@@ -1,0 +1,38 @@
+# Build output
+/bin/
+/dist/
+*.exe
+*.test
+*.out
+
+# Coverage and profiling
+coverage.*
+*.coverprofile
+*.prof
+
+# Runtime data (worker chunk stores, controller metadata DB) when run outside Docker
+/data/
+/tmp/
+*.db
+*.db-wal
+*.db-shm
+*.sqlite
+*.sqlite-wal
+*.sqlite-shm
+
+# Benchmark/demo artifacts generated locally (results that matter are copied into docs/)
+/bench-results/
+/demo-output/
+
+# Local configuration and secrets (commit .env.example instead)
+.env
+.env.*
+!.env.example
+
+# Editors and OS
+.idea/
+.vscode/
+*.swp
+*~
+.DS_Store
+Thumbs.db
