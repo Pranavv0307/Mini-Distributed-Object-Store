@@ -107,6 +107,8 @@ type Controller struct {
 	MaxObjectSize     int64  // MAX_OBJECT_SIZE
 	// MaxConcurrentUploads (MAX_CONCURRENT_UPLOADS): further uploads get 503.
 	MaxConcurrentUploads int
+	// MaxConcurrentDownloads (MAX_CONCURRENT_DOWNLOADS): further downloads get 503.
+	MaxConcurrentDownloads int
 	// MinFreeBytes (PLACEMENT_MIN_FREE_BYTES): workers reporting less free
 	// space are not chosen for new chunks (placement rule 3).
 	MinFreeBytes int64
@@ -124,23 +126,24 @@ type Controller struct {
 func LoadController(getenv func(string) string) (Controller, error) {
 	l := &loader{getenv: getenv}
 	c := Controller{
-		ListenAddr:           l.str("LISTEN_ADDR", ":8080"),
-		LogLevel:             l.level("LOG_LEVEL", slog.LevelInfo),
-		HeartbeatInterval:    l.duration("HEARTBEAT_INTERVAL", 3*time.Second, 10*time.Millisecond, time.Hour),
-		DeadAfter:            l.duration("DEAD_AFTER", 10*time.Second, 10*time.Millisecond, time.Hour),
-		RepairGrace:          l.duration("REPAIR_GRACE", 30*time.Second, 0, 24*time.Hour),
-		FailureCheckInterval: l.duration("FAILURE_CHECK_INTERVAL", time.Second, 5*time.Millisecond, time.Minute),
-		DBPath:               l.str("DB_PATH", "/data/meta.db"),
-		ChunkSize:            l.int64("CHUNK_SIZE", DefaultChunkSize, 1, MaxConfigurableChunkSize),
-		ReplicationFactor:    int(l.int64("REPLICATION_FACTOR", 2, 1, 5)),
-		UploadWindow:         int(l.int64("UPLOAD_WINDOW", 4, 1, 64)),
-		MaxObjectSize:        l.int64("MAX_OBJECT_SIZE", DefaultMaxObjectSize, 0, 1<<40),
-		MaxConcurrentUploads: int(l.int64("MAX_CONCURRENT_UPLOADS", 16, 1, 1024)),
-		MinFreeBytes:         l.int64("PLACEMENT_MIN_FREE_BYTES", 100_000_000, 0, 1<<50),
-		WorkerConnectTimeout: l.duration("WORKER_CONNECT_TIMEOUT", 2*time.Second, time.Millisecond, time.Minute),
-		WorkerRequestTimeout: l.duration("WORKER_REQUEST_TIMEOUT", 10*time.Second, time.Millisecond, 10*time.Minute),
-		ClientReadTimeout:    l.duration("CLIENT_READ_TIMEOUT", time.Minute, 10*time.Millisecond, time.Hour),
-		JanitorInterval:      l.duration("JANITOR_INTERVAL", 10*time.Second, 5*time.Millisecond, time.Hour),
+		ListenAddr:             l.str("LISTEN_ADDR", ":8080"),
+		LogLevel:               l.level("LOG_LEVEL", slog.LevelInfo),
+		HeartbeatInterval:      l.duration("HEARTBEAT_INTERVAL", 3*time.Second, 10*time.Millisecond, time.Hour),
+		DeadAfter:              l.duration("DEAD_AFTER", 10*time.Second, 10*time.Millisecond, time.Hour),
+		RepairGrace:            l.duration("REPAIR_GRACE", 30*time.Second, 0, 24*time.Hour),
+		FailureCheckInterval:   l.duration("FAILURE_CHECK_INTERVAL", time.Second, 5*time.Millisecond, time.Minute),
+		DBPath:                 l.str("DB_PATH", "/data/meta.db"),
+		ChunkSize:              l.int64("CHUNK_SIZE", DefaultChunkSize, 1, MaxConfigurableChunkSize),
+		ReplicationFactor:      int(l.int64("REPLICATION_FACTOR", 2, 1, 5)),
+		UploadWindow:           int(l.int64("UPLOAD_WINDOW", 4, 1, 64)),
+		MaxObjectSize:          l.int64("MAX_OBJECT_SIZE", DefaultMaxObjectSize, 0, 1<<40),
+		MaxConcurrentUploads:   int(l.int64("MAX_CONCURRENT_UPLOADS", 16, 1, 1024)),
+		MaxConcurrentDownloads: int(l.int64("MAX_CONCURRENT_DOWNLOADS", 32, 1, 4096)),
+		MinFreeBytes:           l.int64("PLACEMENT_MIN_FREE_BYTES", 100_000_000, 0, 1<<50),
+		WorkerConnectTimeout:   l.duration("WORKER_CONNECT_TIMEOUT", 2*time.Second, time.Millisecond, time.Minute),
+		WorkerRequestTimeout:   l.duration("WORKER_REQUEST_TIMEOUT", 10*time.Second, time.Millisecond, 10*time.Minute),
+		ClientReadTimeout:      l.duration("CLIENT_READ_TIMEOUT", time.Minute, 10*time.Millisecond, time.Hour),
+		JanitorInterval:        l.duration("JANITOR_INTERVAL", 10*time.Second, 5*time.Millisecond, time.Hour),
 	}
 	if c.DBPath == "" {
 		l.fail("DB_PATH", "must not be empty")

@@ -13,8 +13,8 @@ owner review. The owner makes the git commit for each phase.
 | 0 | M0 | Setup and design lock-in | — | COMPLETED |
 | 1 | M1 | Worker: durable chunk store over HTTP, in Docker | 0 | COMPLETED |
 | 2 | M2 | Membership, failure detection, `SYNCING`, Compose cluster | 1 | COMPLETED |
-| 3 | M3a+M3b | Write path: metadata DB, chunk, place, replicate, commit | 2 | COMPLETED (awaiting review) |
-| 4 | M4 | Read path: verify, fall back, stream in order | 3 | NOT STARTED |
+| 3 | M3a+M3b | Write path: metadata DB, chunk, place, replicate, commit | 2 | COMPLETED |
+| 4 | M4 | Read path: verify, fall back, stream in order | 3 | COMPLETED (awaiting review) |
 | 5 | M5 | Complete client API, delete path, error mapping | 4 | NOT STARTED |
 | 6 | M6 | Degraded operation, full inventory reconciliation, audit v1 | 5 | NOT STARTED |
 | 7 | M7 | Self-healing re-replication (reconciler) | 6 | NOT STARTED |
@@ -153,7 +153,7 @@ owner review. The owner makes the git commit for each phase.
   placement constraints; integration tests with failure-injecting transports
   (timeouts, checksum rejection, worker death mid-upload); concurrency test of
   many simultaneous uploads; Go benchmark sequential vs windowed.
-- **Status.** COMPLETED (awaiting review). As built:
+- **Status.** COMPLETED. As built:
   `internal/controller/meta` (SQLite schema and conditional transactions,
   DEC-034), `internal/controller/placement` (random distinct eligible
   workers, free-space rule DEC-038), `internal/controller/workerclient`,
@@ -190,6 +190,19 @@ owner review. The owner makes the git commit for each phase.
   → truncated response, never wrong bytes.
 - **Testing.** Integration tests with stopped workers, corrupted files,
   missing files, both replicas bad; concurrency test of parallel downloads.
+- **Status.** COMPLETED (awaiting review). As built:
+  `internal/controller/download` (pre-flight, chunk 0 before headers, per-chunk
+  verification with random replica order and fallback, `CORRUPT` marking,
+  whole-object checksum guard, flush per chunk, abort mid-stream, `HEAD`),
+  `meta.MarkReplicaCorrupt`, `GET /api/v1/objects/{id}` with
+  `MAX_CONCURRENT_DOWNLOADS` (DEC-040 to DEC-044). Acceptance: checksums
+  identical (`TestDownloadRoundTrip`, `TestComposeDownload`); holder stopped
+  (`TestDownloadWithWorkerStopped`, e2e); hand-altered replica skipped and
+  marked `CORRUPT` (`TestDownloadSkipsAndMarksCorruptReplica`, 5 kinds of
+  damage, e2e); zero effective replicas → 503 before any body
+  (`TestDownloadBothHoldersDown`, `TestDownloadBothReplicasCorrupt`);
+  mid-stream failure → truncated, never wrong (`TestMidStreamFailureTruncates`,
+  `TestDownloadBothReplicasCorrupt/last_chunk`). Prefetch (S2) not done.
 
 ## Phase 5 — Complete API surface (M5)
 

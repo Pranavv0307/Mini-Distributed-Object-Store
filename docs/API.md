@@ -1,9 +1,10 @@
 # API Reference
 
-> **Status (end of Phase 3):** **IMPLEMENTED** and tested: all worker
+> **Status (end of Phase 4):** **IMPLEMENTED** and tested: all worker
 > endpoints (Phase 1); the controller's membership endpoints, `/healthz`, and
-> `/cluster` (Phase 2); **`POST /api/v1/objects`** (Phase 3). Everything else
-> is the **API contract** for later phases. Each
+> `/cluster` (Phase 2); `POST /api/v1/objects` (Phase 3);
+> **`GET`/`HEAD /api/v1/objects/{object_id}`** (Phase 4). Everything else is
+> the **API contract** for later phases. Each
 > endpoint lists the phase that implements it; when that phase completes, its
 > section is marked **IMPLEMENTED**. Until then, details may be refined, and
 > any change is recorded in [`DECISIONS.md`](DECISIONS.md). Verified `curl`
@@ -58,7 +59,7 @@
 | 503 | `NOT_REGISTERED` | Worker refuses writes before it is registered (DEC-006) |
 | 409 | `REGISTRATION_SUPERSEDED` | A newer registration of the same worker started, or it was declared DEAD, during reconciliation; register again |
 | 503 | `INSUFFICIENT_STORAGE` | Worker disk is full |
-| 503 | `SERVER_BUSY` | `MAX_CONCURRENT_UPLOADS` uploads already in progress; retry later |
+| 503 | `SERVER_BUSY` | `MAX_CONCURRENT_UPLOADS` uploads (or `MAX_CONCURRENT_DOWNLOADS` downloads) already in progress; retry later |
 
 ---
 
@@ -127,21 +128,55 @@ curl -s -F 'metadata={"owner":"alice"}' -F 'file=@big.bin;type=application/octet
   that stalls longer than `CLIENT_READ_TIMEOUT` (60 s) aborts the upload
   (DEC-036).
 
-### `GET /api/v1/objects/{object_id}` — download · *Phase 4*
+### `GET /api/v1/objects/{object_id}` — download · IMPLEMENTED (Phase 4)
 
-**Response 200**, body = exact original bytes, with headers:
-`Content-Type`, `Content-Length`,
-`Content-Disposition: attachment; filename="<sanitised name>"`,
-`ETag: "<checksum_sha256>"`, `X-Object-Checksum-SHA256: <hex>`.
+Also answers `HEAD` (headers only; no chunk is fetched).
 
-**Errors:** 400 `INVALID_OBJECT_ID`; 404 `OBJECT_NOT_FOUND`; 503
-`STORAGE_UNAVAILABLE` (pre-flight found a chunk with no effective replica).
+**Response 200**, body = the exact original bytes, with headers (verified):
 
-**Guarantees.** Each chunk is verified against its metadata SHA-256 before any
-of its bytes are sent; a mismatching replica is marked `CORRUPT` and the other
-replica is used. If a failure occurs **after** the 200 headers were sent, the
-connection is aborted, so the client sees a short body (length mismatch),
-never wrong bytes.
+```
+Content-Type: application/pdf
+Content-Length: 3500000
+Content-Disposition: attachment; filename=report.pdf
+Etag: "d2e2d9547eba9f87cf274718e746fb541e7156618e22b44b9a2336ffc123560f"
+X-Object-Checksum-Sha256: d2e2d9547eba9f87cf274718e746fb541e7156618e22b44b9a2336ffc123560f
+```
+
+`Content-Disposition` carries the upload's file name with path components,
+control characters, and quotes removed (non-ASCII names use RFC 2231
+`filename*=`); it is a plain `attachment` if nothing is left.
+
+**Errors:**
+
+| Status | Code | When |
+| --- | --- | --- |
+| 400 | `INVALID_OBJECT_ID` | Not a canonical UUIDv4 |
+| 404 | `OBJECT_NOT_FOUND` | Unknown, still `UPLOADING`, or `DELETING` |
+| 503 | `STORAGE_UNAVAILABLE` | Some chunk has no effective replica (`OK` on an `ALIVE` worker), or chunk 0 has no valid copy. Nothing of the object is sent. |
+| 503 | `SERVER_BUSY` | `MAX_CONCURRENT_DOWNLOADS` (32) in progress |
+| 500 | `INTERNAL` | Unexpected error |
+
+Error messages never name workers (clients do not learn chunk locations);
+the controller log has the details.
+
+**Guarantees (DEC-040 to DEC-044).**
+- Every chunk is verified (size and SHA-256 against the controller's
+  metadata) **before any of its bytes are sent**. Before the last chunk is
+  sent, the SHA-256 of the whole stream is compared with the object's
+  checksum.
+- Copies are read in random order; on failure the next copy is tried. A copy
+  that fails verification, is missing (`404`), or has an unreadable header is
+  marked `CORRUPT` and is not read again. A copy that is unreachable (timeout,
+  connection refused, 5xx) is skipped but not marked.
+- Chunk 0 is fetched and verified before the response starts, so a missing
+  or corrupt first chunk is a clean `503`. If a later chunk has no valid copy,
+  the 200 response has started: the connection is closed, and the client
+  receives a verified prefix shorter than `Content-Length`, **never wrong
+  bytes**.
+- Chunks are fetched one at a time; each download holds at most one chunk
+  (1 MB) in memory.
+- A delete racing with a streaming download (Phase 5) may cut the stream
+  (architecture §5.6).
 
 ### `GET /api/v1/objects/{object_id}/metadata` — metadata · *Phase 5*
 

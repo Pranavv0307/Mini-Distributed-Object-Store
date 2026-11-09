@@ -13,12 +13,14 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"path/filepath"
+	"strings"
 	"sync"
 	"testing"
 	"time"
 
 	"objstore/internal/config"
 	"objstore/internal/controller/api"
+	"objstore/internal/controller/download"
 	"objstore/internal/controller/janitor"
 	"objstore/internal/controller/meta"
 	"objstore/internal/controller/placement"
@@ -80,6 +82,7 @@ func newUploadCluster(t testing.TB, o clusterOpts) *uploadCluster {
 	srv := api.New(reg, api.NoopReconciler{}, api.Config{
 		HeartbeatInterval: hbInterval, DeadAfter: deadAfter, RepairGrace: repairGrace,
 		Meta: m, Uploader: up, MaxConcurrentUploads: o.maxUploads,
+		Downloader: download.New(m, reg, wc, nil), MaxConcurrentDownloads: 32,
 	})
 	ts := httptest.NewServer(srv.Handler())
 	ctx, cancel := context.WithCancel(context.Background())
@@ -434,6 +437,9 @@ func TestUploadFailsWhenWorkersRunOut(t *testing.T) {
 	r := c.upload(filePart("f", randomBytes(t, 10_000)))
 	if r.status != http.StatusServiceUnavailable || r.err.Error.Code != wire.CodeUploadFailed {
 		t.Fatalf("got %d %+v", r.status, r.err)
+	}
+	if strings.Contains(r.err.Error.Message, "worker2") {
+		t.Fatalf("error message reveals a worker: %q", r.err.Error.Message)
 	}
 	c.waitClean()
 	if cnt, _ := c.meta.Counts(context.Background()); len(cnt.ObjectsByStatus) != 0 || cnt.Chunks != 0 || cnt.Replicas != 0 {

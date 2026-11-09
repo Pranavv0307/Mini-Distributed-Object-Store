@@ -388,7 +388,7 @@ func (c *Coordinator) writeReplica(ctx context.Context, ch meta.Chunk, data []by
 			"retry_on", next, "error", err)
 		if !ok {
 			return &Error{Status: http.StatusServiceUnavailable, Code: wire.CodeUploadFailed,
-				Message: fmt.Sprintf("chunk %d: no eligible worker left after %s failed", ch.Idx, target), Err: errNoWorker}
+				Message: fmt.Sprintf("chunk %d: not enough distinct workers left after worker failures", ch.Idx), Err: errNoWorker}
 		}
 		if err := c.meta.ReplaceReplica(ctx, ch.ObjectID, ch.ID, target, next, "replica_write_failed"); err != nil {
 			return c.internalOrAborted("replace replica", err)

@@ -51,6 +51,11 @@ explicit owner confirmation; may change) · `SUPERSEDED by DEC-nnn`.
 | DEC-037 | Phase 3 janitor: pending deletes for ALIVE workers only, exponential backoff, kick on abort | ACCEPTED | 3 |
 | DEC-038 | Placement free-space threshold `PLACEMENT_MIN_FREE_BYTES` = 100 MB | ACCEPTED | 3 |
 | DEC-039 | End of the file part only on a clean `io.EOF` | ACCEPTED | 3 |
+| DEC-040 | Read-path failure classification: bad data, missing, unreadable header → `CORRUPT`; unreachable → skip | ACCEPTED | 4 |
+| DEC-041 | Chunk 0 fetched before the response starts; flush per chunk; abort on later failure | ACCEPTED | 4 |
+| DEC-042 | Whole-object checksum verified before the last chunk is sent | ACCEPTED | 4 |
+| DEC-043 | Sequential download, one chunk in memory, `MAX_CONCURRENT_DOWNLOADS`, `HEAD` without fetching | ACCEPTED | 4 |
+| DEC-044 | Client error messages never name workers | ACCEPTED | 4 |
 
 ---
 
@@ -674,3 +679,81 @@ explicit owner confirmation; may change) · `SUPERSEDED by DEC-nnn`.
   would also have failed one step later, when `NextPart` met the missing
   boundary, so this is defence in depth rather than a fix for an observed
   defect.) Test: `TestTruncatedUploadIsNeverCommitted`.
+
+## DEC-040 — Read-path failure classification
+
+- **Context.** §4.2: on mismatch mark the replica `CORRUPT`, on unreachable
+  try the other one; §4.9 lists "read miss" as a way to detect a deleted
+  chunk file; §3.6 says the controller's checksum is the authority.
+- **Choice.**
+  | Worker response | Verdict |
+  | --- | --- |
+  | 200 with wrong size or SHA-256 | `CORRUPT` (reason `size_mismatch` / `checksum_mismatch`) |
+  | 404 `CHUNK_NOT_FOUND` | `CORRUPT` (reason `missing`) |
+  | 500 `CHUNK_CORRUPT` (unreadable header) | `CORRUPT` (reason `header_corrupt`) |
+  | Timeout, connection error, other 5xx, 503 | Skip this replica; state unchanged |
+  `MarkReplicaCorrupt` only changes an `OK` row; it runs on a context detached
+  from the request so the verdict is recorded even if the client leaves.
+  Each detection is logged as `corruption_detected` with `detected_by: read`.
+- **Why.** A missing file is as lost as a corrupt one; treating it as
+  `CORRUPT` lets Phases 7–8 repair both through one path (D16). The
+  controller verifies against its own checksum, so no cross-check is needed
+  (the §3.6 cross-check is for *worker*-reported suspicion, Phase 8).
+  Unreachability is a liveness question, and only heartbeats decide liveness
+  (§4.6).
+- **Consequences.** A copy damaged in transit between worker and controller
+  would be marked `CORRUPT` although the file is fine; TCP checksums make this
+  very unlikely, and the in-place repair (Phase 8) would simply rewrite it.
+
+## DEC-041 — Chunk 0 before the response starts; flush per chunk; abort on later failure
+
+- **Context.** §4.2 sends headers after the pre-flight, so any chunk failure
+  after that can only be an aborted connection.
+- **Choice.** After the pre-flight, chunk 0 is fetched and verified *before*
+  any object header is set and before the status line, so a first chunk with
+  no valid copy is a clean JSON `503`. (A first draft set the object headers
+  earlier; its 503 then inherited the object's `Content-Length`, which the
+  unit tests caught.) After `200`, the response is flushed after the status
+  line and after every chunk. If a later chunk has no valid copy, the handler
+  panics with `http.ErrAbortHandler`, closing the connection.
+- **Why flush.** Without it, the 200 and earlier chunks sit in the server's
+  buffer, and an abort delivers nothing at all. The client could not tell a
+  failure mid-object from a connection failure. With flushing, the client
+  receives `200` and a verified prefix, and sees the truncation against
+  `Content-Length`.
+- **Consequences.** One flush per 1 MB chunk (negligible).
+
+## DEC-042 — Whole-object checksum verified before the last chunk is sent
+
+- **Context.** §3.6: the object-level checksum catches assembly bugs
+  (missing, duplicated, or reordered chunks) that per-chunk checks cannot.
+- **Choice.** The download hashes the stream as it writes. After hashing the
+  final chunk and *before* writing it, the result is compared with the
+  object's stored checksum; on mismatch the connection is aborted, so the last
+  chunk is not sent. For an empty object the check happens before the status
+  line.
+- **Consequences.** The client never receives a complete wrong object.
+  Tested with a deliberately wrong stored checksum (`TestAssemblyChecksumGuard`).
+
+## DEC-043 — Sequential download, bounded concurrency, `HEAD`
+
+- **Choice.** Chunks are fetched one at a time (M4 says "start with
+  sequential fetch"; parallel prefetch is stretch S2, and `DOWNLOAD_PREFETCH`
+  is reserved for it). Each download holds at most one chunk in memory.
+  Concurrent downloads are capped at `MAX_CONCURRENT_DOWNLOADS` (default 32,
+  ≈ 32 MB); more get `503 SERVER_BUSY`. `HEAD` runs the 404/503 checks and
+  returns the headers without fetching any chunk.
+
+## DEC-044 — Client error messages never name workers
+
+- **Context.** The spec says clients do not need to know chunk locations (§5.2);
+  D2 puts the controller in the data path for that reason. The first Phase 4
+  walkthrough showed a 503 message listing the workers that failed, and an
+  upload `UPLOAD_FAILED` message also named a worker.
+- **Choice.** Download 503s and upload 503s carry only a summary (for
+  example "chunk 0 of object … has no available valid copy"). Details, including
+  worker IDs and per-replica reasons, go to the controller log
+  (`download_unavailable`, `download_aborted`, `upload_unavailable`,
+  `replica_write_failed`). 400 messages keep their detail because they describe
+  the client's own request. Tested by `TestErrorsDoNotRevealWorkers` and in
+  `TestUploadFailsWhenWorkersRunOut`.

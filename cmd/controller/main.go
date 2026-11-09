@@ -1,7 +1,8 @@
 // Command controller is the single coordinator of the object store. It owns
 // worker membership and liveness (Phase 2), the metadata database and the
-// upload path with its cleanup janitor (Phase 3); later phases add the rest
-// of the client REST API and the repair loops.
+// upload path with its cleanup janitor (Phase 3), and the verified download
+// path (Phase 4); later phases add the rest of the client REST API and the
+// repair loops.
 //
 // Usage:
 //
@@ -25,6 +26,7 @@ import (
 
 	"objstore/internal/config"
 	"objstore/internal/controller/api"
+	"objstore/internal/controller/download"
 	"objstore/internal/controller/janitor"
 	"objstore/internal/controller/meta"
 	"objstore/internal/controller/placement"
@@ -83,14 +85,17 @@ func serve(cfg config.Controller, logger *slog.Logger) error {
 		ClientReadTimeout: cfg.ClientReadTimeout,
 		Logger:            logger,
 	}, jan.Kick)
+	downloader := download.New(store, reg, workers, logger)
 	srv := api.New(reg, api.NoopReconciler{Logger: logger}, api.Config{
-		HeartbeatInterval:    cfg.HeartbeatInterval,
-		DeadAfter:            cfg.DeadAfter,
-		RepairGrace:          cfg.RepairGrace,
-		Meta:                 store,
-		Uploader:             uploader,
-		MaxConcurrentUploads: cfg.MaxConcurrentUploads,
-		Logger:               logger,
+		HeartbeatInterval:      cfg.HeartbeatInterval,
+		DeadAfter:              cfg.DeadAfter,
+		RepairGrace:            cfg.RepairGrace,
+		Meta:                   store,
+		Uploader:               uploader,
+		MaxConcurrentUploads:   cfg.MaxConcurrentUploads,
+		Downloader:             downloader,
+		MaxConcurrentDownloads: cfg.MaxConcurrentDownloads,
+		Logger:                 logger,
 	})
 
 	ln, err := net.Listen("tcp", cfg.ListenAddr)

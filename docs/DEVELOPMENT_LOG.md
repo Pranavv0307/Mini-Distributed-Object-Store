@@ -421,3 +421,85 @@ failed upload leaves no object or chunk behind.
 
 Phase 4: download with per-chunk verification, replica fallback, pre-flight
 503, mid-stream abort, and marking `CORRUPT` replicas.
+
+---
+
+## Phase 4 — Read path (2026-11-09)
+
+### What was implemented
+
+- **`internal/controller/download`**: the download coordinator, which also
+  writes the HTTP response: READY check, pre-flight over effective replicas,
+  chunk 0 fetched before the response starts, per-chunk size + SHA-256
+  verification (worker asked for at most size + 1 bytes), random replica
+  order with fallback, failure classification and `CORRUPT` marking on a
+  detached context, flush after every chunk, abort mid-stream with
+  `http.ErrAbortHandler`, whole-object checksum check before the last chunk,
+  `HEAD` without fetching, sanitised `Content-Disposition`, `ETag` and
+  `X-Object-Checksum-SHA256`.
+- **`meta.MarkReplicaCorrupt`**: conditional `OK → CORRUPT`.
+- **`internal/controller/api`**: `GET /api/v1/objects/{object_id}` (also HEAD)
+  with a concurrent-download cap; upload 503 messages no longer include
+  wrapped error details.
+- **`internal/config`** / **Compose**: `MAX_CONCURRENT_DOWNLOADS` (32).
+- **Tests**: coordinator unit tests (fake worker client, real SQLite);
+  integration tests against real workers; a Compose download e2e test.
+
+### Important decisions
+
+DEC-040 (failure classification), DEC-041 (chunk 0 first, flush per chunk,
+abort), DEC-042 (whole-object checksum guard), DEC-043 (sequential,
+bounded, HEAD), DEC-044 (client errors never name workers).
+
+### Problems encountered and resolutions
+
+1. **503 with the wrong `Content-Length`.** The first draft set the object's
+   headers before fetching chunk 0; when chunk 0 failed, the JSON error
+   inherited `Content-Length: <object size>` and the client could not parse
+   it. Headers are now set only after chunk 0 is verified. Found by
+   `TestNoValidReplicaOnChunkZeroIsClean503`.
+2. **Abort delivered nothing.** Without flushing, the 200 and earlier chunks
+   were still buffered when the connection was cut, so the client saw a bare
+   connection failure. The response is now flushed after the status line and
+   every chunk. Found by `TestMidStreamFailureTruncates` and
+   `TestAssemblyChecksumGuard`.
+3. **Worker IDs leaked to clients.** The manual walkthrough showed a 503
+   message listing failing workers; an upload `UPLOAD_FAILED` message also
+   named one, and upload 503s could include wrapped database errors naming
+   workers. Messages are now generic, with details in the log (DEC-044), and
+   tests assert it.
+4. **Wrong curl message in the draft guide.** I had written the message from
+   memory; the verified run prints `curl: (18) end of response with 1500000
+   bytes missing`. Corrected.
+5. **Test bug:** one integration test compared a finished upload against
+   empty data.
+
+### Tests performed and results (2026-11-09)
+
+- `go build`, `go vet` (default and `-tags e2e`), `gofmt -l` (empty),
+  `go tool staticcheck` (default and `-tags e2e`): pass.
+- `go test -count=3 ./...` (Windows, 16 packages): pass.
+  `go test -race -count=3 ./...` in `golang:1.27.3` (Linux): pass.
+- `go test -tags e2e -count=1 -v ./test/e2e/...`: `TestComposeClusterMembership`,
+  `TestComposeDownload`, `TestComposeUpload`, `TestWorkerContainer` pass; no
+  leftovers.
+- Manual Compose walkthroughs (guarded `objstore-` names): download identical
+  with correct headers; HEAD; 404/400; identical with a holder stopped; 6 of 6
+  identical after appending bytes to one copy, with one
+  `corruption_detected` log line; both copies of chunk 0 corrupted → 503 (twice:
+  verification, then pre-flight); both copies of chunk 2 corrupted → 200,
+  2,000,000 correct bytes, curl exit 18.
+
+### Known limitations
+
+- Sequential fetch only (prefetch is stretch S2); download throughput is
+  bounded by one chunk round trip at a time.
+- `CORRUPT` replicas are not repaired yet (Phases 7–8); an object with a
+  `CORRUPT` copy is under-replicated until then.
+- A copy damaged in transit (not on disk) would be marked `CORRUPT`; very
+  unlikely with TCP, and harmless once repair exists.
+
+### Work remaining
+
+Phase 5: metadata GET (chunk map) and PATCH, list with pagination, client
+delete, conformance checklist.

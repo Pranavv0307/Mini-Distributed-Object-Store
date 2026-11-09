@@ -7,6 +7,9 @@ package wire
 // checksum on PUT, and the checksum stored in the chunk header on GET.
 const HeaderChunkSHA256 = "X-Chunk-SHA256"
 
+// HeaderObjectChecksum carries an object's whole-object SHA-256 on download.
+const HeaderObjectChecksum = "X-Object-Checksum-SHA256"
+
 // Stable error codes (docs/API.md, DEC-015).
 const (
 	CodeInvalidRequest         = "INVALID_REQUEST"
@@ -30,6 +33,7 @@ const (
 	CodeServerBusy             = "SERVER_BUSY"
 	CodeObjectNotFound         = "OBJECT_NOT_FOUND"
 	CodeInvalidObjectID        = "INVALID_OBJECT_ID"
+	CodeStorageUnavailable     = "STORAGE_UNAVAILABLE"
 )
 
 // ErrorResponse is the body of every non-2xx JSON response.

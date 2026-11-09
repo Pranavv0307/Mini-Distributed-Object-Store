@@ -6,12 +6,13 @@ Practical, step-by-step instructions to set up, run, and verify the project.
 > observed at the phase noted. Sections for later phases are marked
 > *not yet available* until those phases are implemented.
 
-**Current state (end of Phase 3):** the cluster runs under Docker Compose:
+**Current state (end of Phase 4):** the cluster runs under Docker Compose:
 one controller and four workers. Workers register, heartbeat, and are marked
-`DEAD` when they stop. **Objects can be uploaded** (`POST /api/v1/objects`):
-they are split into 1 MB chunks, each stored on two distinct workers, and
-committed atomically. Download and the rest of the client API come in
-Phases 4–5.
+`DEAD` when they stop. Objects can be **uploaded** (`POST /api/v1/objects`:
+1 MB chunks, two copies on distinct workers, atomic commit) and
+**downloaded** (`GET /api/v1/objects/{id}`: every chunk verified against its
+checksum, failing over to the other copy, corrupt copies marked). Metadata,
+list, and delete come in Phase 5.
 
 > ⚠️ **Docker name collisions.** Container names are global on a Docker host.
 > The Compose file uses the spec's names `controller` and `worker1`…`worker4`.
@@ -103,6 +104,7 @@ All variables are optional (defaults shown). Set them in the shell or in a
 | `UPLOAD_WINDOW` | controller | `4` | Chunks in flight per upload (1 = sequential) |
 | `MAX_OBJECT_SIZE` | controller | `5368709120` | Largest accepted object (5 GiB) |
 | `MAX_CONCURRENT_UPLOADS` | controller | `16` | More uploads at once get `503 SERVER_BUSY` |
+| `MAX_CONCURRENT_DOWNLOADS` | controller | `32` | More downloads at once get `503 SERVER_BUSY` |
 | `PLACEMENT_MIN_FREE_BYTES` | controller | `100000000` | Workers reporting less free space get no new chunks |
 | `WORKER_CONNECT_TIMEOUT` | controller | `2s` | Connection timeout for worker calls |
 | `WORKER_REQUEST_TIMEOUT` | controller | `10s` | Overall timeout per worker call |
@@ -295,8 +297,31 @@ The controller logs one `upload_started` and one `upload_committed` line
 | `curl -s -w ' HTTP %{http_code}\n' -F 'metadata={"n":1}' -F 'file=@big.bin' localhost:8080/api/v1/objects` | `INVALID_METADATA` ("value of \"n\" must be a string, got number") |
 | `curl -s -w ' HTTP %{http_code}\n' -H 'Content-Type: application/json' -d '{}' localhost:8080/api/v1/objects` | `INVALID_REQUEST` ("expected a multipart/form-data body") |
 
-Retrieving the object (download, metadata, list) is Phases 4–5. Until then,
-metadata rows can be inspected only through tests.
+Metadata GET/PATCH, list, and delete are Phase 5.
+
+### 4.4 Download (verified at Phase 4, Compose cluster)
+
+```bash
+head -c 3500000 /dev/urandom > obj.bin
+ID=$(curl -s -F 'file=@obj.bin;filename=report.pdf;type=application/pdf' \
+  localhost:8080/api/v1/objects | grep -o '"object_id":"[^"]*"' | cut -d'"' -f4)
+curl -s -o got.bin -D headers.txt localhost:8080/api/v1/objects/$ID
+grep -i -E '^(HTTP|content-type|content-length|content-disposition|etag|x-object-checksum)' headers.txt
+sha256sum obj.bin got.bin; cmp obj.bin got.bin && echo IDENTICAL
+```
+
+Expected: `HTTP/1.1 200 OK`, `Content-Type: application/pdf`,
+`Content-Length: 3500000`, `Content-Disposition: attachment; filename=report.pdf`,
+`Etag` and `X-Object-Checksum-Sha256` both equal to the SHA-256; identical
+hashes; `IDENTICAL`.
+
+| Request | Expected |
+| --- | --- |
+| `curl -s -I localhost:8080/api/v1/objects/$ID` | `HTTP/1.1 200 OK`, `Content-Length: 3500000`, no body (no chunk is fetched) |
+| `curl -s -w ' HTTP %{http_code}\n' localhost:8080/api/v1/objects/3f2b8c1e-9a4d-4e2f-8b7a-1c2d3e4f5a6b` | `404`, `OBJECT_NOT_FOUND` |
+| `curl -s -w ' HTTP %{http_code}\n' localhost:8080/api/v1/objects/not-a-uuid` | `400`, `INVALID_OBJECT_ID` |
+
+The controller logs `download_completed` with size, duration, and MB/s.
 
 ---
 
@@ -365,17 +390,69 @@ corrupting data in transit) is covered by automated tests (§6): the upload
 still succeeds with ≥ 2 workers, and any bytes the failed worker may have
 stored are deleted by the janitor.
 
-### 5.5 Corruption, repair, crash consistency
+### 5.5 Downloads with a worker down (verified at Phase 4)
 
-Single-worker corruption visibility: §4.2. Controller-side detection and
-repair: *not yet available* (Phases 4, 7–9). Crash mid-write on a worker:
+Find the two workers holding chunk 1 of the object from §4.4, stop one, and
+download:
+
+```bash
+C1=${ID}_000001
+for w in 1 2 3 4; do docker exec objstore-worker$w sh -c "test -f /data/chunks/$C1" && echo worker$w; done
+docker stop objstore-worker3          # one of the two holders printed above
+curl -s localhost:8080/api/v1/objects/$ID | cmp - obj.bin && echo IDENTICAL
+docker start objstore-worker3
+```
+
+Expected: `IDENTICAL`, both immediately after the stop (the controller still
+thinks the worker is `ALIVE`, the read fails over) and after it is `DEAD`
+(the worker is no longer tried). Replicas on a stopped worker are **not**
+marked `CORRUPT`: being unreachable says nothing about the data.
+
+### 5.6 Corruption detection on download (verified at Phase 4)
+
+Corrupt one copy of chunk 1 (on a holder from §5.5), then download several
+times (copies are read in random order):
+
+```bash
+docker exec objstore-worker3 sh -c "printf garbage >> /data/chunks/$C1"
+for i in 1 2 3 4 5 6; do curl -s localhost:8080/api/v1/objects/$ID | cmp -s - obj.bin || echo MISMATCH; done
+docker logs objstore-controller 2>&1 | grep corruption_detected
+```
+
+Expected: no `MISMATCH`, and one log line
+`"msg":"corruption_detected",…,"chunk_index":1,"worker_id":"worker3","reason":"size_mismatch: got 1000001 bytes, want 1000000","detected_by":"read","marked_corrupt":true`.
+After that the corrupt copy is never read again. Repair of the bad copy is
+Phases 7–8.
+
+Corrupt **both** copies of chunk 0:
+
+```bash
+C0=${ID}_000000
+for w in 1 2 3 4; do docker exec objstore-worker$w sh -c "test -f /data/chunks/$C0 && printf garbage >> /data/chunks/$C0"; done
+curl -s -w ' HTTP %{http_code}\n' localhost:8080/api/v1/objects/$ID
+```
+
+Expected: `{"error":{"code":"STORAGE_UNAVAILABLE","message":"chunk 0 of object … has no available valid copy"}} HTTP 503`;
+nothing of the object is returned. (If a *later* chunk has no valid copy,
+the response has already started: the controller cuts the connection, so
+the client sees a body shorter than `Content-Length` and never wrong bytes.
+Verified: with both copies of chunk 2 of a 3.5 MB object corrupted,
+`curl -sS -o got.bin …` prints `curl: (18) end of response with 1500000 bytes
+missing`, exits with code 18, and `got.bin` holds the first 2,000,000 bytes,
+identical to the original.) Error
+messages never name workers; details are in the controller log
+(`download_unavailable`, `download_aborted`).
+
+### 5.7 Repair, crash consistency
+
+Repair: *not yet available* (Phases 7–9). Crash mid-write on a worker:
 covered by automated tests (§6).
 
 ---
 
 ## 6. Automated testing and static analysis
 
-Run from the repository root. All verified at Phase 3.
+Run from the repository root. All verified at Phase 4.
 
 ### Unit and integration tests
 
@@ -389,6 +466,7 @@ Expected (all `ok`; `cmd/*` and `internal/wire` print `[no test files]`):
 ok  	objstore/internal/config
 ok  	objstore/internal/controller/api
 ok  	objstore/internal/controller/custommeta
+ok  	objstore/internal/controller/download
 ok  	objstore/internal/controller/janitor
 ok  	objstore/internal/controller/meta
 ok  	objstore/internal/controller/placement
@@ -428,13 +506,17 @@ Builds `objstore:e2e` once, then runs:
   `docker start` → `ALIVE` with a newer epoch; `docker restart` controller →
   all four re-register with newer epochs. Removes only its own project
   (`compose down -v`).
+- `TestComposeDownload`: uploads 3.5 MB, downloads and compares; stops a
+  holder of chunk 1 and downloads again (before and after `DEAD`); appends
+  bytes to one copy on disk and downloads 6 times (all correct, controller logs
+  `corruption_detected`); corrupts both copies of chunk 0 and expects `503`.
 - `TestComposeUpload`: uploads a 5.5 MB object through the real stack and
   checks 6 chunks stored as 12 files, each chunk on 2 distinct worker volumes;
   then stops 3 workers and checks the next upload gets
   `503 INSUFFICIENT_WORKERS` with nothing stored.
 - `TestWorkerContainer`: the standalone worker container checks from Phase 1.
 
-Expected: all three `PASS` (about 1–2 minutes including the image build). Set
+Expected: all four `PASS` (about 1–2 minutes including the image build). Set
 `E2E_IMAGE=objstore:dev` to reuse an existing image.
 
 ### Benchmark: sequential vs windowed upload
@@ -494,6 +576,8 @@ Expected last line: `ALL-OK`. Then run the race detector and the e2e tests.
 | `Conflict. The container name "/worker1" is already in use` on `compose up` | Another project uses the spec's container names | `export OBJSTORE_CONTAINER_PREFIX=objstore-` and retry. Do **not** remove containers you did not create |
 | `port is already allocated` for 8080 | Something else uses port 8080 | `export CONTROLLER_PORT=18080` and use that port with `curl` |
 | `/cluster` shows fewer than 4 workers right after `up` or a controller restart | Workers have not (re-)registered yet | Wait one heartbeat interval (3 s); check `docker logs <worker>` for `worker_register_failed` |
+| Download returns `503 STORAGE_UNAVAILABLE` | Some chunk has no valid copy on an `ALIVE` worker: both holders down, or both copies corrupt | Check the controller log (`download_unavailable`, `corruption_detected`); start the holders. Both copies corrupt cannot be fixed automatically: re-upload |
+| `curl: (18) end of response with … bytes missing` on download | A chunk failed after the response started; the controller cut the connection rather than send wrong bytes | Check the controller log for `download_aborted`; retry |
 | Upload returns `503 INSUFFICIENT_WORKERS` | Fewer than 2 workers are `ALIVE` (or the others reported less than `PLACEMENT_MIN_FREE_BYTES` free) | Check `/cluster`; start workers; free disk space |
 | Upload returns `503 UPLOAD_FAILED` | Workers failed during the upload and no distinct second worker was left | Check controller log `replica_write_failed` for the reason; retry |
 | Upload returns `503 SERVER_BUSY` | `MAX_CONCURRENT_UPLOADS` uploads in progress | Retry later or raise the limit |

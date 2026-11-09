@@ -13,6 +13,7 @@ import (
 	"net/url"
 	"time"
 
+	"objstore/internal/controller/download"
 	"objstore/internal/controller/meta"
 	"objstore/internal/controller/registry"
 	"objstore/internal/controller/upload"
@@ -61,6 +62,11 @@ type Config struct {
 	Meta *meta.Store
 	// Uploader, if set, serves POST /api/v1/objects.
 	Uploader *upload.Coordinator
+	// Downloader, if set, serves GET/HEAD /api/v1/objects/{object_id}.
+	Downloader *download.Coordinator
+	// MaxConcurrentDownloads bounds simultaneous downloads
+	// (MAX_CONCURRENT_DOWNLOADS); each holds at most one chunk in memory.
+	MaxConcurrentDownloads int
 	// MaxConcurrentUploads bounds simultaneous uploads (MAX_CONCURRENT_UPLOADS);
 	// further uploads get 503 SERVER_BUSY. Upload memory is bounded by
 	// MaxConcurrentUploads × UPLOAD_WINDOW × CHUNK_SIZE.
@@ -75,6 +81,7 @@ type Server struct {
 	cfg        Config
 	startedAt  time.Time
 	uploadSem  chan struct{}
+	dlSem      chan struct{}
 	log        *slog.Logger
 }
 
@@ -85,7 +92,8 @@ func New(reg *registry.Registry, reconciler InventoryReconciler, cfg Config) *Se
 		logger = slog.New(slog.DiscardHandler)
 	}
 	return &Server{reg: reg, reconciler: reconciler, cfg: cfg, startedAt: reg.Now(),
-		uploadSem: make(chan struct{}, max(cfg.MaxConcurrentUploads, 1)), log: logger}
+		uploadSem: make(chan struct{}, max(cfg.MaxConcurrentUploads, 1)),
+		dlSem:     make(chan struct{}, max(cfg.MaxConcurrentDownloads, 1)), log: logger}
 }
 
 // Handler returns the HTTP handler with logging and panic recovery.
@@ -97,6 +105,10 @@ func (s *Server) Handler() http.Handler {
 	mux.HandleFunc("GET /cluster", s.cluster)
 	if s.cfg.Uploader != nil {
 		mux.HandleFunc("POST /api/v1/objects", s.uploadObject)
+	}
+	if s.cfg.Downloader != nil {
+		// "GET" patterns also match HEAD.
+		mux.HandleFunc("GET /api/v1/objects/{object_id}", s.downloadObject)
 	}
 	return httpx.Middleware(s.log, mux)
 }
@@ -228,7 +240,16 @@ func (s *Server) uploadObject(w http.ResponseWriter, r *http.Request) {
 			if ue.ClientGone {
 				s.log.Info("upload_client_gone", "error", err)
 			}
-			httpx.WriteError(w, ue.Status, ue.Code, ue.Error())
+			// 400s explain the client's own request; 503s carry only the
+			// summary, since their underlying errors can name workers, and
+			// clients never learn chunk locations (spec §5.2).
+			msg := ue.Message
+			if ue.Status < 500 {
+				msg = ue.Error()
+			} else {
+				s.log.Warn("upload_unavailable", "code", ue.Code, "error", err)
+			}
+			httpx.WriteError(w, ue.Status, ue.Code, msg)
 		case r.Context().Err() != nil:
 			s.log.Info("upload_client_gone", "error", err)
 		default:
@@ -239,6 +260,20 @@ func (s *Server) uploadObject(w http.ResponseWriter, r *http.Request) {
 	}
 	w.Header().Set("Location", "/api/v1/objects/"+obj.ID)
 	httpx.WriteJSON(w, http.StatusCreated, objectInfo(obj))
+}
+
+// downloadObject implements GET and HEAD /api/v1/objects/{object_id}
+// (architecture §4.2).
+func (s *Server) downloadObject(w http.ResponseWriter, r *http.Request) {
+	select {
+	case s.dlSem <- struct{}{}:
+		defer func() { <-s.dlSem }()
+	default:
+		httpx.WriteError(w, http.StatusServiceUnavailable, wire.CodeServerBusy,
+			fmt.Sprintf("too many concurrent downloads (limit %d); retry later", cap(s.dlSem)))
+		return
+	}
+	s.cfg.Downloader.ServeObject(w, r, r.PathValue("object_id"))
 }
 
 func objectInfo(o meta.Object) wire.ObjectInfo {

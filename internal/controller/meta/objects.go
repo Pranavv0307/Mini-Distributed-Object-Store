@@ -369,3 +369,25 @@ func nonNil(m map[string]string) map[string]string {
 	}
 	return m
 }
+
+// MarkReplicaCorrupt records that a replica failed verification against the
+// controller's checksum (architecture §4.9, detection path 1). Only an OK
+// replica changes (a PENDING or already CORRUPT one is left alone); it reports
+// whether the row changed. The controller's metadata checksum is the
+// authority (§3.6), so its own verification needs no further cross-check.
+func (s *Store) MarkReplicaCorrupt(ctx context.Context, chunkID, workerID string) (bool, error) {
+	now := s.nowNanos()
+	changed := false
+	err := s.tx(ctx, func(tx *sql.Tx) error {
+		res, err := tx.ExecContext(ctx, `
+			UPDATE replicas SET state = 'CORRUPT', updated_at = ?
+			WHERE chunk_id = ? AND worker_id = ? AND state = 'OK'`, now, chunkID, workerID)
+		if err != nil {
+			return err
+		}
+		n, err := res.RowsAffected()
+		changed = n == 1
+		return err
+	})
+	return changed, err
+}

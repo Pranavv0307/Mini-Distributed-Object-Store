@@ -96,7 +96,7 @@ func TestLoadController(t *testing.T) {
 	want := Controller{ListenAddr: ":8080", LogLevel: slog.LevelInfo, HeartbeatInterval: 3 * time.Second,
 		DeadAfter: 10 * time.Second, RepairGrace: 30 * time.Second, FailureCheckInterval: time.Second,
 		DBPath: "/data/meta.db", ChunkSize: 1_000_000, ReplicationFactor: 2, UploadWindow: 4,
-		MaxObjectSize: 5 << 30, MaxConcurrentUploads: 16, MinFreeBytes: 100_000_000,
+		MaxObjectSize: 5 << 30, MaxConcurrentUploads: 16, MaxConcurrentDownloads: 32, MinFreeBytes: 100_000_000,
 		WorkerConnectTimeout: 2 * time.Second, WorkerRequestTimeout: 10 * time.Second,
 		ClientReadTimeout: time.Minute, JanitorInterval: 10 * time.Second}
 	if c != want {

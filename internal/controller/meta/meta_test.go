@@ -369,3 +369,33 @@ func TestSchemaVersionCheck(t *testing.T) {
 		t.Fatal("opened a database with an unknown schema version")
 	}
 }
+
+func TestMarkReplicaCorrupt(t *testing.T) {
+	s, _ := openTest(t)
+	obj, cs := upload(t, s, 1, 10)
+	if _, err := commit(s, obj, 1, 10); err != nil {
+		t.Fatal(err)
+	}
+	changed, err := s.MarkReplicaCorrupt(ctx, cs[0].ID, "w1")
+	if err != nil || !changed {
+		t.Fatalf("MarkReplicaCorrupt = %v, %v", changed, err)
+	}
+	if changed, _ := s.MarkReplicaCorrupt(ctx, cs[0].ID, "w1"); changed {
+		t.Fatal("second MarkReplicaCorrupt changed the row again")
+	}
+	if changed, _ := s.MarkReplicaCorrupt(ctx, cs[0].ID, "w9"); changed {
+		t.Fatal("marked a replica that does not exist")
+	}
+	cm, _ := s.ChunkMap(ctx, obj)
+	if cm[0].Replicas[0] != (Replica{cs[0].ID, "w1", ReplicaCorrupt}) || cm[0].Replicas[1].State != ReplicaOK {
+		t.Fatalf("replicas = %+v", cm[0].Replicas)
+	}
+	// A PENDING replica is never marked CORRUPT by a read.
+	obj2 := ids.NewObjectID()
+	s.CreateObject(ctx, obj2, "f", "x")
+	c := chunk(t, obj2, 0, 1)
+	s.ClaimChunk(ctx, c, []string{"w1", "w2"})
+	if changed, _ := s.MarkReplicaCorrupt(ctx, c.ID, "w1"); changed {
+		t.Fatal("PENDING replica marked CORRUPT")
+	}
+}

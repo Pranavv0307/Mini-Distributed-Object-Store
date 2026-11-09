@@ -6,14 +6,14 @@ original design, with full rationale for decisions D1–D22, is in
 [`reference/Object_Store_Architecture.md`](reference/Object_Store_Architecture.md)
 (called "the design doc" below). Where this implementation differs from or
 clarifies the design doc, the difference is listed in
-[§11 Deviations](#11-deviations-and-clarifications-vs-the-design-doc) with a link
+[§12 Deviations](#12-deviations-and-clarifications-vs-the-design-doc) with a link
 to [`DECISIONS.md`](DECISIONS.md).
 
-> **Current status (end of Phase 3):** implemented: the worker's chunk store
+> **Current status (end of Phase 4):** implemented: the worker's chunk store
 > and chunk API (§3.1); cluster membership with the `SYNCING` protocol (§7);
-> the metadata database, the upload path, and a minimal janitor (§8). Not
-> yet: download, the rest of the client API, inventory reconciliation, repair,
-> and the full janitor/recovery (target design below).
+> the metadata database, the upload path, and a minimal janitor (§8); the
+> verified download path (§9). Not yet: metadata/list/delete API, inventory
+> reconciliation, repair, and the full janitor/recovery (target design below).
 
 ---
 
@@ -52,7 +52,7 @@ observed state reconciled in loops; trust nothing you didn't verify.
 | Controller | Failure detector | `ALIVE`/`SYNCING` → `DEAD` on heartbeat silence | `internal/controller/registry` | **Implemented (Phase 2)** |
 | Controller | Placement engine | Distinct ALIVE workers with free space; pluggable (random) | `internal/controller/placement` | **Implemented (Phase 3)** |
 | Controller | Worker client | The only code calling workers: timeouts, checksum headers | `internal/controller/workerclient` | **Implemented (Phase 3)** |
-| Controller | Upload / download coordinators | Streaming write and read paths | `internal/controller/upload`, `.../download` | Upload **implemented (Phase 3)**; download Phase 4 |
+| Controller | Upload / download coordinators | Streaming write and read paths | `internal/controller/upload`, `.../download` | **Implemented (Phases 3, 4)** |
 | Controller | Reconciler | Level-triggered repair of under-replicated/corrupt chunks | `internal/controller/reconciler` | Phase 7 |
 | Controller | Janitor | `pending_deletes` drain and purge of `DELETING` objects (Phase 3, implemented); stale uploads, orphan sweep (Phase 9) | `internal/controller/janitor` | Partly (Phase 3) |
 | Controller | Recovery | Startup recovery pass, reconciler warm-up | `internal/controller/recovery` | Phase 9 |
@@ -365,7 +365,43 @@ then purge `DELETING` objects with nothing left (DEC-037).
   replicas on worker3), as the design doc anticipates for the random policy;
   rendezvous hashing is stretch S1.
 
-## 9. Failure handling (summary)
+## 9. Read path (implemented, Phase 4)
+
+`internal/controller/download`, served at `GET`/`HEAD /api/v1/objects/{id}`:
+
+1. Validate the ID (400); load the object, which must be `READY` (else 404, I7),
+   and its chunk map (plain reads, no transaction held).
+2. **Pre-flight:** every chunk must have an effective replica (`OK` on an
+   `ALIVE` worker); otherwise `503 STORAGE_UNAVAILABLE`. `HEAD` stops here.
+3. **Chunk 0** is fetched and verified before the response starts (DEC-041).
+4. Set headers, `200`, flush; for each chunk in index order: fetch from a
+   random effective replica, asking for at most size + 1 bytes; verify size
+   and SHA-256; on failure classify (DEC-040: `CORRUPT` for bad data, missing,
+   or unreadable header; skip for unreachable) and try the next replica; write
+   and flush.
+5. Before writing the last chunk, compare the whole-stream SHA-256 with the
+   object checksum (DEC-042).
+6. If a chunk after the first has no valid copy, abort the connection: the
+   client gets a verified prefix shorter than `Content-Length`.
+
+Order comes from metadata (`idx`), never from arrival. One chunk in memory
+per download; at most `MAX_CONCURRENT_DOWNLOADS` downloads (DEC-043).
+
+| Situation | Behaviour (all tested) |
+| --- | --- |
+| Holder stopped, still `ALIVE` in the registry | Read fails over to the other copy; nothing marked |
+| Holder `DEAD` | Not tried at all |
+| One copy appended / flipped / truncated / deleted / header destroyed | Correct bytes from the other copy; bad copy `CORRUPT`, never read again |
+| Both copies of chunk 0 bad | Clean `503`; both `CORRUPT`; later requests refused at pre-flight |
+| Both copies of a later chunk bad | `200` + verified prefix, then connection closed |
+| Both holders of a chunk `DEAD` | `503` at pre-flight; copies stay `OK`; readable again once a holder returns |
+| Stored object checksum wrong (assembly bug) | Last chunk withheld, connection closed |
+
+Measured (Compose, 3.5 MB): download identical to upload; with a holder
+stopped, identical; after appending bytes to one copy, 6 of 6 downloads
+identical and one `corruption_detected` log line.
+
+## 10. Failure handling (summary)
 
 See the design doc §5.2 (failure model) and §7 (failure scenario matrix).
 Implemented so far: worker stop/start and controller restart for membership
@@ -376,14 +412,14 @@ chunk (`TestWorkerKilledMidWriteLeavesNoPartialChunk`, e2e). Data-path
 scenarios are implemented in Phases 4–9 and will be listed here with their
 tests.
 
-## 10. Trade-offs and limitations
+## 11. Trade-offs and limitations
 
 Inherited from the design doc §8: single controller (SPOF); controller in the
 data path (throughput ceiling); synchronous 2-way replication (write latency;
 needs ≥ 2 workers); RF = 2 (one failure at a time); immutable objects; repair
 grace period (longer vulnerability window); single-file metadata DB.
 
-## 11. Deviations and clarifications vs. the design doc
+## 12. Deviations and clarifications vs. the design doc
 
 | Topic | Design doc | Implementation | Decision |
 | --- | --- | --- | --- |
@@ -395,3 +431,6 @@ grace period (longer vulnerability window); single-file metadata DB.
 | Stale-upload abort vs. live handler | Not addressed | Claims and commit conditional on status | DEC-011 |
 | New parameters | — | `JANITOR_INTERVAL`, `INVENTORY_SWEEP_INTERVAL` | DEC-009 |
 | Chunk size | 1 MiB = 1,048,576 bytes (§3.1, D3) | 1 MB = 1,000,000 bytes, as the specification says (owner decision) | DEC-005 |
+| Download header timing | Headers right after pre-flight (§4.2 step 4) | Chunk 0 fetched and verified first; flush per chunk | DEC-041 |
+| Object checksum on read | Client-side, optional (§3.6 layer 4) | Also checked by the controller before the last chunk is sent | DEC-042 |
+| Missing chunk file on read | "Unreachable → try other replica" | Treated as `CORRUPT` (repairable in place) | DEC-040 |
