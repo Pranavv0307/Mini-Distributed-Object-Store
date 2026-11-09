@@ -8,8 +8,9 @@
 //	worker inspect FILE... print and verify chunk file headers (debug tool)
 //	worker version         print the version
 //
-// Phase 1: the worker runs standalone and accepts writes immediately.
-// Registration and heartbeats with the controller arrive in Phase 2.
+// With CONTROLLER_URL set, the worker registers with the controller (with its
+// inventory) and heartbeats; it refuses chunk writes until registered. Without
+// it, the worker runs standalone and accepts writes immediately.
 package main
 
 import (
@@ -27,6 +28,7 @@ import (
 
 	"objstore/internal/config"
 	"objstore/internal/version"
+	"objstore/internal/worker/agent"
 	"objstore/internal/worker/server"
 	"objstore/internal/worker/store"
 )
@@ -79,8 +81,6 @@ func serve(cfg config.Worker, logger *slog.Logger) error {
 		MaxConcurrentReads: cfg.MaxConcurrentReads,
 		Logger:             logger,
 	})
-	srv.SetAcceptingWrites(true) // standalone mode (Phase 1); see server.Server
-
 	ln, err := net.Listen("tcp", cfg.ListenAddr)
 	if err != nil {
 		return fmt.Errorf("listen on %s: %w", cfg.ListenAddr, err)
@@ -100,8 +100,36 @@ func serve(cfg config.Worker, logger *slog.Logger) error {
 
 	errc := make(chan error, 1)
 	go func() { errc <- httpSrv.Serve(ln) }()
+	mode := "standalone"
+	if cfg.ControllerURL != "" {
+		mode = "cluster"
+	}
 	logger.Info("worker_started", "version", version.Version, "listen_addr", ln.Addr().String(),
-		"data_dir", cfg.DataDir, "chunk_size", cfg.ChunkSize, "fsync", cfg.FsyncOnWrite)
+		"data_dir", cfg.DataDir, "chunk_size", cfg.ChunkSize, "fsync", cfg.FsyncOnWrite,
+		"mode", mode, "controller_url", cfg.ControllerURL, "advertise_addr", cfg.AdvertiseAddr)
+
+	// The HTTP server starts before registration so the controller can
+	// reach the worker as soon as it is registered; until then the write gate
+	// is closed (DEC-006). In standalone mode (no CONTROLLER_URL) the gate is
+	// opened immediately (DEC-026).
+	agentCtx, stopAgent := context.WithCancel(ctx)
+	defer stopAgent()
+	agentDone := make(chan struct{})
+	if cfg.ControllerURL == "" {
+		srv.OpenWrites()
+		close(agentDone)
+	} else {
+		ag := agent.New(agent.Config{
+			WorkerID:      cfg.WorkerID,
+			AdvertiseAddr: cfg.AdvertiseAddr,
+			ControllerURL: cfg.ControllerURL,
+			Logger:        logger,
+		}, st, srv)
+		go func() {
+			defer close(agentDone)
+			_ = ag.Run(agentCtx) // returns only when agentCtx ends
+		}()
+	}
 
 	select {
 	case err := <-errc:
@@ -109,6 +137,8 @@ func serve(cfg config.Worker, logger *slog.Logger) error {
 	case <-ctx.Done():
 	}
 	logger.Info("worker_stopping")
+	stopAgent()
+	<-agentDone
 	shutdownCtx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
 	defer cancel()
 	if err := httpSrv.Shutdown(shutdownCtx); err != nil {

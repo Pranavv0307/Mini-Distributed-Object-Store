@@ -1,7 +1,10 @@
 # API Reference
 
-> **Status (end of Phase 1):** the **worker endpoints** are **IMPLEMENTED**
-> and tested. Everything else is the **API contract** for later phases. Each
+> **Status (end of Phase 2):** **IMPLEMENTED** and tested: all worker
+> endpoints (Phase 1), the controller's membership endpoints
+> (`/internal/workers/register`, `/internal/workers/heartbeat`), and
+> controller `/healthz` and `/cluster` (Phase 2). Everything else is the
+> **API contract** for later phases. Each
 > endpoint lists the phase that implements it; when that phase completes, its
 > section is marked **IMPLEMENTED**. Until then, details may be refined, and
 > any change is recorded in [`DECISIONS.md`](DECISIONS.md). Verified `curl`
@@ -19,7 +22,7 @@
 | --- | --- |
 | Object ID | Canonical lowercase UUIDv4, e.g. `3f2b8c1e-9a4d-4e2f-8b7a-1c2d3e4f5a6b`. A malformed ID returns 400 `INVALID_OBJECT_ID`; a well-formed unknown ID returns 404 (DEC-015). |
 | Chunk ID | `{object_id}_{idx}`, `idx` zero-padded to 6 digits (`..._000000`). Regex: `^[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}_[0-9]{6}$`. Anything else, including `/` or `..`, is rejected with 400. Order is **never** inferred from the name; metadata `index` is authoritative. |
-| Chunk size | 1,048,576 bytes (PROVISIONAL, DEC-005). The last chunk may be smaller. An empty object has 0 chunks. |
+| Chunk size | 1,000,000 bytes (1 MB, DEC-005). The last chunk may be smaller. An empty object has 0 chunks. |
 | Timestamps | RFC 3339, UTC, nanosecond precision (DEC-021). |
 | Checksums | SHA-256, 64 lowercase hex characters (DEC-021). |
 | Visibility | Only `READY` objects exist for clients. `UPLOADING` and `DELETING` objects behave exactly like unknown objects (404) and are never listed. |
@@ -54,6 +57,7 @@
 | 503 | `UPLOAD_FAILED` | Upload could not place a chunk on enough distinct workers |
 | 503 | `STORAGE_UNAVAILABLE` | Download: some chunk has no effective (OK + ALIVE) replica |
 | 503 | `NOT_REGISTERED` | Worker refuses writes before it is registered (DEC-006) |
+| 409 | `REGISTRATION_SUPERSEDED` | A newer registration of the same worker started, or it was declared DEAD, during reconciliation; register again |
 | 503 | `INSUFFICIENT_STORAGE` | Worker disk is full |
 
 ---
@@ -124,7 +128,7 @@ plus the chunk map:
   "created_at": "...", "modified_at": "...", "metadata_version": 1,
   "custom_metadata": { "owner": "alice" },
   "chunks": [
-    { "index": 0, "chunk_id": "3f2b...a6b_000000", "size": 1048576,
+    { "index": 0, "chunk_id": "3f2b...a6b_000000", "size": 1000000,
       "checksum_sha256": "...",
       "replicas": [ { "worker_id": "worker1", "state": "OK" },
                     { "worker_id": "worker3", "state": "OK" } ] }
@@ -186,17 +190,42 @@ previous response).
 `object_id` (keyset pagination; stable under concurrent inserts).
 **Errors:** 400 `INVALID_PAGINATION`.
 
-### `GET /healthz` — liveness (controller) · *Phase 2*
+### `GET /healthz` — liveness (controller) · IMPLEMENTED (Phase 2)
 
-200 `{"status":"ok"}` once the controller has opened its database and is serving.
+200 `{"status":"ok"}` while the controller is serving. (From Phase 3 it also
+requires the metadata database to be open.) Used by the Compose healthcheck.
 
-### `GET /cluster` — observability · *Phase 2 (workers), Phase 6–8 (chunk and repair counters)*
+### `GET /cluster` — observability · IMPLEMENTED (Phase 2: workers); chunk and repair counters in Phases 6–8
 
-JSON snapshot: workers (`worker_id`, `address`, `state`
-`ALIVE|SYNCING|DEAD`, heartbeat age, `dead_since`, chunk count, bytes),
-chunk totals (fully replicated / under-replicated / zero-effective),
-repairs (in flight / completed / failed), objects by status. Exact schema is
-fixed in Phase 2.
+200, JSON snapshot (verified example, worker2 stopped):
+
+```json
+{
+  "controller": {"version": "dev", "started_at": "2026-11-09T10:31:13.9Z"},
+  "config": {"heartbeat_interval_ms": 3000, "dead_after_ms": 10000, "repair_grace_ms": 30000},
+  "summary": {"total": 4, "alive": 3, "syncing": 0, "dead": 1},
+  "workers": [
+    {"worker_id": "worker2", "address": "http://worker2:9000", "state": "DEAD",
+     "epoch": 1794220273940473530, "last_heartbeat_age_ms": 12489,
+     "registered_at": "2026-11-09T10:31:14.322965428Z",
+     "dead_since": "2026-11-09T10:31:24.943565474Z", "repair_eligible": false,
+     "free_bytes": 1020651261952, "used_bytes": 0, "chunk_count": 0}
+  ]
+}
+```
+
+| Field | Meaning |
+| --- | --- |
+| `state` | `SYNCING` (registered, inventory being reconciled; not used for anything), `ALIVE`, `DEAD` |
+| `epoch` | Registration epoch (DEC-029); changes on every (re-)registration |
+| `last_heartbeat_age_ms` | Controller-clock time since the last heartbeat or registration (D11) |
+| `dead_since` | `null` unless `DEAD` |
+| `repair_eligible` | `DEAD` for longer than `REPAIR_GRACE` (D12); repair itself starts in Phase 7 |
+| `free_bytes` | Free space on the worker's volume as reported by the worker; `-1` = unknown |
+| `used_bytes`, `chunk_count` | Payload bytes and chunk files on the worker's volume |
+
+Workers are sorted by ID. The registry is in memory only, so `workers` is
+empty right after a controller restart until workers re-register (seconds).
 
 ### `GET /admin/audit` — invariant audit · *Phase 6 (v1), Phase 9 (v2)*
 
@@ -204,38 +233,68 @@ Evaluates invariants I1–I7 and returns violations. Schema fixed in Phase 6.
 
 ---
 
-## Internal API — controller endpoints (called by workers)
+## Internal API — controller endpoints (called by workers) · IMPLEMENTED (Phase 2)
 
-### `POST /internal/workers/register` · *Phase 2*
+### `POST /internal/workers/register`
+
+Sent by a worker at every start and whenever a heartbeat reply says
+`reregister`. The worker closes and drains its write gate before taking the
+inventory snapshot, and keeps it closed until this call succeeds (DEC-006,
+DEC-030), so the inventory is exact.
 
 ```json
 {
   "worker_id": "worker2",
   "address": "http://worker2:9000",
-  "free_bytes": 1000000000, "used_bytes": 12582912,
-  "inventory": [ { "chunk_id": "3f2b...a6b_000000", "size": 1048576 } ]
+  "free_bytes": 1000000000, "used_bytes": 12000000,
+  "inventory": [ { "chunk_id": "3f2b...a6b_000000", "size": 1000000 } ]
 }
 ```
 
-**Response 200** `{"epoch": 7, "heartbeat_interval_ms": 3000}`.
-The controller marks the worker `SYNCING`, reconciles the inventory against
-metadata (architecture §4.5 table; DEC-006/007), then marks it `ALIVE` if the
-epoch is still current. The reply is sent after reconciliation. **Errors:**
-400 (bad ID, address, or chunk IDs).
+**Controller behaviour:**
+1. Validate (worker ID format; `address` is `http(s)://host[:port]` with no
+   path or query; every chunk ID valid; sizes ≥ 0). Body limit 64 MiB.
+2. Mark the worker `SYNCING` under a **new epoch** (DEC-029). A `SYNCING`
+   worker is never used for placement, reads, or repair.
+3. Reconcile the inventory against metadata (§4.5 table). *Phase 2: no
+   metadata yet, so this only logs the inventory size; implemented in Phase 6.*
+4. Mark it `ALIVE` **only if that epoch is still current and the worker is
+   still `SYNCING`.**
 
-Workers retry registration with backoff until it succeeds, and refuse chunk
-writes until then (DEC-006).
+**Response 200** (only after step 4): `{"epoch": 1794220273940473530, "heartbeat_interval_ms": 3000}`.
+The controller's `HEARTBEAT_INTERVAL` is the single source of the heartbeat
+period.
 
-### `POST /internal/workers/heartbeat` · *Phase 2 (suspects used in Phase 8)*
+**Errors:** 400 `INVALID_REQUEST`; 409 `REGISTRATION_SUPERSEDED` (a newer
+registration of the same worker began, or the worker was declared `DEAD`,
+while this one was reconciling); 503 `INTERNAL` (reconciliation failed; the
+worker stays `SYNCING`). The worker retries every failure with exponential
+backoff and jitter (200 ms → 5 s).
+
+**Idempotency:** registering again is always safe; it supersedes the previous
+registration.
+
+### `POST /internal/workers/heartbeat`
+
+Sent every `heartbeat_interval_ms` after a successful registration.
 
 ```json
-{ "worker_id": "worker2", "epoch": 7, "free_bytes": 1000000000,
-  "used_bytes": 12582912, "chunk_count": 12, "suspect_chunks": [] }
+{ "worker_id": "worker2", "epoch": 1794220273940473530, "free_bytes": 1000000000,
+  "used_bytes": 12000000, "chunk_count": 12, "suspect_chunks": [] }
 ```
 
-**Response 200** `{"action": "ok"}` or `{"action": "reregister"}` when the
-worker is unknown (e.g. controller restarted), marked `DEAD`, or the epoch is
-stale (DEC-020). Liveness is judged on the controller's receive time only (D11).
+**Response 200** `{"action":"ok"}`, or `{"action":"reregister"}` when the
+worker is unknown (e.g. the controller restarted), marked `DEAD`, or the epoch
+is not its current one (DEC-020). A heartbeat never revives a `DEAD` worker;
+only a new registration does. The controller records its own receive time
+(D11). `suspect_chunks` is accepted and ignored until Phase 8.
+
+**Errors:** 400 `INVALID_REQUEST`. Body limit 1 MiB.
+
+**Worker behaviour on failure:** a failed heartbeat (controller down or
+unreachable) is retried on the next tick; the worker keeps serving with its
+write gate open. If the outage exceeds `DEAD_AFTER`, the controller marks it
+`DEAD` and its next successful heartbeat gets `reregister`.
 
 ---
 
@@ -243,10 +302,11 @@ stale (DEC-020). Liveness is judged on the controller's receive time only (D11).
 
 Workers listen on port 9000 inside the Compose network. **Write gate
 (DEC-006):** PUT and DELETE return 503 `NOT_REGISTERED` while the worker is
-not accepting writes. In Phase 1 the worker runs standalone and accepts
-writes from startup (DEC-026); from Phase 2 it accepts writes only after
-registering with the controller. GET, inventory, and healthz are always
-available.
+not accepting writes. With `CONTROLLER_URL` set (always, under Compose) the
+worker accepts writes only while registered: the gate is closed and drained
+before every registration and opened after it succeeds (DEC-030). Without
+`CONTROLLER_URL` the worker runs standalone and accepts writes from startup
+(DEC-026). GET, inventory, and healthz are always available.
 
 ### `PUT /internal/chunks/{chunk_id}`
 
@@ -264,7 +324,7 @@ never changes the existing file.
 **Response 201** (no file existed) or **200** (an existing file was replaced):
 
 ```json
-{"chunk_id":"3f2b8c1e-9a4d-4e2f-8b7a-1c2d3e4f5a6b_000000","size":1048576,
+{"chunk_id":"3f2b8c1e-9a4d-4e2f-8b7a-1c2d3e4f5a6b_000000","size":1000000,
  "checksum_sha256":"934e1109...","created":true}
 ```
 
@@ -305,7 +365,7 @@ memory at once; others wait (and give up if the client disconnects).
 **Response 200:**
 
 ```json
-{"worker_id":"worker1","chunks":[{"chunk_id":"3f2b8c1e-..._000000","size":1048576}]}
+{"worker_id":"worker1","chunks":[{"chunk_id":"3f2b8c1e-..._000000","size":1000000}]}
 ```
 
 Lists committed chunk files sorted by chunk ID; `chunks` is `[]` (never
@@ -318,4 +378,6 @@ Files whose names are not valid chunk IDs are ignored (and logged).
 ### `GET /healthz` (worker)
 
 200 `{"status":"ok","worker_id":"worker1","registered":false,"accepting_writes":true}`.
-`registered` becomes meaningful in Phase 2.
+`registered` is true while the worker holds a successful registration;
+`accepting_writes` is the write gate's state (both false between a
+`reregister` reply and the next successful registration).

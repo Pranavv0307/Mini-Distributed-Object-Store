@@ -376,3 +376,34 @@ func Inspect(path string) (Report, error) {
 	r.Problem = strings.Join(problems, "; ")
 	return r, nil
 }
+
+// Stats summarises the committed chunks.
+type Stats struct {
+	ChunkCount int64
+	UsedBytes  int64 // sum of payload sizes on disk
+}
+
+// Stats scans the inventory (file metadata only). It is called once per
+// heartbeat; its cost is one directory listing.
+func (s *Store) Stats() (Stats, error) {
+	inv, err := s.Inventory()
+	if err != nil {
+		return Stats{}, err
+	}
+	st := Stats{ChunkCount: int64(len(inv))}
+	for _, e := range inv {
+		st.UsedBytes += e.Size
+	}
+	return st, nil
+}
+
+// FreeBytes reports the space available on the data volume, or -1 if it
+// cannot be determined (always on Windows, see fs_windows.go).
+func (s *Store) FreeBytes() int64 {
+	n, err := freeBytes(s.chunksDir)
+	if err != nil {
+		s.log.Debug("free_bytes_unavailable", "error", err)
+		return -1
+	}
+	return n
+}

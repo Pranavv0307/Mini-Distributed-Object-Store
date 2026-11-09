@@ -3,6 +3,7 @@
 package server
 
 import (
+	"context"
 	"crypto/sha256"
 	"encoding/hex"
 	"errors"
@@ -37,14 +38,15 @@ type Server struct {
 	readSem  chan struct{}
 	log      *slog.Logger
 
-	// acceptingWrites gates chunk PUT and DELETE (DEC-006). Phase 1 workers run
-	// standalone and open the gate at startup; from Phase 2 the gate opens
-	// only after successful registration with the controller.
-	acceptingWrites atomic.Bool
-	registered      atomic.Bool
+	// gate admits chunk PUT and DELETE (DEC-006). In standalone mode it is
+	// opened at startup (DEC-026); with a controller, the membership agent
+	// opens it after each successful registration and closes and drains it
+	// before each inventory snapshot.
+	gate       writeGate
+	registered atomic.Bool
 }
 
-// New creates a Server. Writes are refused until SetAcceptingWrites(true).
+// New creates a Server. Writes are refused until OpenWrites is called.
 func New(st *store.Store, cfg Config) *Server {
 	logger := cfg.Logger
 	if logger == nil {
@@ -59,8 +61,16 @@ func New(st *store.Store, cfg Config) *Server {
 	}
 }
 
-// SetAcceptingWrites opens or closes the write gate.
-func (s *Server) SetAcceptingWrites(v bool) { s.acceptingWrites.Store(v) }
+// OpenWrites opens the write gate: chunk PUT and DELETE are admitted.
+func (s *Server) OpenWrites() { s.gate.setOpen() }
+
+// CloseWritesAndDrain closes the write gate and waits until every admitted
+// PUT/DELETE has finished (or ctx ends). Afterwards, until OpenWrites, the
+// set of chunk files cannot change through the API, so an inventory snapshot
+// is exact.
+func (s *Server) CloseWritesAndDrain(ctx context.Context) error {
+	return s.gate.closeAndDrain(ctx)
+}
 
 // SetRegistered records whether the worker is registered with a controller
 // (reported by /healthz).
@@ -83,10 +93,11 @@ func (s *Server) putChunk(w http.ResponseWriter, r *http.Request) {
 		httpx.WriteError(w, http.StatusBadRequest, wire.CodeInvalidChunkID, fmt.Sprintf("invalid chunk id %q", id))
 		return
 	}
-	if !s.acceptingWrites.Load() {
+	if !s.gate.enter() {
 		httpx.WriteError(w, http.StatusServiceUnavailable, wire.CodeNotRegistered, "worker is not accepting writes until it is registered")
 		return
 	}
+	defer s.gate.exit()
 	sum, err := parseSHA256(r.Header.Get(wire.HeaderChunkSHA256))
 	if err != nil {
 		httpx.WriteError(w, http.StatusBadRequest, wire.CodeInvalidRequest, err.Error())
@@ -184,10 +195,11 @@ func (s *Server) deleteChunk(w http.ResponseWriter, r *http.Request) {
 		httpx.WriteError(w, http.StatusBadRequest, wire.CodeInvalidChunkID, fmt.Sprintf("invalid chunk id %q", id))
 		return
 	}
-	if !s.acceptingWrites.Load() {
+	if !s.gate.enter() {
 		httpx.WriteError(w, http.StatusServiceUnavailable, wire.CodeNotRegistered, "worker is not accepting writes until it is registered")
 		return
 	}
+	defer s.gate.exit()
 	existed, err := s.store.Delete(id)
 	if err != nil {
 		s.log.Error("chunk_delete_failed", "chunk_id", id, "error", err)
@@ -222,7 +234,7 @@ func (s *Server) healthz(w http.ResponseWriter, _ *http.Request) {
 		Status:          "ok",
 		WorkerID:        s.workerID,
 		Registered:      s.registered.Load(),
-		AcceptingWrites: s.acceptingWrites.Load(),
+		AcceptingWrites: s.gate.isOpen(),
 	})
 }
 

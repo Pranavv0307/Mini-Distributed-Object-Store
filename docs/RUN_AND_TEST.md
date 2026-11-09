@@ -6,16 +6,25 @@ Practical, step-by-step instructions to set up, run, and verify the project.
 > observed at the phase noted. Sections for later phases are marked
 > *not yet available* until those phases are implemented.
 
-**Current state (end of Phase 1):** the **worker** is complete as a
-standalone container. There is no controller yet, so there is no client API
-and no `docker-compose.yml` (Phase 2).
+**Current state (end of Phase 2):** the cluster runs under Docker Compose:
+one controller and four workers. Workers register (with their inventory),
+heartbeat, and are marked `DEAD` when they stop; `/cluster` shows it. There
+is no client object API yet (Phase 3).
 
-> ⚠️ **Docker name collisions.** Container and volume names are global on a
-> Docker host. The commands below use names prefixed `objstore-` to avoid
-> clashing with other projects. Before running them, check that
-> `docker ps -a` and `docker volume ls` show no `objstore-w1` /
-> `objstore-w1-data`. **Never** `docker rm` or `docker volume rm` a resource
-> you did not create.
+> ⚠️ **Docker name collisions.** Container names are global on a Docker host.
+> The Compose file uses the spec's names `controller` and `worker1`…`worker4`.
+> If containers with those names already exist (from another project),
+> `docker compose up` fails with a "Conflict" error. **Do not remove containers
+> you did not create.** Instead give this project's containers a prefix
+> (DEC-032):
+>
+> ```bash
+> export OBJSTORE_CONTAINER_PREFIX=objstore-
+> ```
+>
+> and use `objstore-worker2` etc. in the commands below. All commands in this
+> document were verified with that prefix set. Without a prefix, drop
+> `objstore-` from container names (e.g. `docker stop worker2`).
 
 ---
 
@@ -25,26 +34,26 @@ and no `docker-compose.yml` (Phase 2).
 
 | Software | Version verified | Needed for |
 | --- | --- | --- |
-| Go | 1.27.3 (any 1.27.x works; `go.mod` requires ≥ 1.27.0) | Building and testing |
-| Docker Engine | 29.9.2 (Docker Desktop on Windows) | Container image, e2e tests, race detector on Windows |
-| Docker Compose | v5.6.1 (`docker compose`) | Running the cluster (Phase 2+) |
+| Go | 1.27.3 (any 1.27.x; `go.mod` requires ≥ 1.27.0) | Building and testing |
+| Docker Engine | 29.9.2 (Docker Desktop on Windows) | Image, cluster, e2e tests, race detector on Windows |
+| Docker Compose | v5.6.1 (`docker compose`) | Running the cluster |
 | Git (and Git Bash on Windows) | 2.55 | Source control; the shell commands below |
-| curl, sha256sum | bundled with Git Bash | Manual API checks |
+| curl, sha256sum, grep | bundled with Git Bash | Manual API checks |
 
-The shell examples are written for **bash** (Git Bash on Windows, or any
-Linux/macOS shell). On Windows, run them in Git Bash, not PowerShell.
+The shell examples are **bash** (Git Bash on Windows, or Linux/macOS). On
+Windows, run them in Git Bash, not PowerShell. In Git Bash also run
+`export MSYS_NO_PATHCONV=1`, so `docker exec … /data/...` paths are not
+rewritten. `jq` is not required; the examples use `grep`.
 
 ### Installing Go
 
 - **Windows:** `winget install GoLang.Go` (installs to `C:\Program Files\Go`).
-  **Open a new terminal afterwards**: shells started before the install don't
-  have Go on `PATH`. Check with `go version`.
+  **Open a new terminal afterwards.** Check with `go version`.
 - **macOS:** `brew install go`. **Linux:** see <https://go.dev/doc/install>.
 
 ### Docker
 
-Start Docker Desktop and wait until `docker info` prints server information
-without errors (see Troubleshooting if it does not).
+Start Docker Desktop and wait until `docker info` prints server information.
 
 ### Dependencies
 
@@ -52,214 +61,245 @@ without errors (see Troubleshooting if it does not).
 go mod download
 ```
 
-All dependencies are pinned in `go.mod`/`go.sum`.
-
 ---
 
 ## 2. Building
 
-### Go binaries
-
 ```bash
 go build ./...                 # compile everything (no output = success)
-go build -o bin/ ./cmd/...     # binaries into bin/ (ignored by git)
+go build -o bin/ ./cmd/...     # binaries into bin/ (git-ignored)
+docker build -t objstore:dev . # the image Compose uses (DEC-023)
 ```
 
-`bin/worker` is functional. `bin/controller` and `bin/objctl` are still stubs
-that exit with code 2.
-
-### Docker image
-
-```bash
-docker build -t objstore:dev .
-```
-
-One image contains all binaries (DEC-023); its default command is `worker`.
-Verify:
-
-```bash
-docker run --rm objstore:dev worker version
-```
-
-Expected: `worker dev`.
+`bin/controller` and `bin/worker` are functional; `bin/objctl` is still a
+stub. `docker compose up --build` (below) also builds the image.
 
 ---
 
-## 3. Running a worker (Phase 1)
+## 3. Running the cluster (Docker Compose)
 
 ### Configuration
 
-| Variable | Default | Meaning |
-| --- | --- | --- |
-| `WORKER_ID` | *(required)* | Stable identity; `[a-z0-9][a-z0-9_-]{0,62}` |
-| `LISTEN_ADDR` | `:9000` | HTTP listen address |
-| `DATA_DIR` | `/data` | Root of the persistent volume (`chunks/`, `tmp/`) |
-| `CHUNK_SIZE` | `1048576` | Largest accepted chunk payload (provisional, DEC-005) |
-| `FSYNC_ON_WRITE` | `true` | fsync file and directory on write/delete |
-| `MAX_CONCURRENT_READS` | `16` | Chunk GETs held in memory at once |
-| `LOG_LEVEL` | `info` | `debug`, `info`, `warn`, `error` |
+All variables are optional (defaults shown). Set them in the shell or in a
+`.env` file next to `docker-compose.yml` (see `.env.example`).
 
-Invalid configuration prints every problem and exits with code 2.
+| Variable | Applies to | Default | Meaning |
+| --- | --- | --- | --- |
+| `OBJSTORE_CONTAINER_PREFIX` | Compose | *(empty)* | Prefix for container names (DEC-032) |
+| `CONTROLLER_PORT` | Compose | `8080` | Host port (bound to 127.0.0.1) for the controller |
+| `OBJSTORE_IMAGE` | Compose | `objstore:dev` | Image for all services |
+| `HEARTBEAT_INTERVAL` | controller | `3s` | Heartbeat period, sent to workers at registration |
+| `DEAD_AFTER` | controller | `10s` | Silence after which a worker is `DEAD`; must exceed `HEARTBEAT_INTERVAL` |
+| `REPAIR_GRACE` | controller | `30s` | `DEAD` for longer → `repair_eligible` (repair starts in Phase 7) |
+| `FAILURE_CHECK_INTERVAL` | controller | `1s` | How often the failure detector runs |
+| `CHUNK_SIZE` | workers | `1000000` | Max chunk payload: 1 MB (DEC-005) |
+| `FSYNC_ON_WRITE` | workers | `true` | fsync file and directory on write/delete |
+| `MAX_CONCURRENT_READS` | workers | `16` | Chunk GETs held in memory at once |
+| `LOG_LEVEL` | all | `info` | `debug`, `info`, `warn`, `error` |
 
-### Start a worker container with a named volume
+Fixed per service in `docker-compose.yml`: `WORKER_ID=workerN`,
+`ADVERTISE_ADDR=http://workerN:9000`, `CONTROLLER_URL=http://controller:8080`,
+`DATA_DIR=/data` (one named volume per service).
+
+### Start
 
 ```bash
-export MSYS_NO_PATHCONV=1   # Git Bash only: stop it rewriting /data paths
-docker volume create objstore-w1-data
-docker run -d --name objstore-w1 -e WORKER_ID=worker1 \
-  -v objstore-w1-data:/data -p 127.0.0.1:19001:9000 objstore:dev
-W=http://127.0.0.1:19001
-curl -s $W/healthz
+export OBJSTORE_CONTAINER_PREFIX=objstore-   # see the warning at the top
+docker compose up -d --build
+docker compose ps
 ```
 
-Expected:
+Expected: five containers `Up` (health `starting`, then `healthy`). Startup
+order does not matter: workers retry registration until the controller
+answers.
 
-```json
-{"status":"ok","worker_id":"worker1","registered":false,"accepting_writes":true}
+### Health and cluster state
+
+```bash
+curl -s localhost:8080/healthz
+curl -s localhost:8080/cluster
 ```
 
-(Phase 1 workers run standalone, so they accept writes without registering,
-DEC-026.) Port 19001 is published only for this standalone check; in the
-Compose cluster, workers are not published to the host.
+Expected: `{"status":"ok"}`, and a cluster view with
+`"summary":{"total":4,"alive":4,"syncing":0,"dead":0}` (observed within about
+1 s of `up`). Compact per-worker view:
+
+```bash
+curl -s localhost:8080/cluster | grep -o '"summary":{[^}]*}'
+curl -s localhost:8080/cluster | grep -o '"worker_id":"worker[0-9]","address":"[^"]*","state":"[A-Z]*"'
+```
+
+Field meanings: [`API.md`](API.md), section `GET /cluster`.
 
 ### Logs
 
 ```bash
-docker logs objstore-w1
+docker logs objstore-controller
+docker logs objstore-worker2
+docker compose logs -f            # all services, follow
 ```
 
-JSON lines, for example `startup_temp_cleanup` (with `removed_temp_files`),
-`worker_started`, `http_request`, `chunk_stored`, `chunk_put_rejected`,
-`chunk_deleted`.
+JSON lines. Useful events: controller `controller_started`, `worker_syncing`,
+`worker_alive`, `worker_dead`, `worker_reregister_requested`,
+`worker_registration_superseded`, `inventory_reconciled`; worker
+`worker_started` (with `mode`), `worker_registered`, `worker_reregistering`,
+`worker_register_failed`, `heartbeat_failed`, `heartbeat_recovered`,
+`chunk_stored`.
 
-### Run a worker natively (without Docker)
+### Stop, keep data, reset
+
+```bash
+docker compose down        # remove containers; volumes (data) are KEPT
+docker compose up -d       # start again with the same data
+docker compose down -v     # remove containers AND this project's volumes (factory reset)
+```
+
+`down -v` removes only the `objstore` project's volumes
+(`objstore_controller-data`, `objstore_worker1-data`, …).
+
+### Running components individually
+
+**Standalone worker** (no controller; writes accepted at once, DEC-026):
+
+```bash
+docker volume create objstore-w1-data
+docker run -d --name objstore-w1 -e WORKER_ID=worker1 \
+  -v objstore-w1-data:/data -p 127.0.0.1:19001:9000 objstore:dev
+curl -s http://127.0.0.1:19001/healthz
+```
+
+Expected: `{"status":"ok","worker_id":"worker1","registered":false,"accepting_writes":true}`.
+Clean up: `docker rm -f objstore-w1 && docker volume rm objstore-w1-data`.
+
+**Native controller and worker** (no Docker; two terminals):
 
 ```bash
 go build -o bin/ ./cmd/...
-WORKER_ID=worker1 LISTEN_ADDR=127.0.0.1:19001 DATA_DIR=./data/worker1 ./bin/worker
+LISTEN_ADDR=127.0.0.1:18080 ./bin/controller
 ```
 
-It logs `startup_temp_cleanup` and `worker_started` and creates
-`./data/worker1/chunks` and `./data/worker1/tmp` (`bin/` and `data/` are
-git-ignored). Stop it with Ctrl-C (graceful shutdown). Remove `./data` to
-reset.
+```bash
+WORKER_ID=worker1 LISTEN_ADDR=127.0.0.1:19001 DATA_DIR=./data/worker1 \
+  CONTROLLER_URL=http://127.0.0.1:18080 ADVERTISE_ADDR=http://127.0.0.1:19001 ./bin/worker
+```
+
+Then `curl -s localhost:18080/cluster` shows worker1 `ALIVE`, and the worker's
+`/healthz` shows `"registered":true,"accepting_writes":true`. `ADVERTISE_ADDR`
+is required natively because the default (`http://worker1:9000`) is the
+Compose DNS name. Stop each with Ctrl-C; `bin/` and `data/` are git-ignored.
 
 ---
 
-## 4. Functional testing — worker API (verified at Phase 1)
+## 4. Functional testing
 
-With the container from §3 running and `W` set:
+### 4.1 Membership (verified at Phase 2)
+
+With the cluster running (§3):
+
+1. `curl -s localhost:8080/cluster | grep -o '"summary":{[^}]*}'` →
+   `"summary":{"total":4,"alive":4,"syncing":0,"dead":0}`.
+2. Each worker entry has `"address":"http://workerN:9000"`, a large `epoch`
+   (≈ 1.8 × 10¹⁸, DEC-029), `last_heartbeat_age_ms` below 3000, and
+   `"dead_since":null`.
+3. The controller log has `worker_syncing` and `worker_alive` for each
+   worker; each worker log has `worker_registered`.
+
+### 4.2 Worker chunk API (verified at Phase 1/2, standalone worker)
+
+Workers are not published to the host in the cluster, so exercise the chunk
+API on a standalone worker (§3):
 
 ```bash
-head -c 1048576 /dev/urandom > chunk.bin
+W=http://127.0.0.1:19001
+head -c 1000000 /dev/urandom > chunk.bin
 SUM=$(sha256sum chunk.bin | cut -d' ' -f1)
 ID=3f2b8c1e-9a4d-4e2f-8b7a-1c2d3e4f5a6b_000000
+ZERO=0000000000000000000000000000000000000000000000000000000000000000
 ```
 
-**Store a chunk** (expect `201`, `"created":true`):
+| Step | Command | Expected |
+| --- | --- | --- |
+| Store | `curl -s -w ' HTTP %{http_code}\n' -X PUT -H "X-Chunk-SHA256: $SUM" --data-binary @chunk.bin $W/internal/chunks/$ID` | `201`, `"created":true` |
+| Store again | same command | `200`, `"created":false` (idempotent) |
+| Fetch | `curl -s -o fetched.bin $W/internal/chunks/$ID && sha256sum chunk.bin fetched.bin` | identical hashes |
+| Wrong checksum | `curl -s -w ' HTTP %{http_code}\n' -X PUT -H "X-Chunk-SHA256: $ZERO" --data-binary @chunk.bin $W/internal/chunks/${ID%_000000}_000001` | `400`, `CHECKSUM_MISMATCH` |
+| Traversal | `curl -s -w ' HTTP %{http_code}\n' -X PUT -H "X-Chunk-SHA256: $SUM" --data-binary @chunk.bin "$W/internal/chunks/..%2Fescape"` | `400`, `INVALID_CHUNK_ID` |
+| Inventory | `curl -s $W/internal/workers/worker1/chunks` | one chunk, `"size":1000000` |
+| Files | `docker exec objstore-w1 ls -l /data/chunks /data/tmp` | one 1000048-byte file (48-byte header); `tmp` empty |
+| Inspect | `docker exec objstore-w1 worker inspect /data/chunks/$ID` | `status: VALID`, exit 0 |
+| Delete twice | `curl -s -o /dev/null -w '%{http_code}\n' -X DELETE $W/internal/chunks/$ID` | `204`, then `204` |
+| Fetch deleted | `curl -s -w ' HTTP %{http_code}\n' $W/internal/chunks/$ID` | `404`, `CHUNK_NOT_FOUND` |
 
-```bash
-curl -s -w ' HTTP %{http_code}\n' -X PUT -H "X-Chunk-SHA256: $SUM" \
-  --data-binary @chunk.bin $W/internal/chunks/$ID
-```
+Corruption on one worker (before deleting):
+`docker exec objstore-w1 sh -c "printf garbage >> /data/chunks/$ID"` →
+`worker inspect` reports `status: CORRUPT (payload is 1000007 bytes, header
+says 1000000; …)` with exit code 1; the inventory reports `"size":1000007`;
+GET returns 1000001 bytes (capped at `CHUNK_SIZE + 1`, DEC-025). The worker
+never judges validity; the controller will (Phase 4).
 
-**Store it again** (idempotent: expect `200`, `"created":false`): repeat the
-command above.
+### 4.3 Client object API
 
-**Fetch and compare** (both hashes identical; header carries the checksum):
-
-```bash
-curl -s -o fetched.bin -D - $W/internal/chunks/$ID | grep -i -E 'HTTP/|x-chunk-sha256|content-length'
-sha256sum chunk.bin fetched.bin
-```
-
-**Wrong checksum is rejected** (expect `400` `CHECKSUM_MISMATCH`, nothing stored):
-
-```bash
-curl -s -w ' HTTP %{http_code}\n' -X PUT \
-  -H "X-Chunk-SHA256: 0000000000000000000000000000000000000000000000000000000000000000" \
-  --data-binary @chunk.bin $W/internal/chunks/3f2b8c1e-9a4d-4e2f-8b7a-1c2d3e4f5a6b_000001
-```
-
-**Path traversal is rejected** (expect `400` `INVALID_CHUNK_ID` for `"../escape"`):
-
-```bash
-curl -s -w ' HTTP %{http_code}\n' -X PUT -H "X-Chunk-SHA256: $SUM" \
-  --data-binary @chunk.bin "$W/internal/chunks/..%2Fescape"
-```
-
-**Inventory** (one chunk, `size` 1048576):
-
-```bash
-curl -s $W/internal/workers/worker1/chunks
-```
-
-**Look at the files and verify one with the inspect tool** (`status: VALID`, exit code 0):
-
-```bash
-docker exec objstore-w1 ls -l /data/chunks /data/tmp
-docker exec objstore-w1 worker inspect /data/chunks/$ID
-```
-
-Each chunk file is 48 bytes larger than its payload (the header, DEC-012).
-
-**Delete** (expect `204` twice: idempotent; then GET → `404` `CHUNK_NOT_FOUND`):
-
-```bash
-curl -s -o /dev/null -w 'DELETE HTTP %{http_code}\n' -X DELETE $W/internal/chunks/$ID
-curl -s -o /dev/null -w 'DELETE again HTTP %{http_code}\n' -X DELETE $W/internal/chunks/$ID
-curl -s -w ' HTTP %{http_code}\n' $W/internal/chunks/$ID
-```
+*Not yet available* (Phases 3–5).
 
 ---
 
-## 5. Failure testing (Phase 1: single worker)
+## 5. Failure testing
 
-Re-create the chunk first (the PUT from §4).
-
-**Persistence across stop/start** (hash after restart equals `$SUM`):
+### 5.1 Stop and restart a worker (verified at Phase 2, default timings)
 
 ```bash
-docker stop objstore-w1 && docker start objstore-w1
-curl -s $W/internal/chunks/$ID | sha256sum
+docker stop objstore-worker2
+curl -s localhost:8080/cluster | grep -o '"worker_id":"worker2"[^}]*}'
 ```
 
-(After `docker start`, wait a moment until `curl -s $W/healthz` answers.)
-
-**Simulated corruption** (append bytes to the chunk file):
+Until `DEAD_AFTER` (10 s) passes, worker2 is still `ALIVE` with a growing
+`last_heartbeat_age_ms`. About 10 s after the stop (observed: 10 s), it is
+`"state":"DEAD"` with a `dead_since` timestamp; the summary shows
+`"alive":3,"dead":1`; the other three stay `ALIVE`. Once `REPAIR_GRACE`
+(30 s) more has passed, `"repair_eligible":true`. The controller logs
+`worker_dead` with the measured `silence`.
 
 ```bash
-docker exec objstore-w1 sh -c "printf garbage >> /data/chunks/$ID"
-docker exec objstore-w1 worker inspect /data/chunks/$ID; echo "exit code: $?"
-curl -s $W/internal/workers/worker1/chunks
-curl -s $W/internal/chunks/$ID | wc -c
+docker start objstore-worker2
 ```
 
-Expected: `inspect` reports `status: CORRUPT (payload is 1048583 bytes,
-header says 1048576; payload SHA-256 does not match header)` and exit code 1;
-the inventory reports `size` 1048583; GET returns 1048577 bytes (capped at
-`CHUNK_SIZE + 1`, DEC-025). The worker returns bytes as stored and never
-decides validity itself; the controller's verification (Phase 4) rejects them.
+Within a second or two (observed: 1 s): worker2 is `ALIVE` with a **new,
+larger `epoch`** and `"dead_since":null`. Its log shows
+`worker_registered`; the controller log shows `worker_syncing` then
+`worker_alive`. Data on its volume is untouched (it re-registered with its
+inventory).
 
-**Kill mid-write leaves no partial chunk:** automated in
-`TestWorkerKilledMidWriteLeavesNoPartialChunk` (native process) and the e2e
-subtest `no partial chunk after kill mid-write` (container); see §6.
-
-**Clean up** (only what you created above):
+### 5.2 Controller restart (verified at Phase 2)
 
 ```bash
-docker rm -f objstore-w1 && docker volume rm objstore-w1-data
-rm -f chunk.bin fetched.bin
+docker restart objstore-controller
+curl -s localhost:8080/cluster | grep -o '"summary":{[^}]*}'
 ```
 
-Controller restarts, multi-worker failures, and repair: *not yet available*
-(Phases 2, 6–9).
+The restarted controller has an empty registry; each worker's next heartbeat
+is answered `reregister` (controller log `worker_reregister_requested` with
+`"reason":"unknown_worker"`), and all four return to `ALIVE` with new epochs
+without anything being done to the workers (observed: 4 `ALIVE` within 2 s).
+While the controller is down, workers keep running and retry.
+
+### 5.3 Unavailable workers
+
+`docker stop` is the supported way to make a worker unavailable; stopping
+several workers shows each going `DEAD` independently. Network-partition
+simulation (`docker network disconnect`) and multi-worker data scenarios
+arrive with the data path (Phases 6–9).
+
+### 5.4 Corruption, repair, crash consistency
+
+Single-worker corruption visibility: §4.2. Controller-side detection and
+repair: *not yet available* (Phases 4, 7–9). Crash mid-write on a worker:
+covered by automated tests (§6).
 
 ---
 
 ## 6. Automated testing and static analysis
 
-Run from the repository root. All commands verified at Phase 1.
+Run from the repository root. All verified at Phase 2.
 
 ### Unit and integration tests
 
@@ -267,25 +307,25 @@ Run from the repository root. All commands verified at Phase 1.
 go test ./...
 ```
 
-Expected:
+Expected (all `ok`; `cmd/*` and `internal/wire` print `[no test files]`):
 
 ```
-?   	objstore/cmd/controller	[no test files]
-?   	objstore/cmd/objctl	[no test files]
-?   	objstore/cmd/worker	[no test files]
-ok  	objstore/internal/config	...
-ok  	objstore/internal/httpx	...
-ok  	objstore/internal/ids	...
-ok  	objstore/internal/version	...
-?   	objstore/internal/wire	[no test files]
-ok  	objstore/internal/worker/server	...
-ok  	objstore/internal/worker/store	...
-ok  	objstore/test/integration	...
+ok  	objstore/internal/config
+ok  	objstore/internal/controller/api
+ok  	objstore/internal/controller/registry
+ok  	objstore/internal/httpx
+ok  	objstore/internal/ids
+ok  	objstore/internal/version
+ok  	objstore/internal/worker/agent
+ok  	objstore/internal/worker/server
+ok  	objstore/internal/worker/store
+ok  	objstore/test/integration
 ```
 
-`test/integration` builds the worker binary (needs `go` on `PATH`), kills it
-mid-write, and restarts it: about 5–15 s. Skip it with `go test -short ./...`.
-Add `-count=1` to bypass the test cache, `-v` for detail.
+`test/integration` runs an in-process cluster (controller + 4 workers with
+50 ms heartbeats and a 300 ms `DEAD_AFTER`) and builds and kills the real
+worker binary; about 5–20 s. `go test -short ./...` skips the timing-based and
+process-spawning tests. Add `-count=1` to bypass the cache, `-v` for detail.
 
 ### End-to-end tests (Docker)
 
@@ -293,22 +333,24 @@ Add `-count=1` to bypass the test cache, `-v` for detail.
 go test -tags e2e -count=1 -v ./test/e2e/...
 ```
 
-Builds `objstore:e2e` from the repository, then runs a worker container on a
-uniquely named container and volume (`objstore-e2e-*`, removed afterwards)
-and checks: wrong checksum rejected; data survives `docker stop/start`; no
-partial chunk after `docker kill` mid-write; `worker inspect` reports VALID;
-data survives removing and re-creating the container on the same volume.
-Expected: `--- PASS: TestWorkerContainer` with 5 passing subtests (~15 s
-after the image is built). Set `E2E_IMAGE=objstore:dev` to reuse an
-existing image instead of building.
+Builds `objstore:e2e` once, then runs:
+
+- `TestComposeClusterMembership`: the Compose stack under a **unique project
+  name, container prefix (`objstore-e2e-<n>-`), and free host port**, with
+  `HEARTBEAT_INTERVAL=1s`, `DEAD_AFTER=4s`, `REPAIR_GRACE=6s`. Checks: 4
+  `ALIVE`; `docker stop` worker2 → `DEAD` (others `ALIVE`) → repair-eligible;
+  `docker start` → `ALIVE` with a newer epoch; `docker restart` controller →
+  all four re-register with newer epochs. Removes only its own project
+  (`compose down -v`).
+- `TestWorkerContainer`: the standalone worker container checks from Phase 1.
+
+Expected: both `PASS` (about 1 minute including the image build). Set
+`E2E_IMAGE=objstore:dev` to reuse an existing image.
 
 ### Race detector
 
-On Linux/macOS with a C toolchain: `go test -race ./...`.
-
-On **Windows**, `-race` needs cgo and a C compiler, which is not installed.
-Run it in the Go container (DEC-018). The named volumes `objstore-gomod` and
-`objstore-gocache` cache modules and builds; the source is mounted read-only.
+On Linux/macOS with a C toolchain: `go test -race ./...`. On **Windows**, run
+it in the Go container (DEC-018):
 
 PowerShell:
 
@@ -322,8 +364,7 @@ Git Bash:
 MSYS_NO_PATHCONV=1 docker run --rm -v "$(pwd -W):/src:ro" -v objstore-gomod:/go/pkg/mod -v objstore-gocache:/root/.cache/go-build -w /src golang:1.27.3 go test -race -count=1 ./...
 ```
 
-Expected: the same `ok` lines as above. This also runs the crash test on
-Linux, exercising real directory fsync and SIGKILL.
+Expected: the same `ok` lines.
 
 ### Static analysis
 
@@ -333,7 +374,7 @@ gofmt -l .
 go tool staticcheck ./... && go tool staticcheck -tags e2e ./...
 ```
 
-Expected: no output (exit code 0). Fix formatting with `gofmt -w .`.
+Expected: no output (exit code 0).
 
 ### Full pre-review check
 
@@ -349,13 +390,16 @@ Expected last line: `ALL-OK`. Then run the race detector and the e2e tests.
 
 | Symptom | Likely cause | Fix |
 | --- | --- | --- |
-| `go: command not found` / `'go' is not recognized` | Go not installed, or terminal opened before installing | Install Go; open a new terminal; or call `"C:\Program Files\Go\bin\go.exe"` |
-| `go: go.mod requires go >= 1.27.0` | Older Go toolchain | Install Go 1.27.x |
-| `failed to connect to the docker API at npipe:////./pipe/dockerDesktopLinuxEngine` | Docker Desktop not running or still starting | Start Docker Desktop; wait until `docker info` succeeds. If it exits right away, start it again from the Start menu and check for prompts |
+| `Conflict. The container name "/worker1" is already in use` on `compose up` | Another project uses the spec's container names | `export OBJSTORE_CONTAINER_PREFIX=objstore-` and retry. Do **not** remove containers you did not create |
+| `port is already allocated` for 8080 | Something else uses port 8080 | `export CONTROLLER_PORT=18080` and use that port with `curl` |
+| `/cluster` shows fewer than 4 workers right after `up` or a controller restart | Workers have not (re-)registered yet | Wait one heartbeat interval (3 s); check `docker logs <worker>` for `worker_register_failed` |
+| A worker stays `SYNCING` | Registration failed during inventory reconciliation (possible from Phase 6) | Check controller logs for `inventory_reconcile_failed`; the worker retries automatically |
+| Controller exits with `DEAD_AFTER (…) must be greater than HEARTBEAT_INTERVAL` | Misconfigured timings | Make `DEAD_AFTER` larger (≥ 3 × the heartbeat interval recommended) |
+| Worker logs `heartbeat_failed` repeatedly | Controller down or unreachable | Start the controller; the worker re-registers automatically |
+| Worker `/healthz` shows `"registered":false` with a controller configured | Registration not yet succeeded | Check worker logs for `worker_register_failed` and the error; check `CONTROLLER_URL` / `ADVERTISE_ADDR` |
+| PUT to a worker returns `503 NOT_REGISTERED` | Worker not (yet) registered | Wait for registration; check `/healthz` `accepting_writes` |
+| `go: command not found` / `'go' is not recognized` | Go not installed or terminal predates install | Install Go; open a new terminal |
+| `failed to connect to the docker API at npipe:////./pipe/dockerDesktopLinuxEngine` | Docker Desktop not running | Start it; wait for `docker info` to succeed |
 | `-race requires cgo` / `C compiler "gcc" not found` (Windows) | Native race detector needs a C toolchain | Use the Docker race command in §6 |
-| `ls: C:/Program Files/Git/data/...: No such file or directory` from `docker exec` | Git Bash rewrote `/data/...` into a Windows path | `export MSYS_NO_PATHCONV=1` before running `docker` commands |
-| `Conflict. The container name "/…" is already in use` | A container with that name exists (possibly from another project) | Pick a different name. Do **not** remove a container you did not create |
-| Worker exits with `invalid configuration: WORKER_ID is required` | `WORKER_ID` not set | Pass `-e WORKER_ID=worker1` |
-| PUT returns `400 INVALID_REQUEST` "Content-Length header is required" | Client used chunked transfer encoding | Send a body with a known length (curl `--data-binary @file` does) |
-| PUT returns `503 NOT_REGISTERED` | Write gate closed (from Phase 2: worker not yet registered) | Wait for registration; check `/healthz` `accepting_writes` |
-| Shell scripts fail in containers with `\r: command not found` | CRLF line endings | `.gitattributes` enforces LF for checked-out files; convert locally created files with `dos2unix` |
+| `ls: C:/Program Files/Git/data/...` from `docker exec` | Git Bash path conversion | `export MSYS_NO_PATHCONV=1` |
+| Shell scripts fail in containers with `\r: command not found` | CRLF line endings | `.gitattributes` enforces LF; convert local files with `dos2unix` |

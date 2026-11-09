@@ -374,3 +374,18 @@ func flipByte(path string, off int64) error {
 	_, err = f.WriteAt(b[:], off)
 	return err
 }
+
+func TestStats(t *testing.T) {
+	s := openTest(t, t.TempDir())
+	if st, err := s.Stats(); err != nil || st != (Stats{}) {
+		t.Fatalf("empty Stats = %+v, %v", st, err)
+	}
+	put(t, s, testObj+"_000000", payload(10, 1))
+	put(t, s, testObj+"_000001", payload(32, 1))
+	if st, err := s.Stats(); err != nil || st != (Stats{ChunkCount: 2, UsedBytes: 42}) {
+		t.Fatalf("Stats = %+v, %v", st, err)
+	}
+	if fb := s.FreeBytes(); fb == 0 || fb < -1 {
+		t.Fatalf("FreeBytes = %d, want positive or -1 (unknown)", fb)
+	}
+}

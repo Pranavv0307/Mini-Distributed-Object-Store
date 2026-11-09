@@ -19,6 +19,7 @@ import (
 	"testing"
 	"time"
 
+	"objstore/internal/config"
 	"objstore/internal/wire"
 )
 
@@ -129,8 +130,8 @@ func TestWorkerKilledMidWriteLeavesNoPartialChunk(t *testing.T) {
 	committed := bytes.Repeat([]byte("committed "), 50_000) // 500 KB
 	putChunk(t, w.base, committedID, committed)
 
-	// Start a 1 MiB PUT but send only the first 256 KiB.
-	full := bytes.Repeat([]byte{0xab}, 1<<20)
+	// Start a full-size (CHUNK_SIZE) PUT but send only the first 256 KiB.
+	full := bytes.Repeat([]byte{0xab}, int(config.DefaultChunkSize))
 	sum := sha256.Sum256(full)
 	pr, pw := io.Pipe()
 	req, _ := http.NewRequest(http.MethodPut, w.base+"/internal/chunks/"+partialID, pr)

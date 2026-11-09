@@ -191,3 +191,133 @@ All on 2026-11-09:
 Phase 2: controller skeleton, registry with `SYNCING`/epochs, registration
 and heartbeats (the worker's write gate closes until registered), failure
 detector, `/healthz`, `/cluster`, `docker-compose.yml`.
+
+---
+
+## Between Phases 1 and 2 — owner decisions and incident remediation (2026-11-09)
+
+- **Stray file removed (owner-approved).** The 7-byte file
+  `chunks/3f2b8c1e-9a4d-4e2f-8b7a-1c2d3e4f5a6b_000000` that the Phase 1
+  walkthrough had written into the owner's `dos_worker1-data` volume was
+  deleted (after checking its content was exactly `garbage`) using a
+  throwaway `alpine` container. A check afterwards showed no other file in that
+  volume modified in the preceding two hours. The deleted `dos` worker1
+  *container* must be recreated by the owner from that project's Compose
+  file; its data volume is intact.
+- **Chunk size confirmed as 1 MB = 1,000,000 bytes** (DEC-005 → ACCEPTED,
+  replacing the provisional 1 MiB). Changed `config.DefaultChunkSize`, its
+  test, `.env.example`, the integration and e2e tests (which now derive sizes
+  from `config.DefaultChunkSize`), and all docs; recorded as a deviation from
+  the architecture document in `ARCHITECTURE.md` §10. The Phase 1 e2e test
+  payload (1,045,000 bytes) became oversized and was reduced to 990,000 bytes.
+
+---
+
+## Phase 2 — Membership and failure detection (2026-11-09)
+
+### What was implemented
+
+- **`internal/config`**: `LoadController` (listen address, `HEARTBEAT_INTERVAL`,
+  `DEAD_AFTER`, `REPAIR_GRACE`, `FAILURE_CHECK_INTERVAL`; rejects
+  `DEAD_AFTER <= HEARTBEAT_INTERVAL`); worker `CONTROLLER_URL` and
+  `ADVERTISE_ADDR` (default `http://<WORKER_ID>:<port>`); duration and URL
+  loaders.
+- **`internal/wire`**: register/heartbeat request and response types,
+  heartbeat actions, `/cluster` view types, `REGISTRATION_SUPERSEDED` code.
+- **`internal/controller/registry`**: worker states `SYNCING`/`ALIVE`/`DEAD`,
+  epochs from boot time (DEC-029), `BeginRegistration` /
+  `CompleteRegistration` (epoch-checked), `Heartbeat` (reregister on
+  unknown, `DEAD`, or stale epoch), `CheckLiveness`, `Alive()` (excludes
+  `SYNCING`), `RunFailureDetector`, derived repair eligibility. Injectable
+  clock.
+- **`internal/controller/api`**: register (validate → SYNCING → reconcile hook
+  → ALIVE if current → reply), heartbeat, `/healthz`, `/cluster`;
+  `InventoryReconciler` interface with `NoopReconciler` (Phase 6 supplies the
+  real one).
+- **`internal/worker/server`**: the on/off write flag became `writeGate`, which
+  counts admitted requests and can close-and-drain (DEC-030);
+  `OpenWrites`/`CloseWritesAndDrain` replace `SetAcceptingWrites`.
+- **`internal/worker/store`**: `Stats()` (chunk count, used bytes) and
+  `FreeBytes()` (`statfs` on Linux; `-1` on Windows).
+- **`internal/worker/agent`**: the membership loop (close+drain → snapshot →
+  register with backoff+jitter → open → heartbeat → on `reregister`, repeat).
+- **`cmd/controller`**: real binary with failure detector and graceful
+  shutdown. **`cmd/worker`**: runs the agent when `CONTROLLER_URL` is set,
+  standalone otherwise (DEC-026, narrowed).
+- **`docker-compose.yml`**: project `objstore`, controller + `worker1..4`,
+  one named volume each, loopback-only published port, optional container
+  prefix (DEC-032), healthchecks.
+- **Tests**: registry (fake clock), API handlers, gate draining, agent (fake
+  controller), in-process cluster integration tests, Compose e2e test.
+
+### Important decisions
+
+DEC-029 (epochs from boot time), DEC-030 (draining write gate), DEC-031
+(heartbeat failures keep the gate open), DEC-032 (Compose naming and port),
+DEC-033 (controller owns liveness timing; `FAILURE_CHECK_INTERVAL`). DEC-026
+narrowed to an explicit standalone mode. DEC-006 updated: draining removes
+the residual "late repair PUT" case it had anticipated.
+
+**`SYNCING` evaluation (owner's §4.5 question), as built.** The worker is
+unusable while `SYNCING` (excluded from `Registry.Alive()`), its writes are
+gated and drained before the snapshot, and `ALIVE` is reached only through
+an epoch-checked transition. Tests cover a superseded registration
+(`TestSupersededRegistrationCannotMarkAlive`, `TestSupersededDuringReconcile`),
+death during sync (`TestDeathDuringSyncBlocksCompletion`), the drain
+(`TestCloseWritesDrainsInFlightPut`), and refusing writes until registered
+(`TestWritesRefusedUntilRegistered`). The metadata-dependent races (stale
+`OK` rows counted as effective, false "missing") are tested in Phase 6, when
+reconciliation has metadata to compare.
+
+### Problems encountered and resolutions
+
+1. **Agent test hung.** The test helper returned a buffered result channel;
+   `TestRunStopsOnCancel` read the single value and the cleanup then waited on
+   the same channel forever. Replaced it with a channel closed on completion
+   plus an error variable.
+2. **Sleeps in agent tests.** Two tests used fixed sleeps to let failures
+   happen; the fake controller now counts rejected requests, and the tests wait
+   for a count.
+3. **Registry test arithmetic.** A repair-eligibility check forgot that an
+   earlier step had already advanced the fake clock; the test, not the code,
+   was wrong.
+4. **Escaped newline lost** when editing a Go string through a Python heredoc;
+   fixed with a direct edit.
+5. **Phase 1 e2e payload too large** after the chunk-size change (see above).
+6. **Docker safety.** Every manual Docker command was run with the
+   `objstore-` prefix after checking that no such names, volumes, or listener
+   on port 8080 existed; the e2e test uses unique project names, prefixes and
+   ports, and removes only its own project. Native processes were stopped by
+   PID. No leftover resources after any run.
+
+### Tests performed and results (2026-11-09)
+
+- `go build`, `go vet` (default and `-tags e2e`), `gofmt -l` (empty),
+  `go tool staticcheck` (default and `-tags e2e`): pass.
+- `go test -count=3 ./...` (Windows): pass.
+- `go test -race -count=3 ./...` in `golang:1.27.3` (Linux): pass.
+- `go test -tags e2e -count=1 -v ./test/e2e/...`: `TestComposeClusterMembership`
+  (3 subtests) and `TestWorkerContainer` (5 subtests) pass.
+- Manual Compose walkthrough with default timings and
+  `OBJSTORE_CONTAINER_PREFIX=objstore-`: 4 `ALIVE` ≈ 1 s after `up`; worker2
+  `DEAD` 10 s after `docker stop`; `ALIVE` ≈ 1 s after `docker start` with a
+  new epoch; 4 `ALIVE` ≈ 2 s after `docker restart` of the controller;
+  `docker compose down -v` removed only `objstore_*` resources.
+- Manual standalone worker walkthrough re-run with 1 MB chunks (all numbers in
+  `RUN_AND_TEST.md` §4.2 observed).
+- Native controller + worker pair: worker registers, `ALIVE`.
+
+### Known limitations
+
+- Inventory reconciliation is a no-op until Phase 6 (no metadata yet).
+- `free_bytes` is `-1` on Windows (development only).
+- `/cluster` lists only workers; chunk and repair counters come in Phases 6–8.
+- Network-partition simulation is not yet demonstrated (optional scenario 14).
+- The in-memory registry means `/cluster` is briefly empty after a controller
+  restart (by design).
+
+### Work remaining
+
+Phase 3: metadata DB (SQLite), upload path (chunking, placement on `ALIVE`
+workers, claim-before-write, `pending_deletes`, atomic commit, windowed
+upload).

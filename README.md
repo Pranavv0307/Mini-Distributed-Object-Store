@@ -6,9 +6,10 @@ a single controller keeps the metadata, detects failed workers, and repairs
 lost or corrupted data automatically. The whole system runs on one machine
 with Docker Compose.
 
-> **Implementation status: Phase 1 of 11 complete.** The storage **worker**
-> works as a standalone Docker container (durable, atomic, checksummed chunk
-> storage over HTTP). The controller and client API come next. See
+> **Implementation status: Phase 2 of 11 complete.** The cluster (1
+> controller + 4 workers) runs under Docker Compose: workers store chunks
+> durably, register with the controller, heartbeat, and are detected as `DEAD`
+> when stopped. The client object API (upload/download) comes next. See
 > [Current status](#current-status).
 
 ## The problem
@@ -46,7 +47,7 @@ with rationale: [`docs/reference/Object_Store_Architecture.md`](docs/reference/O
 | --- | --- |
 | Durable, atomic, checksummed chunk storage on workers | 1 |
 | Worker registration, heartbeats, failure detection | 2 |
-| Streaming upload: 1 MiB chunks, RF = 2 on distinct workers, atomic commit | 3 |
+| Streaming upload: 1 MB (1,000,000-byte) chunks, RF = 2 on distinct workers, atomic commit | 3 |
 | Streaming download with per-chunk verification and replica fallback | 4 |
 | Metadata GET/PATCH, list with pagination, delete | 5 |
 | Correct operation with a worker down; inventory resync on return | 6 |
@@ -72,7 +73,7 @@ Reasons for each choice: [`docs/DECISIONS.md`](docs/DECISIONS.md).
 
 ```
 cmd/
-  controller/        controller binary (stub)
+  controller/        controller binary
   worker/            worker binary (+ `worker inspect` debug tool)
   objctl/            client CLI (stub)
 internal/
@@ -80,13 +81,17 @@ internal/
   config/            environment-variable configuration
   wire/              shared JSON types, headers, error codes
   httpx/             JSON errors, request logging middleware
+  controller/registry/ worker states, epochs, failure detector
+  controller/api/    controller HTTP API (membership, /healthz, /cluster)
   worker/store/      on-disk chunk store (atomic, checksummed)
-  worker/server/     worker HTTP API
+  worker/server/     worker HTTP API and write gate
+  worker/agent/      worker membership: register, heartbeat, re-register
   version/           build version string
 test/
-  integration/       multi-process tests (kill worker mid-write)
-  e2e/               Docker tests (build tag `e2e`)
+  integration/       in-process cluster tests; kill worker mid-write
+  e2e/               Docker and Compose tests (build tag `e2e`)
 Dockerfile           one image for all binaries
+docker-compose.yml   controller + worker1..worker4, one volume each
 docs/
   ARCHITECTURE.md        system as implemented, deviations from the design
   IMPLEMENTATION_PLAN.md phase roadmap and status
@@ -101,9 +106,8 @@ docs/
 ## Prerequisites
 
 - **Go 1.27.x** (`go version`). On Windows: `winget install GoLang.Go`.
-- **Docker** with **Docker Compose v2** (Docker Desktop on Windows/macOS).
-  Required for the race detector on Windows now, and for running the cluster
-  from Phase 1.
+- **Docker** with **Docker Compose v2** (Docker Desktop on Windows/macOS):
+  runs the cluster, the e2e tests, and the race detector on Windows.
 - **Git.**
 
 ## Quick start
@@ -115,17 +119,20 @@ go build ./...
 go test ./...
 ```
 
-Run a standalone worker in Docker (Git Bash / Linux / macOS):
+Run the cluster (Git Bash / Linux / macOS):
 
 ```bash
-docker build -t objstore:dev .
-docker volume create objstore-w1-data
-docker run -d --name objstore-w1 -e WORKER_ID=worker1 -v objstore-w1-data:/data -p 127.0.0.1:19001:9000 objstore:dev
-curl -s http://127.0.0.1:19001/healthz
+docker compose up -d --build
+curl -s localhost:8080/cluster        # 4 workers ALIVE
+docker stop worker2                   # ~10 s later: worker2 DEAD
+docker start worker2                  # ALIVE again (re-registered)
+docker compose down                   # stop; data volumes are kept (-v deletes them)
 ```
 
-Store, fetch, corrupt, and inspect chunks: see
-[`docs/RUN_AND_TEST.md`](docs/RUN_AND_TEST.md) §3–5.
+> If containers named `controller` or `worker1`…`worker4` already exist on
+> your machine (another project), first run
+> `export OBJSTORE_CONTAINER_PREFIX=objstore-` and use `objstore-worker2` etc.
+> Never remove containers you did not create.
 
 Full, verified instructions: [`docs/RUN_AND_TEST.md`](docs/RUN_AND_TEST.md).
 
@@ -153,8 +160,9 @@ implemented.
 | Phase | Theme | Status |
 | --- | --- | --- |
 | 0 | Setup and design lock-in | COMPLETED |
-| 1 | Worker: durable chunk store over HTTP, in Docker | COMPLETED (awaiting review) |
-| 2–11 | See [implementation plan](docs/IMPLEMENTATION_PLAN.md) | NOT STARTED |
+| 1 | Worker: durable chunk store over HTTP, in Docker | COMPLETED |
+| 2 | Membership, failure detection, `SYNCING`, Compose cluster | COMPLETED (awaiting review) |
+| 3–11 | See [implementation plan](docs/IMPLEMENTATION_PLAN.md) | NOT STARTED |
 
-Open items awaiting owner confirmation: chunk size definition (DEC-005,
-provisionally 1 MiB) and string-only custom metadata values (DEC-013).
+Open item awaiting owner confirmation: string-only custom metadata values
+(DEC-013). The chunk size is confirmed as 1 MB = 1,000,000 bytes (DEC-005).

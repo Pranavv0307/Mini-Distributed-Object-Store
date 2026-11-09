@@ -20,3 +20,7 @@ const (
 func isDiskFull(err error) bool {
 	return errors.Is(err, errorDiskFull) || errors.Is(err, errorHandleDiskFull)
 }
+
+// freeBytes is not implemented on Windows (it would need golang.org/x/sys);
+// callers report -1 ("unknown").
+func freeBytes(string) (int64, error) { return 0, errors.ErrUnsupported }

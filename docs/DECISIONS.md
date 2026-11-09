@@ -16,7 +16,7 @@ explicit owner confirmation; may change) · `SUPERSEDED by DEC-nnn`.
 | DEC-002 | Standard-library HTTP and routing, no framework | ACCEPTED | 0 |
 | DEC-003 | SQLite via pure-Go `modernc.org/sqlite` | ACCEPTED | 0 (used from 3) |
 | DEC-004 | `golang.org/x/sync` for bounded fan-out | ACCEPTED | 0 (used from 3) |
-| DEC-005 | Chunk size = 1 MiB (1,048,576 bytes) | PROVISIONAL | 0 |
+| DEC-005 | Chunk size = 1 MB (1,000,000 bytes) | ACCEPTED (owner-confirmed) | 0, changed in 1 |
 | DEC-006 | `SYNCING` worker state, registration epochs, worker write gating | ACCEPTED | 0 (built in 2/6) |
 | DEC-007 | `pending_deletes` table for exact physical cleanup | ACCEPTED | 0 (built in 3/5/9) |
 | DEC-008 | Repair target rule and in-place corrupt repair | ACCEPTED | 0 (built in 7/8) |
@@ -37,9 +37,14 @@ explicit owner confirmation; may change) · `SUPERSEDED by DEC-nnn`.
 | DEC-023 | One Alpine image for all binaries, non-root user | ACCEPTED | 1 |
 | DEC-024 | Chunk PUT always writes and atomically replaces | ACCEPTED | 1 |
 | DEC-025 | Chunk GET loads into memory under a striped lock, bounded concurrency | ACCEPTED | 1 |
-| DEC-026 | Phase 1 workers run standalone with the write gate open | ACCEPTED | 1 (superseded in 2) |
+| DEC-026 | Standalone worker mode (no `CONTROLLER_URL`) keeps the write gate open | ACCEPTED (narrowed in 2) | 1 |
 | DEC-027 | Unreadable chunk header → 500 `CHUNK_CORRUPT` | ACCEPTED | 1 |
 | DEC-028 | Identifier package is `internal/ids` (not `chunkid`) | ACCEPTED | 1 |
+| DEC-029 | Registration epochs start at controller boot time (ns) | ACCEPTED | 2 |
+| DEC-030 | Write gate drains in-flight writes before the inventory snapshot | ACCEPTED | 2 |
+| DEC-031 | Heartbeat failures do not close the write gate | ACCEPTED | 2 |
+| DEC-032 | Compose: spec container names with optional prefix; loopback-only port | ACCEPTED | 2 |
+| DEC-033 | Liveness timing owned by the controller (`HEARTBEAT_INTERVAL` sent at registration; `FAILURE_CHECK_INTERVAL`) | ACCEPTED | 2 |
 
 ---
 
@@ -102,18 +107,22 @@ explicit owner confirmation; may change) · `SUPERSEDED by DEC-nnn`.
   `go.sum` transitively through `staticcheck`; it becomes a direct dependency
   in Phase 3.)
 
-## DEC-005 — Chunk size = 1 MiB (1,048,576 bytes) — PROVISIONAL
+## DEC-005 — Chunk size = 1 MB (1,000,000 bytes) — ACCEPTED
 
 - **Context.** The specification says "1 MB"; the architecture (§3.1, D3) chose
-  1 MiB and requires one definition used everywhere. The owner will confirm.
-- **Alternatives.** 1 MB = 1,000,000 bytes.
-- **Choice.** 1,048,576 bytes, held in one constant/config value
-  (`CHUNK_SIZE`), never repeated as a literal.
-- **Why.** Matches the architecture; power-of-two buffers.
-- **Consequences.** Switching to 1,000,000 is a one-line default change plus
-  doc/test expectations (e.g. a "5.5 MiB → 6 chunks" checkpoint). Tests must
-  derive expected chunk counts from the configured size, not hard-code them.
-  `CHUNK_SIZE` is configurable only so tests can use small chunks.
+  1 MiB (1,048,576 bytes) and requires one definition used everywhere.
+- **Alternatives.** 1 MiB = 1,048,576 bytes (the architecture's choice; was
+  this decision's provisional value during Phases 0–1).
+- **Choice.** **1,000,000 bytes**, confirmed by the owner after Phase 1. Held in
+  one constant (`config.DefaultChunkSize`) and the `CHUNK_SIZE` setting,
+  never repeated as a literal.
+- **Why.** It is what the specification says; the owner chose the
+  specification's wording over the architecture document's.
+- **Consequences.** This **deviates from the architecture document** §3.1/D3
+  (listed in `ARCHITECTURE.md` §9). Example: a 5,500,000-byte object has 6
+  chunks (5 × 1,000,000 + 500,000). Tests derive expected chunk counts from the
+  configured size. `CHUNK_SIZE` remains configurable only so tests can use
+  small chunks. No stored data is affected (no data existed in this format).
 
 ## DEC-006 — `SYNCING` worker state, registration epochs, worker write gating
 
@@ -163,11 +172,15 @@ explicit owner confirmation; may change) · `SUPERSEDED by DEC-nnn`.
     race 2 deterministically. GET and inventory listing stay available because
     they are read-only.
 - **Consequences.** Brief unavailability of a returning worker for
-  placement/reads (reconciliation is DB-only and fast). One subtle benign case
-  remains: a repair PUT started before the worker went `DEAD`, landing after
-  the snapshot, can still cause one spurious "missing" drop; the orphan sweep
-  and reconciler converge it. Tests for races 1–3 are required in Phases 2/6.
-  `docs/ARCHITECTURE.md` documents the corrected state machine.
+  placement/reads (reconciliation is DB-only and fast). *(Phase 0 text:)* "One
+  subtle benign case remains: a repair PUT started before the worker went
+  `DEAD`, landing after the snapshot." **Phase 2 update:** with the draining
+  gate (DEC-030) this case cannot occur: any PUT admitted before the gate
+  closed is drained into the snapshot, and any later PUT is refused. Race 2 is
+  tested in Phase 2 (`TestCloseWritesDrainsInFlightPut`,
+  `TestWritesRefusedUntilRegistered`); races 1, 3, 4 involve metadata and are
+  tested in Phase 6. `docs/ARCHITECTURE.md` §4 and §7 document the state
+  machine and protocol.
 
 ## DEC-007 — `pending_deletes` table for exact physical cleanup
 
@@ -411,23 +424,28 @@ explicit owner confirmation; may change) · `SUPERSEDED by DEC-nnn`.
   `CHUNK_SIZE + header + 1` bytes), releases it, then sends. PUT's final
   rename and DELETE's unlink take the write lock. A semaphore
   (`MAX_CONCURRENT_READS`, default 16) bounds how many chunks are held in
-  memory: worst case ≈ 16 MiB per worker.
+  memory: worst case ≈ 16 MB per worker.
 - **Why.** Lock hold times are bounded by local disk speed, never by the
   network; memory is bounded; behaviour is identical on Linux and Windows.
 - **Consequences.** A file grossly larger than a chunk is returned truncated to
   `CHUNK_SIZE + 1` bytes; that is still a size mismatch to the controller, so
   corruption stays detectable.
 
-## DEC-026 — Phase 1 workers run standalone with the write gate open
+## DEC-026 — Standalone worker mode (no `CONTROLLER_URL`) keeps the write gate open
 
 - **Context.** DEC-006 requires workers to refuse writes until registered,
-  but no controller exists in Phase 1.
-- **Choice.** The write gate is implemented in Phase 1 (`503 NOT_REGISTERED`
-  is tested), but `cmd/worker` opens it at startup. Phase 2 changes
-  `cmd/worker` to open it only after a successful registration. `/healthz`
-  reports both `registered` and `accepting_writes` so the mode is visible.
-- **Consequences.** Superseded by the Phase 2 registration behaviour; no
-  configuration flag is added for standalone mode.
+  but no controller existed in Phase 1.
+- **Choice (Phase 1).** The write gate was implemented (`503 NOT_REGISTERED`
+  tested), but `cmd/worker` opened it at startup.
+- **Narrowed in Phase 2.** The behaviour is kept only as an explicit
+  *standalone mode*: when `CONTROLLER_URL` is empty, the gate opens at startup
+  and no agent runs. When `CONTROLLER_URL` is set (always under Compose), the
+  gate opens only after registration (DEC-030). `/healthz` reports
+  `registered` and `accepting_writes`, and the `worker_started` log line
+  reports `mode` (`standalone` or `cluster`).
+- **Why keep it.** Standalone workers are useful for isolated tests and the
+  Phase 1 container test; there is no risk in production because Compose
+  always sets `CONTROLLER_URL`.
 
 ## DEC-027 — Unreadable chunk header → 500 `CHUNK_CORRUPT`
 
@@ -450,3 +468,86 @@ explicit owner confirmation; may change) · `SUPERSEDED by DEC-nnn`.
 - **Choice.** `internal/ids` provides `NewObjectID`, `ValidObjectID`,
   `ValidChunkID`, `ChunkID`, `ParseChunkID`, `ValidWorkerID`. Worker IDs must
   match `^[a-z0-9][a-z0-9_-]{0,62}$`.
+
+## DEC-029 — Registration epochs start at controller boot time (ns)
+
+- **Context.** DEC-006 gives each registration an epoch so a superseded
+  registration cannot mark a worker `ALIVE`, and heartbeats carry the epoch.
+  The registry is in memory, so a restarted controller would restart a simple
+  counter at 1, and a heartbeat from before the restart could carry an epoch
+  equal to a newly issued one.
+- **Alternatives.** Counter from 1 (collision after restart); random 64-bit
+  epochs (no ordering, which makes logs and tests harder); persisting the
+  counter (extra state to recover).
+- **Choice.** The first epoch is the controller's boot time in Unix
+  nanoseconds, plus one per registration. Epochs are strictly increasing
+  within one controller run and, in practice, across runs.
+- **Consequences.** Epochs are large numbers (~1.8 × 10¹⁸), fine for Go
+  `uint64` and for JSON consumers that parse 64-bit integers (`jq` and
+  JavaScript lose precision above 2⁵³; epochs are compared only by Go code).
+  Even a coincidental collision would be harmless: the worker is looked up by
+  ID first, and an unknown worker is always told to re-register.
+
+## DEC-030 — Write gate drains in-flight writes before the inventory snapshot
+
+- **Context.** DEC-006 says the inventory snapshot is taken "while writes are
+  blocked". Simply refusing new requests is not enough: a PUT admitted just
+  before the gate closed can still rename its chunk into place after the
+  snapshot, so the controller would believe the chunk is missing (race 1 of
+  DEC-006, on the worker side).
+- **Alternatives.** A global `RWMutex` held by each write for its whole
+  duration (cannot honour a context deadline); snapshot without draining and
+  accept spurious "missing" results.
+- **Choice.** `writeGate` (in `internal/worker/server`) counts admitted
+  requests. A request **increments the counter and checks `open` under one
+  mutex**, so a request is either counted before the close or refused.
+  `CloseWritesAndDrain(ctx)` closes the gate, then waits until the count is
+  zero (or `ctx` ends; the gate stays closed either way). The agent runs
+  close+drain → snapshot → register → open on every (re-)registration.
+- **Consequences.** A slow PUT delays re-registration by at most its own
+  duration (bounded by the server's 2-minute read timeout and the controller's
+  per-request timeout). Tested by `TestCloseWritesDrainsInFlightPut`.
+
+## DEC-031 — Heartbeat failures do not close the write gate
+
+- **Context.** If the controller is down or unreachable, should a worker stop
+  accepting writes?
+- **Choice.** No. Failed heartbeats are logged (first failure, then every
+  10th, then on recovery) and retried on the next tick; the gate stays open.
+  Only a `reregister` reply restarts the registration cycle.
+- **Why.** The only client of the worker API is the controller. If the
+  controller can reach the worker but the worker's heartbeats fail (an
+  asymmetric partition), the controller's own liveness view already excludes
+  the worker after `DEAD_AFTER`; closing the gate would add nothing but
+  failures. When heartbeats succeed again, a `DEAD` worker is told to
+  re-register, which drains and snapshots as usual.
+
+## DEC-032 — Compose: spec container names with optional prefix; loopback-only port
+
+- **Context.** The spec's failure demo is literally `docker stop worker2`, so
+  containers should be named `controller`, `worker1`…`worker4` (D22). Docker
+  container names are global per host, and the development machine already
+  has another project using exactly those names.
+- **Choice.** `container_name: ${OBJSTORE_CONTAINER_PREFIX:-}workerN`: spec
+  names by default; setting `OBJSTORE_CONTAINER_PREFIX=objstore-` gives
+  `objstore-worker2` etc. Volumes and the network are namespaced by the
+  Compose project name `objstore` (`objstore_worker1-data`, …). The controller
+  port is published on `127.0.0.1` only (`CONTROLLER_PORT`, default 8080),
+  because the API is unauthenticated (§5.10). Workers are not published. The
+  image is `${OBJSTORE_IMAGE:-objstore:dev}`. Restart policy `no`.
+- **Consequences.** On a machine with conflicting names, the demo commands
+  use the prefixed names (`docker stop objstore-worker2`). The e2e test uses a
+  unique project name, prefix, and port, so it never touches other
+  containers or volumes.
+
+## DEC-033 — Liveness timing owned by the controller
+
+- **Choice.** `HEARTBEAT_INTERVAL` is configured on the controller and sent to
+  each worker in the registration reply (`heartbeat_interval_ms`); workers have
+  no heartbeat setting, so the two can never disagree. The controller refuses
+  to start if `DEAD_AFTER <= HEARTBEAT_INTERVAL`. The failure detector runs
+  every `FAILURE_CHECK_INTERVAL` (default 1 s; a new parameter), so a silent
+  worker is declared `DEAD` between `DEAD_AFTER` and
+  `DEAD_AFTER + FAILURE_CHECK_INTERVAL` after its last heartbeat.
+- **Consequences.** Measured in the Compose walkthrough: `DEAD` 10 s after
+  `docker stop` with the defaults (3 s / 10 s / 1 s).

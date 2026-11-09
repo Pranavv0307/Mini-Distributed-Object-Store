@@ -19,9 +19,11 @@ import (
 	"os"
 	"os/exec"
 	"strings"
+	"sync"
 	"testing"
 	"time"
 
+	"objstore/internal/config"
 	"objstore/internal/wire"
 )
 
@@ -36,12 +38,25 @@ func docker(t *testing.T, args ...string) string {
 	return strings.TrimSpace(string(out))
 }
 
+var (
+	buildOnce sync.Once
+	buildErr  error
+	buildOut  []byte
+)
+
+// image returns the image under test, building objstore:e2e once per test
+// binary unless E2E_IMAGE names an existing image.
 func image(t *testing.T) string {
 	t.Helper()
 	if img := os.Getenv("E2E_IMAGE"); img != "" {
 		return img
 	}
-	docker(t, "build", "-t", "objstore:e2e", "../..")
+	buildOnce.Do(func() {
+		buildOut, buildErr = exec.Command("docker", "build", "-t", "objstore:e2e", "../..").CombinedOutput()
+	})
+	if buildErr != nil {
+		t.Fatalf("docker build: %v\n%s", buildErr, buildOut)
+	}
 	return "objstore:e2e"
 }
 
@@ -131,7 +146,7 @@ func TestWorkerContainer(t *testing.T) {
 	base := c.waitHealthy()
 
 	committedID, partialID := testObj+"_000000", testObj+"_000001"
-	data := bytes.Repeat([]byte("persist me "), 95_000) // ~1 MB
+	data := bytes.Repeat([]byte("persist me "), 90_000) // 990,000 bytes: just under CHUNK_SIZE
 	if st := put(t, base, committedID, data, sumHex(data)); st != http.StatusCreated {
 		t.Fatalf("PUT status = %d", st)
 	}
@@ -155,7 +170,7 @@ func TestWorkerContainer(t *testing.T) {
 	})
 
 	t.Run("no partial chunk after kill mid-write", func(t *testing.T) {
-		full := bytes.Repeat([]byte{0xcd}, 1<<20)
+		full := bytes.Repeat([]byte{0xcd}, int(config.DefaultChunkSize))
 		pr, pw := io.Pipe()
 		req, _ := http.NewRequest(http.MethodPut, base+"/internal/chunks/"+partialID, pr)
 		req.ContentLength = int64(len(full))

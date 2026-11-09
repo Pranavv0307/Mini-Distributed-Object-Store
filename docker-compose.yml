@@ -1,0 +1,114 @@
+# Mini Distributed Object Store: 1 controller + 4 workers (architecture §6).
+#
+#   docker compose up -d --build        build the image and start everything
+#   curl -s localhost:8080/cluster      see worker states
+#   docker stop worker2 / docker start worker2   failure demo
+#   docker compose down                 stop (volumes and data are KEPT)
+#   docker compose down -v              stop and DELETE all data (factory reset)
+#
+# Container names are the spec's (controller, worker1..worker4) so that
+# `docker stop worker2` works as written. Container names are global on a
+# Docker host: if another project already uses them, set
+# OBJSTORE_CONTAINER_PREFIX (e.g. "objstore-") and use prefixed names in the
+# demo commands. Volumes are namespaced by the project name (objstore_*).
+#
+# Every setting has a default; override via environment or a .env file
+# (see .env.example).
+
+name: objstore
+
+x-common-env: &common-env
+  LOG_LEVEL: ${LOG_LEVEL:-info}
+
+x-worker: &worker
+  image: ${OBJSTORE_IMAGE:-objstore:dev}
+  command: ["worker"]
+  restart: "no" # a deliberately stopped worker stays stopped during demos
+  depends_on: [] # workers retry registration; startup order does not matter
+  healthcheck:
+    test: ["CMD", "wget", "-qO-", "http://127.0.0.1:9000/healthz"]
+    interval: 5s
+    timeout: 2s
+    retries: 3
+    start_period: 5s
+
+x-worker-env: &worker-env
+  <<: *common-env
+  CONTROLLER_URL: http://controller:8080
+  DATA_DIR: /data
+  CHUNK_SIZE: ${CHUNK_SIZE:-1000000}
+  FSYNC_ON_WRITE: ${FSYNC_ON_WRITE:-true}
+  MAX_CONCURRENT_READS: ${MAX_CONCURRENT_READS:-16}
+
+services:
+  controller:
+    image: ${OBJSTORE_IMAGE:-objstore:dev}
+    build:
+      context: .
+    container_name: ${OBJSTORE_CONTAINER_PREFIX:-}controller
+    command: ["controller"]
+    restart: "no"
+    ports:
+      # Bound to loopback: the API is unauthenticated (architecture §5.10).
+      - "127.0.0.1:${CONTROLLER_PORT:-8080}:8080"
+    environment:
+      <<: *common-env
+      HEARTBEAT_INTERVAL: ${HEARTBEAT_INTERVAL:-3s}
+      DEAD_AFTER: ${DEAD_AFTER:-10s}
+      REPAIR_GRACE: ${REPAIR_GRACE:-30s}
+      FAILURE_CHECK_INTERVAL: ${FAILURE_CHECK_INTERVAL:-1s}
+    volumes:
+      - controller-data:/data # metadata DB from Phase 3
+    healthcheck:
+      test: ["CMD", "wget", "-qO-", "http://127.0.0.1:8080/healthz"]
+      interval: 5s
+      timeout: 2s
+      retries: 3
+      start_period: 5s
+
+  worker1:
+    <<: *worker
+    container_name: ${OBJSTORE_CONTAINER_PREFIX:-}worker1
+    environment:
+      <<: *worker-env
+      WORKER_ID: worker1
+      ADVERTISE_ADDR: http://worker1:9000
+    volumes:
+      - worker1-data:/data
+
+  worker2:
+    <<: *worker
+    container_name: ${OBJSTORE_CONTAINER_PREFIX:-}worker2
+    environment:
+      <<: *worker-env
+      WORKER_ID: worker2
+      ADVERTISE_ADDR: http://worker2:9000
+    volumes:
+      - worker2-data:/data
+
+  worker3:
+    <<: *worker
+    container_name: ${OBJSTORE_CONTAINER_PREFIX:-}worker3
+    environment:
+      <<: *worker-env
+      WORKER_ID: worker3
+      ADVERTISE_ADDR: http://worker3:9000
+    volumes:
+      - worker3-data:/data
+
+  worker4:
+    <<: *worker
+    container_name: ${OBJSTORE_CONTAINER_PREFIX:-}worker4
+    environment:
+      <<: *worker-env
+      WORKER_ID: worker4
+      ADVERTISE_ADDR: http://worker4:9000
+    volumes:
+      - worker4-data:/data
+
+volumes:
+  controller-data:
+  worker1-data:
+  worker2-data:
+  worker3-data:
+  worker4-data:

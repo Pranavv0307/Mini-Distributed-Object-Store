@@ -11,8 +11,8 @@ owner review. The owner makes the git commit for each phase.
 | Phase | Milestone | Theme | Depends on | Status |
 | --- | --- | --- | --- | --- |
 | 0 | M0 | Setup and design lock-in | — | COMPLETED |
-| 1 | M1 | Worker: durable chunk store over HTTP, in Docker | 0 | COMPLETED (awaiting review) |
-| 2 | M2 | Membership, failure detection, `SYNCING`, Compose cluster | 1 | NOT STARTED |
+| 1 | M1 | Worker: durable chunk store over HTTP, in Docker | 0 | COMPLETED |
+| 2 | M2 | Membership, failure detection, `SYNCING`, Compose cluster | 1 | COMPLETED (awaiting review) |
 | 3 | M3a+M3b | Write path: metadata DB, chunk, place, replicate, commit | 2 | NOT STARTED |
 | 4 | M4 | Read path: verify, fall back, stream in order | 3 | NOT STARTED |
 | 5 | M5 | Complete client API, delete path, error mapping | 4 | NOT STARTED |
@@ -84,7 +84,7 @@ owner review. The owner makes the git commit for each phase.
   concurrent PUT/DELETE on the same ID, concurrent PUTs of the same ID,
   corrupted header/payload detection) and HTTP handler tests; manual Docker
   verification script documented in `RUN_AND_TEST.md`; race run.
-- **Status.** COMPLETED (awaiting review). As built: the identifier package is
+- **Status.** COMPLETED. As built: the identifier package is
   `internal/ids` (DEC-028); the debug tool is the `worker inspect`
   subcommand; the write gate exists but is open at startup (DEC-026). Every
   acceptance criterion is covered by an automated test: store/fetch/compare
@@ -115,6 +115,18 @@ owner review. The owner makes the git commit for each phase.
 - **Testing.** Registry unit tests with a fake clock; integration tests for
   death, return, controller restart, concurrent re-registration; e2e test
   with Compose (`-tags e2e`).
+- **Status.** COMPLETED (awaiting review). As built:
+  `internal/controller/registry` (state machine, epochs from boot time
+  DEC-029, failure detector), `internal/controller/api` (register, heartbeat,
+  `/healthz`, `/cluster`; `InventoryReconciler` hook with a no-op
+  implementation until Phase 6), `internal/worker/agent` (membership loop),
+  draining write gate in `internal/worker/server` (DEC-030),
+  `cmd/controller`, `docker-compose.yml` (DEC-032). Every acceptance
+  criterion has an automated test: 4 ALIVE, stop → DEAD, start → ALIVE,
+  controller restart → re-registration (in-process integration and Compose
+  e2e); superseded registration and death during sync (registry and API unit
+  tests); writes refused until registered (server, agent, integration).
+  Also in this phase: the chunk size changed to 1,000,000 bytes (DEC-005).
 
 ## Phase 3 — Write path (M3a sequential, then M3b windowed)
 
@@ -131,7 +143,7 @@ owner review. The owner makes the git commit for each phase.
   to `pending_deletes` in the same transaction, conditional claims and commit
   DEC-011); minimal abort via delete path; then M3b bounded window with
   backpressure.
-- **Acceptance criteria.** ~5.5 MiB upload → 6 chunks, 12 replica rows, each
+- **Acceptance criteria.** 5.5 MB (5,500,000-byte) upload → 6 chunks, 12 replica rows, each
   chunk on 2 distinct workers; files on volumes under expected names; stopping
   a worker mid-upload still succeeds with ≥2 alive; with 1 alive → 503 and no
   object or chunk remains (after cleanup); empty object → 0 chunks; exact
@@ -235,7 +247,7 @@ owner review. The owner makes the git commit for each phase.
 ## Phase 10 — Evaluation (M10)
 
 - **Objectives.** Turn behaviour into numbers; systematic correctness tests.
-- **Planned components.** Benchmarks (sizes 1 MiB/100 MiB/1 GiB; 1/4/16
+- **Planned components.** Benchmarks (sizes 1 MB/100 MB/1 GB; 1/4/16
   clients; sequential vs windowed; fsync on/off; degraded reads; detection and
   repair times; scrubber detection time) with medians and p99; chaos script
   with audit; invariant tests for every §7 scenario.

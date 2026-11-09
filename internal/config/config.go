@@ -9,15 +9,18 @@ import (
 	"errors"
 	"fmt"
 	"log/slog"
+	"net"
+	neturl "net/url"
 	"strconv"
 	"strings"
+	"time"
 
 	"objstore/internal/ids"
 )
 
-// DefaultChunkSize is the single definition of the chunk size: 1 MiB
-// (DEC-005, provisional pending owner confirmation).
-const DefaultChunkSize int64 = 1 << 20
+// DefaultChunkSize is the single definition of the chunk size: 1 MB =
+// 1,000,000 bytes, as the specification states (DEC-005, confirmed by the owner).
+const DefaultChunkSize int64 = 1_000_000
 
 // MaxConfigurableChunkSize bounds CHUNK_SIZE so a typo cannot make a worker
 // accept (and buffer) enormous chunk bodies.
@@ -32,6 +35,14 @@ type Worker struct {
 	FsyncOnWrite       bool       // FSYNC_ON_WRITE
 	MaxConcurrentReads int        // MAX_CONCURRENT_READS: bounds GET memory
 	LogLevel           slog.Level // LOG_LEVEL: debug|info|warn|error
+	// ControllerURL (CONTROLLER_URL) is the controller's base URL. Empty
+	// means standalone mode: no registration, writes accepted immediately
+	// (DEC-026). Compose always sets it.
+	ControllerURL string
+	// AdvertiseAddr (ADVERTISE_ADDR) is the base URL the controller uses to
+	// reach this worker. Default: http://<WORKER_ID>:<LISTEN_ADDR port>, which
+	// is the worker's DNS name on the Compose network.
+	AdvertiseAddr string
 }
 
 // LoadWorker reads worker configuration through getenv (os.Getenv in
@@ -46,6 +57,7 @@ func LoadWorker(getenv func(string) string) (Worker, error) {
 		FsyncOnWrite:       l.bool("FSYNC_ON_WRITE", true),
 		MaxConcurrentReads: int(l.int64("MAX_CONCURRENT_READS", 16, 1, 1024)),
 		LogLevel:           l.level("LOG_LEVEL", slog.LevelInfo),
+		ControllerURL:      l.url("CONTROLLER_URL", ""),
 	}
 	switch {
 	case c.WorkerID == "":
@@ -55,6 +67,48 @@ func LoadWorker(getenv func(string) string) (Worker, error) {
 	}
 	if c.DataDir == "" {
 		l.fail("DATA_DIR", "must not be empty")
+	}
+	defaultAdvertise := ""
+	if _, port, err := net.SplitHostPort(c.ListenAddr); err != nil || port == "" || port == "0" {
+		l.fail("LISTEN_ADDR", "must be host:port with a fixed port, got %q", c.ListenAddr)
+	} else if c.WorkerID != "" {
+		defaultAdvertise = "http://" + net.JoinHostPort(c.WorkerID, port)
+	}
+	c.AdvertiseAddr = l.url("ADVERTISE_ADDR", defaultAdvertise)
+	return c, l.err()
+}
+
+// Controller is the configuration of the controller process.
+type Controller struct {
+	ListenAddr string     // LISTEN_ADDR
+	LogLevel   slog.Level // LOG_LEVEL
+	// HeartbeatInterval (HEARTBEAT_INTERVAL) is sent to workers at
+	// registration; the controller is the single source of this setting.
+	HeartbeatInterval time.Duration
+	// DeadAfter (DEAD_AFTER): a worker silent for longer is DEAD (D11).
+	DeadAfter time.Duration
+	// RepairGrace (REPAIR_GRACE): a worker DEAD for longer is
+	// repair-eligible (D12). Reported in /cluster; used by repair (Phase 7).
+	RepairGrace time.Duration
+	// FailureCheckInterval (FAILURE_CHECK_INTERVAL): how often the failure
+	// detector evaluates heartbeat ages. Detection latency is at most
+	// DeadAfter + FailureCheckInterval after the last heartbeat.
+	FailureCheckInterval time.Duration
+}
+
+// LoadController reads controller configuration through getenv.
+func LoadController(getenv func(string) string) (Controller, error) {
+	l := &loader{getenv: getenv}
+	c := Controller{
+		ListenAddr:           l.str("LISTEN_ADDR", ":8080"),
+		LogLevel:             l.level("LOG_LEVEL", slog.LevelInfo),
+		HeartbeatInterval:    l.duration("HEARTBEAT_INTERVAL", 3*time.Second, 10*time.Millisecond, time.Hour),
+		DeadAfter:            l.duration("DEAD_AFTER", 10*time.Second, 10*time.Millisecond, time.Hour),
+		RepairGrace:          l.duration("REPAIR_GRACE", 30*time.Second, 0, 24*time.Hour),
+		FailureCheckInterval: l.duration("FAILURE_CHECK_INTERVAL", time.Second, 5*time.Millisecond, time.Minute),
+	}
+	if c.DeadAfter <= c.HeartbeatInterval {
+		l.fail("DEAD_AFTER", "(%v) must be greater than HEARTBEAT_INTERVAL (%v), or every worker would flap", c.DeadAfter, c.HeartbeatInterval)
 	}
 	return c, l.err()
 }
@@ -115,6 +169,37 @@ func (l *loader) bool(key string, def bool) bool {
 		return def
 	}
 	return b
+}
+
+func (l *loader) duration(key string, def, lo, hi time.Duration) time.Duration {
+	v, ok := l.raw(key)
+	if !ok {
+		return def
+	}
+	d, err := time.ParseDuration(v)
+	if err != nil {
+		l.fail(key, "must be a duration like 500ms or 10s, got %q", v)
+		return def
+	}
+	if d < lo || d > hi {
+		l.fail(key, "must be in [%v, %v], got %v", lo, hi, d)
+		return def
+	}
+	return d
+}
+
+// url reads an absolute http(s) base URL and strips any trailing slash.
+func (l *loader) url(key, def string) string {
+	v, ok := l.raw(key)
+	if !ok {
+		return def
+	}
+	u, err := neturl.Parse(v)
+	if err != nil || (u.Scheme != "http" && u.Scheme != "https") || u.Host == "" {
+		l.fail(key, "must be an absolute http(s) URL, got %q", v)
+		return def
+	}
+	return strings.TrimRight(v, "/")
 }
 
 func (l *loader) level(key string, def slog.Level) slog.Level {

@@ -6,13 +6,15 @@ original design, with full rationale for decisions D1–D22, is in
 [`reference/Object_Store_Architecture.md`](reference/Object_Store_Architecture.md)
 (called "the design doc" below). Where this implementation differs from or
 clarifies the design doc, the difference is listed in
-[§9 Deviations](#9-deviations-and-clarifications-vs-the-design-doc) with a link
+[§10 Deviations](#10-deviations-and-clarifications-vs-the-design-doc) with a link
 to [`DECISIONS.md`](DECISIONS.md).
 
-> **Current status (end of Phase 1):** the **worker's chunk store and chunk
-> API** are implemented and run in Docker (§2, §3.1). The worker runs
-> standalone; membership with the controller arrives in Phase 2. Everything
-> controller-side below is still the target design.
+> **Current status (end of Phase 2):** implemented: the worker's chunk store
+> and chunk API (§3.1), and cluster membership: the controller's worker
+> registry, registration with inventory, heartbeats, the failure detector,
+> the `SYNCING` protocol with epochs and the draining write gate, `/healthz`,
+> `/cluster`, and the Compose deployment (§4.1, §5.1, §6.1). Not yet: metadata,
+> the client object API, repair, and cleanup (target design below).
 
 ---
 
@@ -20,7 +22,7 @@ to [`DECISIONS.md`](DECISIONS.md).
 
 A single **controller** and four **workers**, run with Docker Compose. Clients
 talk only to the controller's REST API. The controller cuts each object into
-fixed-size chunks (1 MiB, provisional, DEC-005), stores every chunk on **two
+fixed-size chunks (1 MB = 1,000,000 bytes, DEC-005), stores every chunk on **two
 distinct workers** (replication factor RF = 2), records all metadata in an
 embedded SQLite database, detects dead workers through heartbeats, and repairs
 lost or corrupt replicas in the background.
@@ -43,19 +45,19 @@ observed state reconciled in loops; trust nothing you didn't verify.
 | --- | --- | --- | --- | --- |
 | Worker | Chunk store | Header-format chunk files, atomic durable writes, temp cleanup, inventory | `internal/worker/store` | **Implemented (Phase 1)** |
 | Worker | Chunk API | PUT/GET/DELETE chunk, list inventory, healthz, write gate | `internal/worker/server`, `cmd/worker` | **Implemented (Phase 1)** |
-| Worker | Membership agent | Register (with inventory, retried), heartbeat, write gate | `internal/worker/agent` | Phase 2 |
+| Worker | Membership agent | Register (with inventory, retried), heartbeat, write gate | `internal/worker/agent` | **Implemented (Phase 2)** |
 | Worker | Scrubber | Throttled re-verification; suspects reported via heartbeat | `internal/worker/scrub` | Phase 8 |
-| Controller | API front end | Client REST API, validation, error mapping | `internal/controller/api` | Phases 3–5 |
+| Controller | API front end | Membership endpoints (Phase 2, implemented); client REST API, validation, error mapping (Phases 3–5) | `internal/controller/api`, `cmd/controller` | Partly (Phase 2) |
 | Controller | Metadata store | SQLite schema, migrations, short transactions | `internal/controller/meta` | Phase 3 |
-| Controller | Worker registry | In-memory worker states, epochs, controller-clock liveness | `internal/controller/registry` | Phase 2 |
-| Controller | Failure detector | `ALIVE`/`SYNCING` → `DEAD` on heartbeat silence | `internal/controller/registry` | Phase 2 |
+| Controller | Worker registry | In-memory worker states, epochs, controller-clock liveness | `internal/controller/registry` | **Implemented (Phase 2)** |
+| Controller | Failure detector | `ALIVE`/`SYNCING` → `DEAD` on heartbeat silence | `internal/controller/registry` | **Implemented (Phase 2)** |
 | Controller | Placement engine | Distinct ALIVE workers; pluggable (random first) | `internal/controller/placement` | Phase 3 |
 | Controller | Worker client | The only code calling workers: timeouts, retries, checksum headers | `internal/controller/workerclient` | Phase 3 |
 | Controller | Upload / download coordinators | Streaming write and read paths | `internal/controller/upload`, `.../download` | Phases 3–4 |
 | Controller | Reconciler | Level-triggered repair of under-replicated/corrupt chunks | `internal/controller/reconciler` | Phase 7 |
 | Controller | Janitor | Stale uploads, unfinished deletes, `pending_deletes`, orphan sweep | `internal/controller/janitor` | Phases 5, 9 |
 | Controller | Recovery | Startup recovery pass, reconciler warm-up | `internal/controller/recovery` | Phase 9 |
-| Controller | Observability | `/healthz`, `/cluster`, audit, structured event log | `internal/controller/api`, `.../audit` | Phases 2, 6, 9 |
+| Controller | Observability | `/healthz`, `/cluster`, audit, structured event log | `internal/controller/api`, `.../audit` | `/healthz`, `/cluster` (workers), event log: implemented; audit Phases 6, 9 |
 | Client | `objctl` | CLI for the REST API; demos and benchmarks | `cmd/objctl` | Phase 5 |
 
 Shared packages (implemented in Phase 1): `internal/ids` (object/chunk/worker
@@ -209,20 +211,111 @@ Additional implementation invariants:
 | I9 | A worker in state `SYNCING` is never chosen for placement, reads, or repair | DEC-006 |
 | I10 | No DB transaction is open across a network call | Design doc §3.5 |
 
-## 7. Failure handling (summary)
+| I11 | A worker accepts chunk PUT/DELETE only while it holds a successful registration (or runs standalone) | DEC-006, DEC-030 |
+| I12 | A registration whose epoch is no longer current never marks a worker `ALIVE` | DEC-006, DEC-029 |
 
-See the design doc §5.2 (failure model) and §7 (failure scenario matrix). The
-scenarios are implemented and demonstrated in Phases 6–9; each one will be
-listed here with its test once implemented.
+## 7. Membership and failure detection (implemented, Phase 2)
 
-## 8. Trade-offs and limitations
+### 7.1 Controller side
+
+- **Registry** (`internal/controller/registry`): in memory, one mutex, no I/O
+  under the lock. Per worker: address, state, epoch, `RegisteredAt`,
+  `LastHeartbeat` (controller receive time), `DeadSince`, reported capacity.
+  Rebuilt from registrations after a controller restart (by design, §3.5 of
+  the design doc).
+- **Registration** (`POST /internal/workers/register`):
+  `BeginRegistration` (→ `SYNCING`, new epoch) → `InventoryReconciler`
+  (no-op until Phase 6) → `CompleteRegistration` (→ `ALIVE` only if the
+  epoch is current and the state is still `SYNCING`) → reply. A superseded
+  registration gets 409; a failed reconciliation gets 503 and leaves the
+  worker `SYNCING` (unusable) until a retry succeeds.
+- **Heartbeat**: refreshes `LastHeartbeat` and capacity if the worker is
+  known, not `DEAD`, and the epoch matches; otherwise the reply is
+  `reregister`. A heartbeat never revives a `DEAD` worker.
+- **Failure detector**: every `FAILURE_CHECK_INTERVAL`, any `SYNCING` or
+  `ALIVE` worker silent for more than `DEAD_AFTER` becomes `DEAD`
+  (`DeadSince` = now). Idempotent; safe to run concurrently with requests.
+- **Epochs** start at boot time in nanoseconds (DEC-029).
+
+### 7.2 Worker side
+
+`internal/worker/agent` with `CONTROLLER_URL` set:
+
+1. `SetRegistered(false)`; **close and drain the write gate** (wait until no
+   admitted PUT/DELETE is in flight, DEC-030).
+2. Snapshot the inventory; `POST register`; on failure retry with exponential
+   backoff and jitter (200 ms → 5 s), retaking the snapshot each attempt.
+3. On success: `SetRegistered(true)`, open the gate.
+4. Heartbeat every `heartbeat_interval_ms` (from the registration reply).
+   Failures are logged and retried; the gate stays open (DEC-031). A
+   `reregister` reply → back to step 1.
+
+The HTTP server starts before registration (so the controller can reach the
+worker as soon as it is `ALIVE`); reads, inventory, and health are always
+served.
+
+### 7.3 Why the `SYNCING` protocol is race-free
+
+- **No write lands after the snapshot and before `ALIVE`.** The gate is
+  closed and drained before the snapshot and opens only after the controller
+  has replied (which happens after `ALIVE`). From the controller's side,
+  `SYNCING` workers are excluded from placement and reads (`Registry.Alive()`
+  returns only `ALIVE`), so no write is even attempted.
+- **Superseded registrations cannot win.** `CompleteRegistration` checks the
+  epoch under the registry mutex. A delayed, older registration that arrives
+  *after* a newer one completed starts its own new epoch; the worker's
+  heartbeats then carry the older epoch from its latest reply, are answered
+  `reregister`, and the worker re-registers. The system converges, at the cost
+  of one extra registration.
+- **Death during sync.** If reconciliation outlasts `DEAD_AFTER` without
+  heartbeats, the detector marks the worker `DEAD`, and `CompleteRegistration`
+  refuses (the state is no longer `SYNCING`).
+- **No late writes at all.** Every PUT/DELETE either was admitted before the
+  gate closed (and is drained, so its effect is in the snapshot) or arrives
+  after (and is refused with 503). This also removes the "repair PUT landing
+  after the snapshot" residual case that DEC-006 anticipated: such a PUT is
+  either drained into the snapshot or refused. (Whether the controller then
+  records it as `OK` or as a pending delete is the data path's concern,
+  Phases 3 and 6.)
+
+### 7.4 Deployment (Compose)
+
+`docker-compose.yml`: project `objstore`; services `controller` and
+`worker1`…`worker4` from one image; container names
+`${OBJSTORE_CONTAINER_PREFIX}<service>` (DEC-032); one named volume per
+service mounted at `/data`; only the controller's port 8080 is published,
+bound to 127.0.0.1; workers reach the controller at `http://controller:8080`
+and advertise `http://workerN:9000`; restart policy `no`; healthchecks with
+busybox `wget` on `/healthz`.
+
+### 7.5 Measured behaviour (default timings 3 s / 10 s / 1 s)
+
+| Event | Observed |
+| --- | --- |
+| `docker compose up` → 4 `ALIVE` | ≈ 1 s |
+| `docker stop worker2` → `DEAD` | 10 s |
+| `docker start worker2` → `ALIVE` (new epoch) | ≈ 1 s |
+| `docker restart controller` → 4 `ALIVE` (new epochs) | ≈ 2 s |
+
+## 8. Failure handling (summary)
+
+See the design doc §5.2 (failure model) and §7 (failure scenario matrix).
+Implemented so far: worker stop/start and controller restart for membership
+(§7 above; tests `TestClusterMembership`,
+`TestControllerRestartTriggersReregistration`,
+`TestComposeClusterMembership`); worker crash mid-write leaves no partial
+chunk (`TestWorkerKilledMidWriteLeavesNoPartialChunk`, e2e). Data-path
+scenarios are implemented in Phases 4–9 and will be listed here with their
+tests.
+
+## 9. Trade-offs and limitations
 
 Inherited from the design doc §8: single controller (SPOF); controller in the
 data path (throughput ceiling); synchronous 2-way replication (write latency;
 needs ≥ 2 workers); RF = 2 (one failure at a time); immutable objects; repair
 grace period (longer vulnerability window); single-file metadata DB.
 
-## 9. Deviations and clarifications vs. the design doc
+## 10. Deviations and clarifications vs. the design doc
 
 | Topic | Design doc | Implementation | Decision |
 | --- | --- | --- | --- |
@@ -233,3 +326,4 @@ grace period (longer vulnerability window); single-file metadata DB.
 | `GET /internal/workers/{id}/chunks` | Host unspecified | Served by the worker | DEC-010 |
 | Stale-upload abort vs. live handler | Not addressed | Claims and commit conditional on status | DEC-011 |
 | New parameters | — | `JANITOR_INTERVAL`, `INVENTORY_SWEEP_INTERVAL` | DEC-009 |
+| Chunk size | 1 MiB = 1,048,576 bytes (§3.1, D3) | 1 MB = 1,000,000 bytes, as the specification says (owner decision) | DEC-005 |

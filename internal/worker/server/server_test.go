@@ -2,6 +2,7 @@ package server
 
 import (
 	"bytes"
+	"context"
 	"crypto/sha256"
 	"encoding/hex"
 	"encoding/json"
@@ -12,6 +13,7 @@ import (
 	"path/filepath"
 	"strings"
 	"testing"
+	"time"
 
 	"objstore/internal/wire"
 	"objstore/internal/worker/store"
@@ -38,7 +40,7 @@ func newFixture(t *testing.T) *fixture {
 		t.Fatal(err)
 	}
 	srv := New(st, Config{WorkerID: "worker1", MaxChunkSize: maxChunk, MaxConcurrentReads: 2})
-	srv.SetAcceptingWrites(true)
+	srv.OpenWrites()
 	ts := httptest.NewServer(srv.Handler())
 	t.Cleanup(ts.Close)
 	return &fixture{srv: srv, ts: ts, dir: dir}
@@ -177,7 +179,9 @@ func TestWriteGate(t *testing.T) {
 	f := newFixture(t)
 	data := []byte("x")
 	f.put(t, chunkA, data)
-	f.srv.SetAcceptingWrites(false)
+	if err := f.srv.CloseWritesAndDrain(context.Background()); err != nil {
+		t.Fatal(err)
+	}
 
 	wantError(t, f.put(t, chunkB, data), http.StatusServiceUnavailable, wire.CodeNotRegistered)
 	wantError(t, f.do(t, http.MethodDelete, "/internal/chunks/"+chunkA, nil, nil), http.StatusServiceUnavailable, wire.CodeNotRegistered)
@@ -260,5 +264,97 @@ func TestMethodNotAllowed(t *testing.T) {
 	f := newFixture(t)
 	if resp := f.do(t, http.MethodPost, "/internal/chunks/"+chunkA, []byte("x"), nil); resp.StatusCode != http.StatusMethodNotAllowed {
 		t.Fatalf("POST status = %d, want 405", resp.StatusCode)
+	}
+}
+
+// TestCloseWritesDrainsInFlightPut is the DEC-006 guarantee: closing the gate
+// waits for an admitted PUT, refuses new writes immediately, and an inventory
+// taken after the close includes the drained PUT's chunk.
+func TestCloseWritesDrainsInFlightPut(t *testing.T) {
+	f := newFixture(t)
+	data := bytes.Repeat([]byte("d"), 4096)
+	pr, pw := io.Pipe()
+	req, _ := http.NewRequest(http.MethodPut, f.ts.URL+"/internal/chunks/"+chunkA, pr)
+	req.ContentLength = int64(len(data))
+	req.Header.Set(wire.HeaderChunkSHA256, shaHex(data))
+	putDone := make(chan int, 1)
+	go func() {
+		resp, err := http.DefaultClient.Do(req)
+		if err != nil {
+			putDone <- -1
+			return
+		}
+		resp.Body.Close()
+		putDone <- resp.StatusCode
+	}()
+	if _, err := pw.Write(data[:100]); err != nil { // the PUT is now admitted and blocked mid-body
+		t.Fatal(err)
+	}
+	waitUntil(t, func() bool { return f.inflight() == 1 })
+
+	drained := make(chan error, 1)
+	go func() { drained <- f.srv.CloseWritesAndDrain(context.Background()) }()
+	waitUntil(t, func() bool { return !f.srv.gate.isOpen() })
+
+	// New writes are refused at once while the old one is still running.
+	wantError(t, f.put(t, chunkB, []byte("x")), http.StatusServiceUnavailable, wire.CodeNotRegistered)
+	select {
+	case err := <-drained:
+		t.Fatalf("CloseWritesAndDrain returned (%v) while a PUT was in flight", err)
+	default:
+	}
+
+	if _, err := pw.Write(data[100:]); err != nil {
+		t.Fatal(err)
+	}
+	pw.Close()
+	if st := <-putDone; st != http.StatusCreated {
+		t.Fatalf("in-flight PUT status = %d", st)
+	}
+	if err := <-drained; err != nil {
+		t.Fatalf("CloseWritesAndDrain: %v", err)
+	}
+	if inv := f.inventory(t); len(inv.Chunks) != 1 || inv.Chunks[0].ChunkID != chunkA {
+		t.Fatalf("snapshot after drain = %+v, want the drained chunk", inv.Chunks)
+	}
+}
+
+func TestCloseWritesHonoursContext(t *testing.T) {
+	f := newFixture(t)
+	if !f.srv.gate.enter() { // simulate a stuck admitted request
+		t.Fatal("gate closed")
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), 20*time.Millisecond)
+	defer cancel()
+	if err := f.srv.CloseWritesAndDrain(ctx); err == nil {
+		t.Fatal("CloseWritesAndDrain returned nil with a request still in flight")
+	}
+	if f.srv.gate.isOpen() {
+		t.Fatal("gate reopened after a timed-out drain")
+	}
+	f.srv.gate.exit()
+	if err := f.srv.CloseWritesAndDrain(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	f.srv.OpenWrites()
+	if resp := f.put(t, chunkA, []byte("x")); resp.StatusCode != http.StatusCreated {
+		t.Fatalf("PUT after reopen = %d", resp.StatusCode)
+	}
+}
+
+func (f *fixture) inflight() int {
+	f.srv.gate.mu.Lock()
+	defer f.srv.gate.mu.Unlock()
+	return f.srv.gate.inflight
+}
+
+func waitUntil(t *testing.T, cond func() bool) {
+	t.Helper()
+	deadline := time.Now().Add(5 * time.Second)
+	for !cond() {
+		if time.Now().After(deadline) {
+			t.Fatal("condition not reached within 5s")
+		}
+		time.Sleep(2 * time.Millisecond)
 	}
 }
