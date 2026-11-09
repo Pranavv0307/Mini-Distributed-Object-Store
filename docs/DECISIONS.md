@@ -34,6 +34,12 @@ explicit owner confirmation; may change) · `SUPERSEDED by DEC-nnn`.
 | DEC-020 | Heartbeat replies carry an explicit `action` | ACCEPTED | 0 (built in 2) |
 | DEC-021 | Wire formats: RFC 3339 UTC timestamps, lowercase-hex SHA-256 | ACCEPTED | 0 |
 | DEC-022 | LF line endings enforced via `.gitattributes` | ACCEPTED | 0 |
+| DEC-023 | One Alpine image for all binaries, non-root user | ACCEPTED | 1 |
+| DEC-024 | Chunk PUT always writes and atomically replaces | ACCEPTED | 1 |
+| DEC-025 | Chunk GET loads into memory under a striped lock, bounded concurrency | ACCEPTED | 1 |
+| DEC-026 | Phase 1 workers run standalone with the write gate open | ACCEPTED | 1 (superseded in 2) |
+| DEC-027 | Unreadable chunk header → 500 `CHUNK_CORRUPT` | ACCEPTED | 1 |
+| DEC-028 | Identifier package is `internal/ids` (not `chunkid`) | ACCEPTED | 1 |
 
 ---
 
@@ -254,9 +260,17 @@ explicit owner confirmation; may change) · `SUPERSEDED by DEC-nnn`.
 - **Why.** A single atomic rename covers data and checksum together; a sidecar
   needs two renames and can tear between them.
 - **Consequences.** Files are not raw chunk bytes, so the inspection tool is
-  needed for demos. Corruption demos (appending/altering bytes) are still
-  detected via the length and checksum. Exact layout is fixed in Phase 1.
-  Directory fsync is a no-op on Windows; production runs in Linux containers.
+  needed for demos (`worker inspect FILE`). Corruption demos (appending/altering
+  bytes) are still detected via the length and checksum. Directory fsync is a
+  no-op on Windows; production runs in Linux containers.
+- **Layout (fixed in Phase 1, `internal/worker/store/format.go`).** 48-byte
+  header, big-endian: bytes 0–3 magic `OSCK`; byte 4 format version `1`;
+  bytes 5–7 reserved (zero); bytes 8–15 payload size (uint64); bytes 16–47
+  SHA-256 of the payload; payload follows. Directory layout:
+  `DATA_DIR/chunks/<chunk_id>` (committed) and `DATA_DIR/tmp/<chunk_id>.*.tmp`
+  (in progress, deleted at startup). The header records the *expected*
+  size and checksum, and the file is renamed into place only after the
+  received bytes matched both, so a committed header is always truthful.
 
 ## DEC-013 — Custom metadata: string values, size limits — PROVISIONAL
 
@@ -350,3 +364,89 @@ explicit owner confirmation; may change) · `SUPERSEDED by DEC-nnn`.
 - **Context.** Development happens on Windows; shell scripts and Dockerfiles
   run inside Linux containers and fail with CRLF.
 - **Choice.** `* text=auto eol=lf` in `.gitattributes`; `.editorconfig` agrees.
+
+## DEC-023 — One Alpine image for all binaries, non-root user
+
+- **Context.** Three binaries (controller, worker, objctl) and a demo that
+  needs `docker exec` into worker containers to inspect or corrupt files.
+- **Alternatives.** One image per binary; distroless or `scratch` runtime.
+- **Choice.** A single multi-stage `Dockerfile`: build all binaries with
+  `CGO_ENABLED=0` in `golang:1.27.3-alpine`, copy them into `alpine:3.24`;
+  Compose selects the command (`worker`, later `controller`). The runtime
+  runs as uid/gid 10001 (`objstore`), and `/data` is created owned by it so a
+  fresh named volume mounted there inherits that ownership.
+- **Why.** One build, one cache, one tag. Alpine provides a shell, `find`,
+  and busybox `wget` for demos and healthchecks at ~28 MB total. Non-root
+  limits the damage of a compromised process.
+- **Consequences.** Chunk files are created with mode `0600` owned by
+  `objstore`; `docker exec` (which runs as the same user) can read and modify
+  them for demos.
+
+## DEC-024 — Chunk PUT always writes and atomically replaces
+
+- **Context.** PUT must be idempotent (§5.5), and the controller repairs a
+  corrupt replica by re-sending the correct bytes to the same worker (DEC-008).
+- **Alternatives.** Check for an existing file with the same checksum and
+  skip the write (requires reading and hashing the existing file under a
+  lock, and must still replace it if it turns out to be corrupt).
+- **Choice.** Every valid PUT writes a fresh temp file and atomically renames
+  it over any existing file. The response is 201 if no file existed and 200
+  if one was replaced.
+- **Why.** One code path covers first write, retry, and in-place repair; no
+  "existing file looks fine" decision is ever made by the worker.
+- **Consequences.** A retried PUT costs one extra chunk write (rare). The
+  200/201 distinction is informational; the controller must not rely on it
+  for correctness.
+
+## DEC-025 — Chunk GET loads into memory under a striped lock, bounded concurrency
+
+- **Context.** A GET must never observe a half-replaced file, and a slow
+  network client must not block writers. On Windows (where tests also run) an
+  open file cannot be renamed over or deleted.
+- **Alternatives.** Stream directly from the open file (holding the file open
+  for the duration of the network transfer); rely on POSIX semantics of
+  open-file-survives-rename (not portable).
+- **Choice.** 256 striped `RWMutex`es keyed by a hash of the chunk ID. GET
+  reads the file into memory under the read lock (at most
+  `CHUNK_SIZE + header + 1` bytes), releases it, then sends. PUT's final
+  rename and DELETE's unlink take the write lock. A semaphore
+  (`MAX_CONCURRENT_READS`, default 16) bounds how many chunks are held in
+  memory: worst case ≈ 16 MiB per worker.
+- **Why.** Lock hold times are bounded by local disk speed, never by the
+  network; memory is bounded; behaviour is identical on Linux and Windows.
+- **Consequences.** A file grossly larger than a chunk is returned truncated to
+  `CHUNK_SIZE + 1` bytes; that is still a size mismatch to the controller, so
+  corruption stays detectable.
+
+## DEC-026 — Phase 1 workers run standalone with the write gate open
+
+- **Context.** DEC-006 requires workers to refuse writes until registered,
+  but no controller exists in Phase 1.
+- **Choice.** The write gate is implemented in Phase 1 (`503 NOT_REGISTERED`
+  is tested), but `cmd/worker` opens it at startup. Phase 2 changes
+  `cmd/worker` to open it only after a successful registration. `/healthz`
+  reports both `registered` and `accepting_writes` so the mode is visible.
+- **Consequences.** Superseded by the Phase 2 registration behaviour; no
+  configuration flag is added for standalone mode.
+
+## DEC-027 — Unreadable chunk header → 500 `CHUNK_CORRUPT`
+
+- **Context.** With a header in each file (DEC-012), a corrupted header means
+  the worker cannot even tell where the payload starts.
+- **Alternatives.** Return the whole file as the body (the controller would
+  then see a mismatch); return 404.
+- **Choice.** 500 with the distinct code `CHUNK_CORRUPT`. Payload-level
+  corruption (appended, truncated, or flipped payload bytes) is **not**
+  detected by the worker on GET; those bytes are returned as stored.
+- **Why.** 404 would be a lie (the file exists) and would be treated as
+  "missing"; a distinct code lets the controller treat it as a failed
+  verification (mark `CORRUPT` after cross-check, Phase 4/8).
+
+## DEC-028 — Identifier package is `internal/ids` (not `chunkid`)
+
+- **Context.** Phase 0 planned `internal/chunkid`. Worker-ID and object-ID
+  validation belong with chunk-ID validation (the controller validates all
+  three).
+- **Choice.** `internal/ids` provides `NewObjectID`, `ValidObjectID`,
+  `ValidChunkID`, `ChunkID`, `ParseChunkID`, `ValidWorkerID`. Worker IDs must
+  match `^[a-z0-9][a-z0-9_-]{0,62}$`.

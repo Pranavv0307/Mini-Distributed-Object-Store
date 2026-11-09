@@ -6,9 +6,9 @@ a single controller keeps the metadata, detects failed workers, and repairs
 lost or corrupted data automatically. The whole system runs on one machine
 with Docker Compose.
 
-> **Implementation status: Phase 0 of 11 complete (setup only).** The
-> repository has the toolchain, project layout, stub binaries, and the full
-> design and API contract. No storage functionality exists yet. See
+> **Implementation status: Phase 1 of 11 complete.** The storage **worker**
+> works as a standalone Docker container (durable, atomic, checksummed chunk
+> storage over HTTP). The controller and client API come next. See
 > [Current status](#current-status).
 
 ## The problem
@@ -73,11 +73,20 @@ Reasons for each choice: [`docs/DECISIONS.md`](docs/DECISIONS.md).
 ```
 cmd/
   controller/        controller binary (stub)
-  worker/            worker binary (stub)
+  worker/            worker binary (+ `worker inspect` debug tool)
   objctl/            client CLI (stub)
 internal/
+  ids/               object/chunk/worker ID generation and validation
+  config/            environment-variable configuration
+  wire/              shared JSON types, headers, error codes
+  httpx/             JSON errors, request logging middleware
+  worker/store/      on-disk chunk store (atomic, checksummed)
+  worker/server/     worker HTTP API
   version/           build version string
-  ...                packages are added per phase (see docs/ARCHITECTURE.md §2)
+test/
+  integration/       multi-process tests (kill worker mid-write)
+  e2e/               Docker tests (build tag `e2e`)
+Dockerfile           one image for all binaries
 docs/
   ARCHITECTURE.md        system as implemented, deviations from the design
   IMPLEMENTATION_PLAN.md phase roadmap and status
@@ -99,12 +108,24 @@ docs/
 
 ## Quick start
 
-At this phase there is nothing to run yet. You can verify the toolchain:
+Build and test:
 
 ```bash
 go build ./...
 go test ./...
 ```
+
+Run a standalone worker in Docker (Git Bash / Linux / macOS):
+
+```bash
+docker build -t objstore:dev .
+docker volume create objstore-w1-data
+docker run -d --name objstore-w1 -e WORKER_ID=worker1 -v objstore-w1-data:/data -p 127.0.0.1:19001:9000 objstore:dev
+curl -s http://127.0.0.1:19001/healthz
+```
+
+Store, fetch, corrupt, and inspect chunks: see
+[`docs/RUN_AND_TEST.md`](docs/RUN_AND_TEST.md) §3–5.
 
 Full, verified instructions: [`docs/RUN_AND_TEST.md`](docs/RUN_AND_TEST.md).
 
@@ -131,8 +152,9 @@ implemented.
 
 | Phase | Theme | Status |
 | --- | --- | --- |
-| 0 | Setup and design lock-in | COMPLETED (awaiting review) |
-| 1–11 | See [implementation plan](docs/IMPLEMENTATION_PLAN.md) | NOT STARTED |
+| 0 | Setup and design lock-in | COMPLETED |
+| 1 | Worker: durable chunk store over HTTP, in Docker | COMPLETED (awaiting review) |
+| 2–11 | See [implementation plan](docs/IMPLEMENTATION_PLAN.md) | NOT STARTED |
 
 Open items awaiting owner confirmation: chunk size definition (DEC-005,
 provisionally 1 MiB) and string-only custom metadata values (DEC-013).

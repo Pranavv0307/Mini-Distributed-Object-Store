@@ -9,8 +9,10 @@ clarifies the design doc, the difference is listed in
 [§9 Deviations](#9-deviations-and-clarifications-vs-the-design-doc) with a link
 to [`DECISIONS.md`](DECISIONS.md).
 
-> **Current status (end of Phase 0):** nothing below is implemented yet. The
-> repository contains stub binaries, the toolchain setup, and documentation.
+> **Current status (end of Phase 1):** the **worker's chunk store and chunk
+> API** are implemented and run in Docker (§2, §3.1). The worker runs
+> standalone; membership with the controller arrives in Phase 2. Everything
+> controller-side below is still the target design.
 
 ---
 
@@ -39,8 +41,8 @@ observed state reconciled in loops; trust nothing you didn't verify.
 
 | Process | Module | Responsibility | Package (planned) | Status |
 | --- | --- | --- | --- | --- |
-| Worker | Chunk store | Header-format chunk files, atomic durable writes, temp cleanup, inventory | `internal/worker/store` | Phase 1 |
-| Worker | Chunk API | PUT/GET/DELETE chunk, list inventory, healthz | `internal/worker/server` | Phase 1 |
+| Worker | Chunk store | Header-format chunk files, atomic durable writes, temp cleanup, inventory | `internal/worker/store` | **Implemented (Phase 1)** |
+| Worker | Chunk API | PUT/GET/DELETE chunk, list inventory, healthz, write gate | `internal/worker/server`, `cmd/worker` | **Implemented (Phase 1)** |
 | Worker | Membership agent | Register (with inventory, retried), heartbeat, write gate | `internal/worker/agent` | Phase 2 |
 | Worker | Scrubber | Throttled re-verification; suspects reported via heartbeat | `internal/worker/scrub` | Phase 8 |
 | Controller | API front end | Client REST API, validation, error mapping | `internal/controller/api` | Phases 3–5 |
@@ -56,9 +58,14 @@ observed state reconciled in loops; trust nothing you didn't verify.
 | Controller | Observability | `/healthz`, `/cluster`, audit, structured event log | `internal/controller/api`, `.../audit` | Phases 2, 6, 9 |
 | Client | `objctl` | CLI for the REST API; demos and benchmarks | `cmd/objctl` | Phase 5 |
 
-Shared packages: `internal/chunkid` (ID format and validation),
-`internal/config` (environment configuration), `internal/httpx` (JSON
-errors and middleware), `internal/version`.
+Shared packages (implemented in Phase 1): `internal/ids` (object/chunk/worker
+ID generation and validation, DEC-028), `internal/config` (environment
+configuration), `internal/wire` (JSON types, header names, error codes),
+`internal/httpx` (JSON errors, request logging, panic recovery),
+`internal/version`.
+
+All binaries ship in one Alpine image running as a non-root user (DEC-023);
+Compose selects the command.
 
 ## 3. Data model
 
@@ -81,9 +88,45 @@ Logical records (stored in SQLite tables in Phase 3):
 **Effective replica** = replica in state `OK` on a worker in state `ALIVE`.
 Reads use only effective replicas; safety is measured by counting them.
 
-Worker disk: one file per chunk, named by chunk ID, consisting of a fixed
-header (magic, version, payload length, payload SHA-256) followed by the payload
-(DEC-012).
+### 3.1 Worker storage (implemented, Phase 1)
+
+```
+DATA_DIR/                       (named Docker volume, owned by uid 10001)
+  chunks/<chunk_id>             committed: 48-byte header + payload
+  tmp/<chunk_id>.<random>.tmp   in-progress writes; all deleted at startup
+```
+
+Header (DEC-012): magic `OSCK`, format version, payload size, payload
+SHA-256. The header records the size and checksum the controller *expected*,
+and is only committed if the received bytes matched both.
+
+**Write (PUT) protocol.** Validate ID and headers → stream the body into a new
+temp file while hashing → reject on size or checksum mismatch (temp file
+deleted, existing file untouched) → fsync file → under the chunk's lock,
+rename over `chunks/<chunk_id>` → fsync directory → ack. A crash before the
+rename leaves only a temp file (removed at next startup); a crash after it
+leaves the complete new file. A PUT always replaces (DEC-024), so retries are
+idempotent and in-place repair needs no special path.
+
+**Read (GET).** Under the chunk's read lock, load the file (capped at
+`CHUNK_SIZE + 49` bytes) into memory, release the lock, send. The worker
+returns bytes as stored plus the stored checksum and **does not judge
+validity**; the controller verifies against metadata. A destroyed header is
+reported as `CHUNK_CORRUPT` (DEC-027). At most `MAX_CONCURRENT_READS`
+chunks are held in memory (DEC-025).
+
+**Delete.** Under the chunk's lock, unlink; absent is success; fsync directory.
+
+**Inventory.** List `chunks/` (never `tmp/`), keep only valid chunk-ID names,
+report `size = file size − 48` from metadata alone. Appended or truncated
+bytes therefore show up as a size mismatch at reconciliation time (Phase 6).
+
+**Locking.** 256 striped `RWMutex`es keyed by a hash of the chunk ID. Locks are
+held only for local file operations, never across network I/O.
+
+**Write gate.** PUT/DELETE return 503 `NOT_REGISTERED` while closed. Phase 1
+opens it at startup (standalone, DEC-026); Phase 2 opens it only after
+registration (DEC-006).
 
 ## 4. State machines
 

@@ -10,8 +10,8 @@ owner review. The owner makes the git commit for each phase.
 
 | Phase | Milestone | Theme | Depends on | Status |
 | --- | --- | --- | --- | --- |
-| 0 | M0 | Setup and design lock-in | — | COMPLETED (awaiting review) |
-| 1 | M1 | Worker: durable chunk store over HTTP, in Docker | 0 | NOT STARTED |
+| 0 | M0 | Setup and design lock-in | — | COMPLETED |
+| 1 | M1 | Worker: durable chunk store over HTTP, in Docker | 0 | COMPLETED (awaiting review) |
 | 2 | M2 | Membership, failure detection, `SYNCING`, Compose cluster | 1 | NOT STARTED |
 | 3 | M3a+M3b | Write path: metadata DB, chunk, place, replicate, commit | 2 | NOT STARTED |
 | 4 | M4 | Read path: verify, fall back, stream in order | 3 | NOT STARTED |
@@ -57,16 +57,15 @@ owner review. The owner makes the git commit for each phase.
   `go test -race ./...` passes in the `golang:1.27.3` container. Every
   §9 open decision has a DEC entry.
 - **Testing.** Toolchain smoke test (`internal/version`).
-- **Status.** COMPLETED (awaiting review). Two decisions remain PROVISIONAL
-  pending owner confirmation: DEC-005 (chunk size), DEC-013 (string-only
-  metadata).
+- **Status.** COMPLETED. Two decisions remain PROVISIONAL pending owner
+  confirmation: DEC-005 (chunk size), DEC-013 (string-only metadata).
 
 ## Phase 1 — Worker as a container (M1)
 
 - **Objectives.** A standalone, durable, atomic, idempotent chunk store
   reachable over HTTP, packaged as a container with a named volume.
 - **Dependencies.** Phase 0.
-- **Planned components.** `internal/chunkid` (format + strict validation);
+- **Planned components.** `internal/ids` (planned as `internal/chunkid`; format + strict validation);
   `internal/config` (env parsing with defaults and validation);
   `internal/httpx` (JSON errors, middleware); `internal/worker/store`
   (header file format DEC-012, temp → fsync → rename → dir fsync, startup temp
@@ -85,6 +84,14 @@ owner review. The owner makes the git commit for each phase.
   concurrent PUT/DELETE on the same ID, concurrent PUTs of the same ID,
   corrupted header/payload detection) and HTTP handler tests; manual Docker
   verification script documented in `RUN_AND_TEST.md`; race run.
+- **Status.** COMPLETED (awaiting review). As built: the identifier package is
+  `internal/ids` (DEC-028); the debug tool is the `worker inspect`
+  subcommand; the write gate exists but is open at startup (DEC-026). Every
+  acceptance criterion is covered by an automated test: store/fetch/compare
+  (store, server, e2e), persistence across stop/start and container
+  re-creation (e2e), kill mid-write (integration with the native binary, and
+  e2e with `docker kill`), wrong checksum (all levels), idempotent PUT/DELETE,
+  traversal IDs, inventory contents.
 
 ## Phase 2 — Membership and failure detection (M2)
 

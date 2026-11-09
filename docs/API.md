@@ -1,10 +1,11 @@
 # API Reference
 
-> **Status (Phase 0):** this document is the **API contract**. No endpoint is
-> implemented yet. Each endpoint lists the phase that implements it; when that
-> phase completes, its section is marked **IMPLEMENTED** and verified examples
-> are added. Until then, details may be refined, and any change is recorded in
-> [`DECISIONS.md`](DECISIONS.md).
+> **Status (end of Phase 1):** the **worker endpoints** are **IMPLEMENTED**
+> and tested. Everything else is the **API contract** for later phases. Each
+> endpoint lists the phase that implements it; when that phase completes, its
+> section is marked **IMPLEMENTED**. Until then, details may be refined, and
+> any change is recorded in [`DECISIONS.md`](DECISIONS.md). Verified `curl`
+> examples are in [`RUN_AND_TEST.md`](RUN_AND_TEST.md).
 
 - Client API: served by the **controller**, published on host port `8080`.
 - Internal API: controller endpoints under `/internal/workers/...` (called by
@@ -42,11 +43,13 @@
 | 400 | `INVALID_PAGINATION` | Bad `limit` or `cursor` |
 | 400 | `CHECKSUM_MISMATCH` | Chunk bytes do not match the expected SHA-256 (worker) |
 | 400 | `SIZE_MISMATCH` | Chunk body length differs from `Content-Length` (worker) |
+| 400 | `CHUNK_TOO_LARGE` | Chunk body exceeds `CHUNK_SIZE` (worker) |
 | 404 | `OBJECT_NOT_FOUND` | Unknown or non-`READY` object |
 | 404 | `CHUNK_NOT_FOUND` | Worker does not hold the chunk |
 | 404 | `WORKER_NOT_FOUND` | Inventory requested for a different worker ID (DEC-010) |
 | 409 | `VERSION_CONFLICT` | `If-Match` does not match current `metadata_version` (DEC-014) |
 | 500 | `INTERNAL` | Unexpected error (details only in logs) |
+| 500 | `CHUNK_CORRUPT` | Worker cannot parse the chunk file header (DEC-027) |
 | 503 | `INSUFFICIENT_WORKERS` | Fewer than `REPLICATION_FACTOR` ALIVE workers at upload start |
 | 503 | `UPLOAD_FAILED` | Upload could not place a chunk on enough distinct workers |
 | 503 | `STORAGE_UNAVAILABLE` | Download: some chunk has no effective (OK + ALIVE) replica |
@@ -236,42 +239,83 @@ stale (DEC-020). Liveness is judged on the controller's receive time only (D11).
 
 ---
 
-## Internal API — worker endpoints (called by the controller)
+## Internal API — worker endpoints (called by the controller) · IMPLEMENTED (Phase 1)
 
-### `PUT /internal/chunks/{chunk_id}` · *Phase 1*
+Workers listen on port 9000 inside the Compose network. **Write gate
+(DEC-006):** PUT and DELETE return 503 `NOT_REGISTERED` while the worker is
+not accepting writes. In Phase 1 the worker runs standalone and accepts
+writes from startup (DEC-026); from Phase 2 it accepts writes only after
+registering with the controller. GET, inventory, and healthz are always
+available.
 
-**Request:** raw bytes (`application/octet-stream`). Headers:
-`Content-Length` (required), `X-Chunk-SHA256` (required, expected checksum).
+### `PUT /internal/chunks/{chunk_id}`
 
-**Behaviour:** stream to a temp file while hashing; reject on size or
-checksum mismatch; fsync, rename, fsync directory (when `FSYNC_ON_WRITE`).
-**Idempotent:** if a valid file with the same checksum already exists, the
-result is a no-op success; if an existing file is invalid or differs, it is
-atomically replaced (in-place corrupt repair, DEC-008).
+**Request:** raw bytes. Headers: `Content-Length` (required; chunked
+transfer encoding is rejected), `X-Chunk-SHA256` (required; 64 hex characters,
+either case).
 
-**Responses:** 201 stored; 200 already present and identical. **Errors:** 400
-`INVALID_CHUNK_ID` / `CHECKSUM_MISMATCH` / `SIZE_MISMATCH` / `INVALID_REQUEST`;
-503 `NOT_REGISTERED` / `INSUFFICIENT_STORAGE`.
+**Behaviour:** streams the body to `tmp/` while hashing; rejects it on size
+or checksum mismatch; then fsync, rename into `chunks/`, fsync the directory
+(when `FSYNC_ON_WRITE=true`). **Always atomically replaces** any existing file
+(DEC-024): a retry rewrites identical bytes (idempotent), and re-sending the
+correct bytes repairs a corrupt replica in place (DEC-008). A rejected PUT
+never changes the existing file.
 
-### `GET /internal/chunks/{chunk_id}` · *Phase 1*
+**Response 201** (no file existed) or **200** (an existing file was replaced):
 
-**Response 200:** chunk payload bytes, `Content-Length`, and
-`X-Chunk-SHA256` = checksum stored in the chunk header. The worker returns the
-bytes as stored; the **controller** verifies them against metadata (authority
-rule, architecture §3.6). **Errors:** 400 `INVALID_CHUNK_ID`; 404 `CHUNK_NOT_FOUND`.
+```json
+{"chunk_id":"3f2b8c1e-9a4d-4e2f-8b7a-1c2d3e4f5a6b_000000","size":1048576,
+ "checksum_sha256":"934e1109...","created":true}
+```
 
-### `DELETE /internal/chunks/{chunk_id}` · *Phase 1*
+**Errors:** 400 `INVALID_CHUNK_ID` (including `..%2F` traversal attempts),
+`INVALID_REQUEST` (missing/malformed checksum header, missing Content-Length),
+`CHUNK_TOO_LARGE` (> `CHUNK_SIZE`), `CHECKSUM_MISMATCH`, `SIZE_MISMATCH`;
+503 `NOT_REGISTERED`, `INSUFFICIENT_STORAGE` (disk full); 500 `INTERNAL`.
+
+**Concurrency:** concurrent PUTs, GETs, and DELETEs of the same chunk are
+serialised at the final rename/unlink/read by per-chunk locks. A reader
+always sees either the old complete file or the new complete file.
+
+### `GET /internal/chunks/{chunk_id}`
+
+**Response 200:** body = every byte stored after the chunk header,
+`Content-Type: application/octet-stream`, `Content-Length`, and
+`X-Chunk-SHA256` = the checksum recorded in the header **when the chunk was
+written**. The worker does **not** verify the payload: the **controller**
+verifies size and SHA-256 against metadata (authority rule, architecture
+§3.6). If the file was corrupted by appending or truncating bytes, the body
+length differs from the original size. The body is capped at `CHUNK_SIZE + 1`
+bytes so an oversized file stays detectable without unbounded memory (DEC-025).
+
+**Errors:** 400 `INVALID_CHUNK_ID`; 404 `CHUNK_NOT_FOUND`; 500
+`CHUNK_CORRUPT` (the header itself is unreadable: bad magic, unknown version,
+or the file is shorter than the header); 500 `INTERNAL`.
+
+**Resource bound:** at most `MAX_CONCURRENT_READS` GETs hold a chunk in
+memory at once; others wait (and give up if the client disconnects).
+
+### `DELETE /internal/chunks/{chunk_id}`
 
 **Response 204** whether or not the chunk existed (idempotent, §5.5).
-**Errors:** 400 `INVALID_CHUNK_ID`; 503 `NOT_REGISTERED`.
+**Errors:** 400 `INVALID_CHUNK_ID`; 503 `NOT_REGISTERED`; 500 `INTERNAL`.
 
-### `GET /internal/workers/{worker_id}/chunks` · *Phase 1*
+### `GET /internal/workers/{worker_id}/chunks`
 
-**Response 200:** `{"worker_id": "worker2", "chunks": [ {"chunk_id": "...", "size": 1048576} ]}`
-listing fully written chunks (temp files excluded). `size` is the payload
-size from the chunk header. **Errors:** 404 `WORKER_NOT_FOUND` if
-`worker_id` is not this worker (DEC-010).
+**Response 200:**
 
-### `GET /healthz` (worker) · *Phase 1*
+```json
+{"worker_id":"worker1","chunks":[{"chunk_id":"3f2b8c1e-..._000000","size":1048576}]}
+```
 
-200 `{"status":"ok","worker_id":"worker2","registered":true}`.
+Lists committed chunk files sorted by chunk ID; `chunks` is `[]` (never
+`null`) when empty. Temp files are excluded. `size` is the **payload size on
+disk** (file size − 48-byte header), taken from file metadata only, so
+appended or truncated bytes show up as a size mismatch against metadata.
+Files whose names are not valid chunk IDs are ignored (and logged).
+**Errors:** 404 `WORKER_NOT_FOUND` if `worker_id` is not this worker (DEC-010).
+
+### `GET /healthz` (worker)
+
+200 `{"status":"ok","worker_id":"worker1","registered":false,"accepting_writes":true}`.
+`registered` becomes meaningful in Phase 2.
