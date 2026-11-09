@@ -6,13 +6,14 @@ a single controller keeps the metadata, detects failed workers, and repairs
 lost or corrupted data automatically. The whole system runs on one machine
 with Docker Compose.
 
-> **Implementation status: Phase 6 of 11 complete.** The cluster (1
+> **Implementation status: Phase 7 of 11 complete.** The cluster (1
 > controller + 4 workers) runs under Docker Compose and **every client API
 > endpoint of the specification works** (upload, verified download, metadata
-> GET/PATCH, list, delete, `objctl`). Workers that return after a failure are
-> reconciled against the metadata, `/cluster` shows replication health, and
-> `/admin/audit` checks the invariants. Automatic re-replication comes next.
-> See [Current status](#current-status).
+> GET/PATCH, list, delete, `objctl`). The system **heals itself**: after a
+> worker has been gone for `REPAIR_GRACE` (30 s), its chunks are copied to the
+> remaining workers until every chunk has two copies again; corrupt copies are
+> rewritten. The worker scrubber and full crash recovery come next. See
+> [Current status](#current-status).
 
 ## The problem
 
@@ -93,6 +94,7 @@ internal/
   controller/janitor/ deferred cleanup of aborted uploads
   controller/custommeta/ custom metadata validation
   controller/resync/ inventory reconciliation for registering workers
+  controller/repair/ self-healing re-replication loop
   worker/store/      on-disk chunk store (atomic, checksummed)
   worker/server/     worker HTTP API and write gate
   worker/agent/      worker membership: register, heartbeat, re-register
@@ -144,7 +146,8 @@ curl -s 'localhost:8080/api/v1/objects?limit=10'
 curl -s -X DELETE localhost:8080/api/v1/objects/<object_id>
 curl -s localhost:8080/admin/audit    # invariants: "ok":true,"steady_state":true
 docker stop worker2                   # ~10 s later: worker2 DEAD; /cluster shows under-replicated chunks
-docker start worker2                  # ALIVE again (re-registered)
+                                      # ~40 s later: its chunks re-replicated; audit "steady_state":true
+docker start worker2                  # ALIVE again; its superseded copies are deleted
 docker compose down                   # stop; data volumes are kept (-v deletes them)
 ```
 
@@ -184,8 +187,9 @@ implemented.
 | 3 | Write path: metadata DB, chunking, replication, atomic commit | COMPLETED |
 | 4 | Read path: verified, in-order download with replica fallback | COMPLETED |
 | 5 | Complete client API: metadata, PATCH, list, delete; `objctl` | COMPLETED |
-| 6 | Degraded operation, inventory reconciliation, `/cluster` totals, audit | COMPLETED (awaiting review) |
-| 7–11 | See [implementation plan](docs/IMPLEMENTATION_PLAN.md) | NOT STARTED |
+| 6 | Degraded operation, inventory reconciliation, `/cluster` totals, audit | COMPLETED |
+| 7 | Self-healing re-replication | COMPLETED (awaiting review) |
+| 8–11 | See [implementation plan](docs/IMPLEMENTATION_PLAN.md) | NOT STARTED |
 
 Open item awaiting owner confirmation: string-only custom metadata values
 (DEC-013). The chunk size is confirmed as 1 MB = 1,000,000 bytes (DEC-005).

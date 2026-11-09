@@ -98,7 +98,8 @@ func TestLoadController(t *testing.T) {
 		DBPath: "/data/meta.db", ChunkSize: 1_000_000, ReplicationFactor: 2, UploadWindow: 4,
 		MaxObjectSize: 5 << 30, MaxConcurrentUploads: 16, MaxConcurrentDownloads: 32, MinFreeBytes: 100_000_000,
 		WorkerConnectTimeout: 2 * time.Second, WorkerRequestTimeout: 10 * time.Second,
-		ClientReadTimeout: time.Minute, JanitorInterval: 10 * time.Second}
+		ClientReadTimeout: time.Minute, JanitorInterval: 10 * time.Second,
+		ReconcilerInterval: 5 * time.Second, MaxConcurrentRepairs: 4}
 	if c != want {
 		t.Fatalf("defaults = %+v, want %+v", c, want)
 	}

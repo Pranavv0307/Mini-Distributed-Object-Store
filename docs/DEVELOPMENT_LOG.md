@@ -671,3 +671,83 @@ safety vs. steady state).
 Phase 7: the level-triggered reconciler (repair after `REPAIR_GRACE`,
 risk-prioritised, throttled, in-flight set), over-replication trimming,
 zero-effective alarm, `/cluster` repair counters.
+
+---
+
+## Phase 7 — Self-healing re-replication (2026-11-10)
+
+### What was implemented
+
+- **`internal/controller/meta/repair.go`**: `RepairCandidates`,
+  `PendingDeleteWorkers`, `ClaimRepair` (new or in-place), `CompleteRepair`
+  (with superseding), `AbandonRepair`, `TrimReplica` (guarded) (DEC-055).
+- **`internal/controller/repair`**: the level-triggered loop: replica
+  classification, riskiest-first jobs with bounded concurrency,
+  non-overlapping rounds, verified controller-mediated copy, in-place repair,
+  trimming, `data_unrecoverable` alarm, rate-limited failure logs, counters
+  (DEC-054).
+- **Warm-up and unknown workers** (DEC-056): `registry.StartedAt`; the loop
+  waits `DEAD_AFTER + HEARTBEAT_INTERVAL` after start.
+- **Config/wiring:** `RECONCILER_INTERVAL`, `MAX_CONCURRENT_REPAIRS`;
+  `/cluster` `repair` section; Compose environment.
+- **Tests:** repair transaction unit tests (including the delete race and
+  the trimming guard), eight integration tests, `TestComposeSelfHealing`.
+
+### Important decisions
+
+DEC-054 to DEC-056. In-place repair of CORRUPT copies (D16, DEC-008),
+planned for Phase 8, is part of the same mechanism and already tested here;
+Phase 8 adds the scrubber and the cross-check.
+
+### Problems encountered and resolutions
+
+1. **Placeholder classification draft did not compile** (`viewsWithDefault`)
+   and would have treated unknown workers as "may return" forever; replaced
+   by `workerViews` with an explicit unknown-worker default.
+2. **Classification branch bug** found in review: a chunk with RF effective
+   copies plus one copy on a worker within grace was counted as "waiting"
+   and its lost copies were never trimmed. Branches reordered (effective = 0;
+   effective + potential < RF; effective < RF; otherwise trim).
+3. **Test bug:** `TestNoRepairWithinGrace` checked "more than 5 rounds",
+   which was already true before the worker died. It now waits for chunks to
+   be reported waiting, then for 5 more rounds.
+4. **Latent flake in an older e2e test:** `TestComposeResync` (Phase 6)
+   asserts under-replication right after a wipe; with repair in place the
+   next round could fix it before the assertion. Its repair rounds are now
+   disabled (`RECONCILER_INTERVAL=1h`), since it tests detection.
+5. **Config edits failed on gofmt-aligned anchors**; reapplied with the
+   actual alignment.
+6. All check runs in this phase kept full logs (follow-up to the Phase 6
+   lost-output incident); no unexplained failure occurred.
+
+### Tests performed and results (2026-11-10)
+
+- `go build`, `go vet` (default and `-tags e2e`), `gofmt -l` (empty),
+  `go tool staticcheck` (default and `-tags e2e`): pass.
+- `go test -count=1 ./...` three times (Windows, 16 packages, logs kept): pass.
+- `go test -race -count=3 ./...` (Linux container): pass.
+- Repair integration tests, three times: pass; in-process detection ≈ 1.0 s,
+  full RF ≈ 2.1–2.2 s (`DEAD_AFTER` 1 s, grace 1 s); peak concurrent repair
+  writes 2 with a limit of 2.
+- `go test -tags e2e -count=1 -v ./test/e2e/...`: 7 tests pass; no leftovers.
+  `TestComposeSelfHealing`: DEAD after 4.1 s, full RF after 10.3 s (5 copies).
+- Manual Compose demo with default timings: worker3 (6 of 36 copies) DEAD
+  after 10 s, `fully_replicated` 12/18 → steady after 41 s, 6 repairs, 5.5 MB
+  copied in a 120 ms round, 3 downloads identical; after `docker start` its
+  superseded files were deleted, `pending_deletes` 0, steady.
+
+### Known limitations
+
+- Repair bandwidth flows through the controller (D14); one copy per chunk per
+  round (enough for RF = 2).
+- Placement is random, so repairs can make the distribution uneven; no
+  rebalancing (non-goal).
+- `waiting_for_grace` and `unrecoverable` in `/cluster` lag by up to one round.
+- Corruption is only detected by reads and registration until the scrubber
+  (Phase 8).
+
+### Work remaining
+
+Phase 8: worker scrubber reporting suspects via heartbeat, controller
+cross-check, end-to-end corruption scenarios (one corrupt copy repaired,
+deleted file repaired, both copies corrupt refused).

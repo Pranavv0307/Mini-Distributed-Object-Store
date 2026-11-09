@@ -4,8 +4,8 @@
 > all client endpoints of the specification (see the conformance checklist at
 > the end of the client API section), all worker endpoints, the controller's
 > membership endpoints (with real inventory reconciliation), `/healthz`,
-> `/cluster` (workers and storage totals), and `/admin/audit` (v1). Repair
-> counters (Phase 7) and audit I4 (Phase 9) are still to come. Each
+> `/cluster` (workers, storage totals, and repair counters), and
+> `/admin/audit` (v1). Audit I4 (Phase 9) is still to come. Each
 > endpoint lists the phase that implements it; when that phase completes, its
 > section is marked **IMPLEMENTED**. Until then, details may be refined, and
 > any change is recorded in [`DECISIONS.md`](DECISIONS.md). Verified `curl`
@@ -312,7 +312,7 @@ error code, non-empty message); all pass.
 200 `{"status":"ok"}` while the controller is serving. (From Phase 3 it also
 requires the metadata database to be open.) Used by the Compose healthcheck.
 
-### `GET /cluster` — observability · IMPLEMENTED (Phase 2: workers; Phase 6: storage); repair counters in Phase 7
+### `GET /cluster` — observability · IMPLEMENTED (Phase 2: workers; Phase 6: storage; Phase 7: repair)
 
 200, JSON snapshot (verified example, worker2 stopped):
 
@@ -364,6 +364,29 @@ object (verified, worker2 stopped, one 5.5 MB object):
 | `pending_deletes` | Chunk files queued for deletion (DEC-007) |
 
 Computed on each request from the metadata and the current `ALIVE` set.
+
+**Repair section (Phase 7).** Verified example, after worker3 (6 copies) was
+lost and repaired:
+
+```json
+"repair":{"in_flight":0,"completed":6,"failed":0,"trimmed":0,"bytes_copied":5500000,
+          "waiting_for_grace":0,"unrecoverable":0,"rounds":8,
+          "last_round_at":"2026-11-09T19:00:25.086131328Z","last_round_duration_ms":119}
+```
+
+| Field | Meaning |
+| --- | --- |
+| `in_flight` | Copies being made right now (≤ `MAX_CONCURRENT_REPAIRS`) |
+| `completed`, `failed` | Repairs since the controller started (a failed one is retried in a later round) |
+| `trimmed` | Superfluous copies removed (over-replication, superseded lost copies) |
+| `bytes_copied` | Payload bytes written by repairs |
+| `waiting_for_grace` | Chunks short of RF in the **last round** whose missing holder may still return (DEAD within `REPAIR_GRACE`, or SYNCING) |
+| `unrecoverable` | Chunks in the last round with no valid copy on any live or returning worker (reads return 503; logged as `data_unrecoverable`) |
+| `rounds`, `last_round_at`, `last_round_duration_ms` | Repair loop activity |
+
+`waiting_for_grace` and `unrecoverable` describe the most recent round
+(every `RECONCILER_INTERVAL`), so they lag a state change by up to one
+round. Absent when the controller runs without a repair loop.
 
 ### `GET /admin/audit` — invariant audit · IMPLEMENTED (Phase 6, v1); I4 in Phase 9
 

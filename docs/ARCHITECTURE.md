@@ -6,16 +6,16 @@ original design, with full rationale for decisions D1–D22, is in
 [`reference/Object_Store_Architecture.md`](reference/Object_Store_Architecture.md)
 (called "the design doc" below). Where this implementation differs from or
 clarifies the design doc, the difference is listed in
-[§14 Deviations](#14-deviations-and-clarifications-vs-the-design-doc) with a link
+[§15 Deviations](#15-deviations-and-clarifications-vs-the-design-doc) with a link
 to [`DECISIONS.md`](DECISIONS.md).
 
-> **Current status (end of Phase 6):** implemented: the worker's chunk store
+> **Current status (end of Phase 7):** implemented: the worker's chunk store
 > and chunk API (§3.1); cluster membership with the `SYNCING` protocol (§7);
 > the metadata database, the upload path, and a minimal janitor (§8); the
 > verified download path (§9); metadata, list, delete, and `objctl` (§10);
-> inventory reconciliation, `/cluster` storage totals, and audit v1 (§11).
-> **Every client endpoint of the specification works.** Not yet: repair,
-> the scrubber, and full janitor/recovery (target design below).
+> inventory reconciliation, `/cluster` storage totals, and audit v1 (§11);
+> **self-healing re-replication** (§12). Not yet: the worker scrubber and the
+> rest of crash recovery (target design below).
 
 ---
 
@@ -55,9 +55,9 @@ observed state reconciled in loops; trust nothing you didn't verify.
 | Controller | Placement engine | Distinct ALIVE workers with free space; pluggable (random) | `internal/controller/placement` | **Implemented (Phase 3)** |
 | Controller | Worker client | The only code calling workers: timeouts, checksum headers | `internal/controller/workerclient` | **Implemented (Phase 3)** |
 | Controller | Upload / download coordinators | Streaming write and read paths | `internal/controller/upload`, `.../download` | **Implemented (Phases 3, 4)** |
-| Controller | Reconciler | Level-triggered repair of under-replicated/corrupt chunks | `internal/controller/reconciler` | Phase 7 |
+| Controller | Reconciler (repair loop) | Level-triggered repair of under-replicated/corrupt chunks; trimming | `internal/controller/repair` | **Implemented (Phase 7)** |
 | Controller | Janitor | `pending_deletes` drain and purge of `DELETING` objects for aborted uploads and client deletes (Phases 3, 5, implemented); stale uploads, orphan sweep (Phase 9) | `internal/controller/janitor` | Partly |
-| Controller | Recovery | Startup recovery pass, reconciler warm-up | `internal/controller/recovery` | Phase 9 |
+| Controller | Recovery | Startup recovery pass (Phase 9); repair warm-up and unknown-worker rule (Phase 7, DEC-056) | `internal/controller/recovery`, `.../repair` | Partly (Phase 7) |
 | Controller | Observability | `/healthz`, `/cluster`, audit, structured event log | `internal/controller/api`, `.../audit` | `/healthz`, `/cluster` (workers), event log: implemented; audit Phases 6, 9 |
 | Client | `objctl` | CLI for the REST API with local download verification; Compose `client` service | `cmd/objctl` | **Implemented (Phase 5)** |
 
@@ -468,7 +468,53 @@ of 12 replicas):
 | 7 bytes appended to one worker2 chunk, worker2 restarted | 5 fully, 1 under; reconciliation `size_mismatch_corrupt 1` | ok, not steady (I5: 1) |
 | Volume wiped, worker restarted (e2e test) | missing rows removed; under-replicated = lost copies | ok, not steady |
 
-## 12. Failure handling (summary)
+## 12. Self-healing re-replication (implemented, Phase 7)
+
+`internal/controller/repair` (DEC-054 to DEC-056), started after a warm-up
+of `DEAD_AFTER` + `HEARTBEAT_INTERVAL`, a round every `RECONCILER_INTERVAL`:
+
+```
+ candidates = chunks of READY objects not in the simple healthy shape
+ for each: classify replicas (effective / potential / lost / busy)
+   busy                          → skip
+   effective = 0                 → wait (potential > 0) or unrecoverable (alarm)
+   effective + potential < RF    → repair job
+   effective < RF                → wait for grace
+   otherwise                     → trim superfluous copies (if nothing else to do)
+ run jobs riskiest-first, ≤ MAX_CONCURRENT_REPAIRS at once:
+   target   = ALIVE CORRUPT holder (in place) or a random eligible worker
+              with no row and no pending delete for the chunk
+   claim    → PENDING row (one transaction, object READY)
+   copy     → GET from a random effective source, verify SHA-256, PUT to target
+   complete → OK + superseded lost copy → pending delete (one transaction)
+   failure  → claim → pending delete
+```
+
+| Situation | Behaviour (tested) |
+| --- | --- |
+| Worker DEAD, within grace | Nothing copied; chunks counted in `waiting_for_grace` |
+| Worker DEAD beyond grace | Its chunks re-replicated on the others; its rows superseded |
+| It returns afterwards | Its superseded files deleted by the janitor; no over-replication |
+| Copy `CORRUPT` (read, reconciliation) | Rewritten in place on its own worker, no grace |
+| Volume wiped (rows removed at registration) | Repaired immediately (lost, not "may return") |
+| Only valid copy turns out corrupt, other holder lost | `unrecoverable`, reads 503; repaired from the other holder if it returns |
+| Extra copy (over-replication) | Trimmed to RF; file deleted |
+| Many lost chunks | At most `MAX_CONCURRENT_REPAIRS` copies in flight |
+| Controller restart | No repair until workers had a chance to return (DEC-056) |
+| Delete during repair | Delete wins; repair cannot complete |
+
+**Measured.**
+
+| Setup | Detection | Full RF restored |
+| --- | --- | --- |
+| Compose, defaults (10 s / 30 s / 5 s), worker3 held 6 of 36 copies (3 × 5.5 MB) | 10 s | 41 s (6 copies, 5.5 MB, one 120 ms round) |
+| Compose e2e (4 s / 6 s / 1 s), 5 copies | 4.1 s | 10.3 s |
+| In-process (1 s / 1 s / 50 ms), 15–16 copies | ≈ 1.0 s | ≈ 2.1–2.2 s |
+
+Window of vulnerability ≈ `DEAD_AFTER` + `REPAIR_GRACE` + one round + copy
+time (§4.7); with the defaults, about 45 s for a small data set.
+
+## 13. Failure handling (summary)
 
 See the design doc §5.2 (failure model) and §7 (failure scenario matrix).
 Implemented so far: worker stop/start and controller restart for membership
@@ -479,14 +525,14 @@ chunk (`TestWorkerKilledMidWriteLeavesNoPartialChunk`, e2e). Data-path
 scenarios are implemented in Phases 4–9 and will be listed here with their
 tests.
 
-## 13. Trade-offs and limitations
+## 14. Trade-offs and limitations
 
 Inherited from the design doc §8: single controller (SPOF); controller in the
 data path (throughput ceiling); synchronous 2-way replication (write latency;
 needs ≥ 2 workers); RF = 2 (one failure at a time); immutable objects; repair
 grace period (longer vulnerability window); single-file metadata DB.
 
-## 14. Deviations and clarifications vs. the design doc
+## 15. Deviations and clarifications vs. the design doc
 
 | Topic | Design doc | Implementation | Decision |
 | --- | --- | --- | --- |
@@ -504,4 +550,7 @@ grace period (longer vulnerability window); single-file metadata DB.
 | 409 | "If adopted" (§9.4) | Adopted: optional `If-Match` on PATCH | DEC-014 |
 | Janitor for client deletes | Phase 5 scope | Built in Phase 3 (needed for aborts), reused | DEC-037, DEC-048 |
 | Audit result | Pass/fail on I1–I5 | `ok` = safety invariants (I1, I2, I3, I7, I8); I5 reported as `steady_state` | DEC-053 |
+| Repair in-flight set | Track chunks being repaired across rounds | Rounds never overlap; one copy per chunk per round | DEC-054 |
+| Superseded lost row | "Drop" it | Moved to pending deletes (file deleted when its worker returns) | DEC-055 |
+| Repair warm-up | Phase 9 (§4.10) | Built with the repair loop in Phase 7 | DEC-056 |
 | Missing file on registration vs. on read | §4.5: remove the row | Registration removes the row; a read marks it `CORRUPT` (both non-effective, both repaired in Phase 7) | DEC-040, DEC-051 |

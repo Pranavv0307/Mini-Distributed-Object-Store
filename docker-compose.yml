@@ -70,6 +70,8 @@ services:
       WORKER_REQUEST_TIMEOUT: ${WORKER_REQUEST_TIMEOUT:-10s}
       CLIENT_READ_TIMEOUT: ${CLIENT_READ_TIMEOUT:-60s}
       JANITOR_INTERVAL: ${JANITOR_INTERVAL:-10s}
+      RECONCILER_INTERVAL: ${RECONCILER_INTERVAL:-5s}
+      MAX_CONCURRENT_REPAIRS: ${MAX_CONCURRENT_REPAIRS:-4}
     volumes:
       - controller-data:/data # metadata database (DB_PATH)
     healthcheck:

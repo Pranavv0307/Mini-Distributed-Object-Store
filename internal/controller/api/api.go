@@ -16,6 +16,7 @@ import (
 	"objstore/internal/controller/download"
 	"objstore/internal/controller/meta"
 	"objstore/internal/controller/registry"
+	"objstore/internal/controller/repair"
 	"objstore/internal/controller/upload"
 	"objstore/internal/httpx"
 	"objstore/internal/ids"
@@ -63,6 +64,8 @@ type Config struct {
 	Meta *meta.Store
 	// ReplicationFactor is used for /cluster totals and the audit.
 	ReplicationFactor int
+	// Repair, if set, contributes the /cluster repair section.
+	Repair interface{ Stats() repair.Stats }
 	// Uploader, if set, serves POST /api/v1/objects.
 	Uploader *upload.Coordinator
 	// Downloader, if set, serves GET/HEAD /api/v1/objects/{object_id}.
@@ -321,6 +324,17 @@ func (s *Server) cluster(w http.ResponseWriter, r *http.Request) {
 			ReplicasByState: h.ReplicasByState,
 			PendingDeletes:  h.PendingDeletes,
 		}
+	}
+	if s.cfg.Repair != nil {
+		st := s.cfg.Repair.Stats()
+		rv := &wire.RepairView{InFlight: st.InFlight, Completed: st.Completed, Failed: st.Failed,
+			Trimmed: st.Trimmed, BytesCopied: st.BytesCopied, WaitingForGrace: st.WaitingForGrace,
+			Unrecoverable: st.Unrecoverable, Rounds: st.Rounds, LastRoundDuration: st.LastRoundDuration.Milliseconds()}
+		if !st.LastRoundAt.IsZero() {
+			at := st.LastRoundAt.UTC().Format(time.RFC3339Nano)
+			rv.LastRoundAt = &at
+		}
+		v.Repair = rv
 	}
 	httpx.WriteJSON(w, http.StatusOK, v)
 }

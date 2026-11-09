@@ -73,6 +73,7 @@ type Registry struct {
 	lastEpoch uint64
 	deadAfter time.Duration
 	now       func() time.Time
+	startedAt time.Time
 	log       *slog.Logger
 }
 
@@ -90,9 +91,11 @@ func New(opts Options) *Registry {
 	if logger == nil {
 		logger = slog.New(slog.DiscardHandler)
 	}
+	boot := now()
 	return &Registry{
 		workers:   make(map[string]*Worker),
-		lastEpoch: uint64(now().UnixNano()),
+		lastEpoch: uint64(boot.UnixNano()),
+		startedAt: boot,
 		deadAfter: opts.DeadAfter,
 		now:       now,
 		log:       logger,
@@ -239,3 +242,9 @@ func (r *Registry) Alive() []Worker {
 
 // Now returns the registry's clock reading (for consistent age computations).
 func (r *Registry) Now() time.Time { return r.now() }
+
+// StartedAt is when this registry (i.e. this controller process) started. A
+// worker the registry has never heard from is treated as DEAD since then
+// (architecture §4.10: workers that do not check in after a restart become
+// DEAD with dead_since = restart time).
+func (r *Registry) StartedAt() time.Time { return r.startedAt }

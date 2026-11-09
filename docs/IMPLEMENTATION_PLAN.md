@@ -16,8 +16,8 @@ owner review. The owner makes the git commit for each phase.
 | 3 | M3a+M3b | Write path: metadata DB, chunk, place, replicate, commit | 2 | COMPLETED |
 | 4 | M4 | Read path: verify, fall back, stream in order | 3 | COMPLETED |
 | 5 | M5 | Complete client API, delete path, error mapping | 4 | COMPLETED |
-| 6 | M6 | Degraded operation, full inventory reconciliation, audit v1 | 5 | COMPLETED (awaiting review) |
-| 7 | M7 | Self-healing re-replication (reconciler) | 6 | NOT STARTED |
+| 6 | M6 | Degraded operation, full inventory reconciliation, audit v1 | 5 | COMPLETED |
+| 7 | M7 | Self-healing re-replication (reconciler) | 6 | COMPLETED (awaiting review) |
 | 8 | M8 | Data integrity: scrubber, cross-check, corrupt repair | 7 | NOT STARTED |
 | 9 | M9 | Crash consistency, janitor, recovery, audit v2 | 8 | NOT STARTED |
 | 10 | M10 | Evaluation: benchmarks, chaos, invariant tests | 9 | NOT STARTED |
@@ -246,7 +246,7 @@ owner review. The owner makes the git commit for each phase.
   under-replicated counts grow then return to normal on restart inside grace
   with no data movement; wiped volume → missing replicas dropped; races 1–3 of
   DEC-006 covered by tests; audit passes after each scenario.
-- **Status.** COMPLETED (awaiting review). As built:
+- **Status.** COMPLETED. As built:
   `meta.ReconcileInventory` + `internal/controller/resync` (DEC-051),
   `meta.ChunkHealth` and the `/cluster` storage section (DEC-052),
   `meta.Audit` and `GET /admin/audit` (DEC-053: "passes" means the safety
@@ -272,6 +272,15 @@ owner review. The owner makes the git commit for each phase.
   under-replicated → 0 on remaining workers after grace, audit passes, restart
   → resync and trimming, audit passes; detection time and time-to-full-RF
   recorded.
+- **Status.** COMPLETED (awaiting review). As built: `internal/controller/repair`
+  (DEC-054), the repair transactions in `meta/repair.go` (DEC-055), the
+  warm-up and unknown-worker rule pulled forward from Phase 9 (DEC-056), the
+  `/cluster` repair section. In-place repair of CORRUPT copies (planned for
+  Phase 8) falls out of the same path and is already tested. Acceptance:
+  `TestSelfHealingAfterWorkerLoss` and `TestComposeSelfHealing` (stop →
+  degraded downloads → after grace, steady on the remaining workers → return →
+  superseded copies deleted, steady); measured with defaults: DEAD after 10 s,
+  full RF after 41 s; e2e (4 s / 6 s / 1 s): 4.1 s and 10.3 s.
 
 ## Phase 8 — Data integrity (M8)
 

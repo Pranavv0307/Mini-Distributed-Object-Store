@@ -25,6 +25,7 @@ import (
 	"objstore/internal/controller/meta"
 	"objstore/internal/controller/placement"
 	"objstore/internal/controller/registry"
+	"objstore/internal/controller/repair"
 	"objstore/internal/controller/resync"
 	"objstore/internal/controller/upload"
 	"objstore/internal/controller/workerclient"
@@ -34,14 +35,15 @@ import (
 // uploadCluster is an in-process controller with metadata DB, upload
 // coordinator, janitor, and N real workers (each behind a fault injector).
 type uploadCluster struct {
-	gate    *gatedReconciler
-	t       testing.TB
-	url     string
-	meta    *meta.Store
-	reg     *registry.Registry
-	jan     *janitor.Janitor
-	workers []*testWorker
-	byID    map[string]*testWorker
+	repairer *repair.Repairer // nil unless clusterOpts.repair
+	gate     *gatedReconciler
+	t        testing.TB
+	url      string
+	meta     *meta.Store
+	reg      *registry.Registry
+	jan      *janitor.Janitor
+	workers  []*testWorker
+	byID     map[string]*testWorker
 }
 
 type clusterOpts struct {
@@ -51,6 +53,11 @@ type clusterOpts struct {
 	maxObjectSize  int64
 	maxUploads     int
 	requestTimeout time.Duration
+	// Repair loop (Phase 7): off unless repair is true.
+	repair       bool
+	repairGrace  time.Duration // default: repairGrace (1 s)
+	maxRepairs   int           // default 4
+	repairClient func(repair.Client) repair.Client
 }
 
 func newUploadCluster(t testing.TB, o clusterOpts) *uploadCluster {
@@ -82,20 +89,44 @@ func newUploadCluster(t testing.TB, o clusterOpts) *uploadCluster {
 		ClientReadTimeout: 5 * time.Second,
 	}, jan.Kick)
 	gate := &gatedReconciler{inner: resync.New(m, nil, jan.Kick)}
-	srv := api.New(reg, gate, api.Config{
+	var rp *repair.Repairer
+	if o.repair {
+		if o.repairGrace == 0 {
+			o.repairGrace = repairGrace
+		}
+		if o.maxRepairs == 0 {
+			o.maxRepairs = 4
+		}
+		var rc repair.Client = wc
+		if o.repairClient != nil {
+			rc = o.repairClient(wc)
+		}
+		rp = repair.New(m, reg, rc, placement.Random{}, repair.Config{
+			Interval: 50 * time.Millisecond, MaxConcurrent: o.maxRepairs, RepairGrace: o.repairGrace,
+			DeadAfter: deadAfter, ReplicationFactor: 2,
+		})
+	}
+	acfg := api.Config{
 		HeartbeatInterval: hbInterval, DeadAfter: deadAfter, RepairGrace: repairGrace,
 		Meta: m, ReplicationFactor: 2, OnDelete: jan.Kick,
 		Uploader: up, MaxConcurrentUploads: o.maxUploads,
 		Downloader: download.New(m, reg, wc, nil), MaxConcurrentDownloads: 32,
-	})
+	}
+	if rp != nil { // set only when non-nil: a nil *Repairer in the interface would not be nil
+		acfg.Repair, acfg.RepairGrace = rp, o.repairGrace
+	}
+	srv := api.New(reg, gate, acfg)
 	ts := httptest.NewServer(srv.Handler())
 	ctx, cancel := context.WithCancel(context.Background())
 	var bg sync.WaitGroup
 	bg.Go(func() { registry.RunFailureDetector(ctx, reg, checkEvery) })
 	bg.Go(func() { jan.Run(ctx) })
+	if rp != nil {
+		bg.Go(func() { rp.Run(ctx) })
+	}
 	t.Cleanup(func() { cancel(); bg.Wait(); ts.Close(); m.Close() })
 
-	c := &uploadCluster{t: t, url: ts.URL, meta: m, reg: reg, jan: jan, gate: gate, byID: map[string]*testWorker{}}
+	c := &uploadCluster{t: t, url: ts.URL, meta: m, reg: reg, jan: jan, gate: gate, repairer: rp, byID: map[string]*testWorker{}}
 	for i := range o.workers {
 		w := newTestWorker(t, fmt.Sprintf("worker%d", i+1), ts.URL)
 		c.workers = append(c.workers, w)

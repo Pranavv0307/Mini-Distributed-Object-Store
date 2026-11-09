@@ -120,6 +120,10 @@ type Controller struct {
 	ClientReadTimeout time.Duration
 	// JanitorInterval (JANITOR_INTERVAL): cleanup round period.
 	JanitorInterval time.Duration
+	// ReconcilerInterval (RECONCILER_INTERVAL): repair round period.
+	ReconcilerInterval time.Duration
+	// MaxConcurrentRepairs (MAX_CONCURRENT_REPAIRS): copies in flight at once.
+	MaxConcurrentRepairs int
 }
 
 // LoadController reads controller configuration through getenv.
@@ -144,6 +148,8 @@ func LoadController(getenv func(string) string) (Controller, error) {
 		WorkerRequestTimeout:   l.duration("WORKER_REQUEST_TIMEOUT", 10*time.Second, time.Millisecond, 10*time.Minute),
 		ClientReadTimeout:      l.duration("CLIENT_READ_TIMEOUT", time.Minute, 10*time.Millisecond, time.Hour),
 		JanitorInterval:        l.duration("JANITOR_INTERVAL", 10*time.Second, 5*time.Millisecond, time.Hour),
+		ReconcilerInterval:     l.duration("RECONCILER_INTERVAL", 5*time.Second, 5*time.Millisecond, time.Hour),
+		MaxConcurrentRepairs:   int(l.int64("MAX_CONCURRENT_REPAIRS", 4, 1, 256)),
 	}
 	if c.DBPath == "" {
 		l.fail("DB_PATH", "must not be empty")

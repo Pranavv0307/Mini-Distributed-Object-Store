@@ -31,6 +31,7 @@ import (
 	"objstore/internal/controller/meta"
 	"objstore/internal/controller/placement"
 	"objstore/internal/controller/registry"
+	"objstore/internal/controller/repair"
 	"objstore/internal/controller/resync"
 	"objstore/internal/controller/upload"
 	"objstore/internal/controller/workerclient"
@@ -87,12 +88,23 @@ func serve(cfg config.Controller, logger *slog.Logger) error {
 		Logger:            logger,
 	}, jan.Kick)
 	downloader := download.New(store, reg, workers, logger)
+	repairer := repair.New(store, reg, workers, placement.Random{}, repair.Config{
+		Interval:          cfg.ReconcilerInterval,
+		MaxConcurrent:     cfg.MaxConcurrentRepairs,
+		RepairGrace:       cfg.RepairGrace,
+		DeadAfter:         cfg.DeadAfter,
+		Warmup:            cfg.DeadAfter + cfg.HeartbeatInterval, // §4.10 step 5
+		ReplicationFactor: cfg.ReplicationFactor,
+		MinFreeBytes:      cfg.MinFreeBytes,
+		Logger:            logger,
+	})
 	srv := api.New(reg, resync.New(store, logger, jan.Kick), api.Config{
 		HeartbeatInterval:      cfg.HeartbeatInterval,
 		DeadAfter:              cfg.DeadAfter,
 		RepairGrace:            cfg.RepairGrace,
 		Meta:                   store,
 		ReplicationFactor:      cfg.ReplicationFactor,
+		Repair:                 repairer,
 		Uploader:               uploader,
 		MaxConcurrentUploads:   cfg.MaxConcurrentUploads,
 		Downloader:             downloader,
@@ -121,6 +133,7 @@ func serve(cfg config.Controller, logger *slog.Logger) error {
 	defer cancelBg()
 	bg.Go(func() { registry.RunFailureDetector(bgCtx, reg, cfg.FailureCheckInterval) })
 	bg.Go(func() { jan.Run(bgCtx) })
+	bg.Go(func() { repairer.Run(bgCtx) })
 
 	errc := make(chan error, 1)
 	go func() { errc <- httpSrv.Serve(ln) }()

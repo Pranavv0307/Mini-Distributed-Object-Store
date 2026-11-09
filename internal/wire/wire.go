@@ -131,6 +131,23 @@ type ClusterView struct {
 	Workers    []WorkerView   `json:"workers"`
 	// Storage is present when the controller has a metadata database.
 	Storage *StorageView `json:"storage,omitempty"`
+	// Repair is present when the repair loop runs.
+	Repair *RepairView `json:"repair,omitempty"`
+}
+
+// RepairView reports the repair loop (architecture §4.7, §5.9). Counters are
+// cumulative since the controller started.
+type RepairView struct {
+	InFlight          int64   `json:"in_flight"`
+	Completed         int64   `json:"completed"`
+	Failed            int64   `json:"failed"`
+	Trimmed           int64   `json:"trimmed"`
+	BytesCopied       int64   `json:"bytes_copied"`
+	WaitingForGrace   int64   `json:"waiting_for_grace"` // chunks short of RF whose holders may still return
+	Unrecoverable     int64   `json:"unrecoverable"`     // chunks with no valid copy anywhere
+	Rounds            int64   `json:"rounds"`
+	LastRoundAt       *string `json:"last_round_at"`
+	LastRoundDuration int64   `json:"last_round_duration_ms"`
 }
 
 // StorageView summarises data health (architecture §5.9).

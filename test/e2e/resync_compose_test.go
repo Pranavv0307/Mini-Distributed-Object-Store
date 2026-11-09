@@ -54,7 +54,10 @@ func (a auditReport) violations(id string) int {
 // the audit's safety invariants hold throughout.
 func TestComposeResync(t *testing.T) {
 	img := image(t)
-	p := newComposeProject(t, img, "HEARTBEAT_INTERVAL=1s", "DEAD_AFTER=4s", "REPAIR_GRACE=60s", "JANITOR_INTERVAL=1s")
+	// This test checks detection, not repair: the repair loop runs once after
+	// its warm-up (nothing to do yet) and then not again for an hour.
+	p := newComposeProject(t, img, "HEARTBEAT_INTERVAL=1s", "DEAD_AFTER=4s", "REPAIR_GRACE=60s",
+		"JANITOR_INTERVAL=1s", "RECONCILER_INTERVAL=1h")
 	p.compose("up", "-d", "--no-build")
 	p.waitStates(60*time.Second, allAlive)
 

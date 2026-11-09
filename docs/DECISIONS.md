@@ -65,6 +65,9 @@ explicit owner confirmation; may change) · `SUPERSEDED by DEC-nnn`.
 | DEC-051 | Inventory reconciliation rules and mechanics | ACCEPTED | 6 |
 | DEC-052 | `/cluster` storage totals computed per request | ACCEPTED | 6 |
 | DEC-053 | Audit v1: safety invariants vs. steady state; I7 via the listing; I8 added | ACCEPTED | 6 |
+| DEC-054 | Repair loop: replica classification, one copy per chunk per round, non-overlapping rounds | ACCEPTED | 7 |
+| DEC-055 | Repair claims, superseding, and trimming go through pending deletes | ACCEPTED | 7 |
+| DEC-056 | Repair warm-up and "unknown worker = dead since controller start" pulled forward from Phase 9 | ACCEPTED | 7 |
 
 ---
 
@@ -904,3 +907,77 @@ explicit owner confirmation; may change) · `SUPERSEDED by DEC-nnn`.
   scenario") could not be met before repair exists. Safety invariants must
   never fail; I5 failing during a failure is expected and is reported, not
   hidden.
+
+## DEC-054 — Repair loop: classification and rounds
+
+- **Context.** Design doc §4.7 and D12–D14, D16.
+- **Choice.**
+  - Each round loads the chunks of READY objects that are not "exactly RF OK
+    rows, all on ALIVE workers, and nothing else" (`meta.RepairCandidates`,
+    at most 1,000 per round) and classifies each replica with the registry:
+    *effective* (OK on ALIVE), *potential* (OK on SYNCING, DEAD within
+    `REPAIR_GRACE`, or a worker the registry does not know yet, DEC-056),
+    *lost* (CORRUPT on any worker, with no grace, per D16; or OK on a worker
+    DEAD beyond the grace period), *busy* (any PENDING row: skip the chunk
+    this round).
+  - Decision per chunk: effective = 0 → wait if potential > 0, else
+    `unrecoverable` (logged once per transition as `data_unrecoverable` at
+    ERROR); effective + potential < RF → repair one copy; effective < RF →
+    wait (`waiting_for_grace`); otherwise trim (DEC-055).
+  - Jobs run riskiest first (fewest effective copies) with at most
+    `MAX_CONCURRENT_REPAIRS` at once. A round waits for its jobs, and rounds
+    cannot overlap (`TryLock`), so the "in-flight set" of §4.7 is replaced by
+    a simpler guarantee: no chunk is ever repaired twice concurrently. One copy
+    per chunk per round is enough for RF = 2; with a larger RF, later rounds
+    add the remaining copies.
+  - The source is a random effective replica; its bytes are verified against
+    the metadata checksum before writing (D15). A source that fails is marked
+    CORRUPT (same rules as downloads, DEC-040) and the next one is tried.
+- **Why synchronous rounds.** A round with a slow copy delays the next scan,
+  but the scan is cheap, the copies are bounded, and the alternative (an
+  in-flight set shared between overlapping rounds) is more state to get wrong.
+- **Consequences.** Time to full RF after a failure ≈ `DEAD_AFTER` +
+  `REPAIR_GRACE` + up to one `RECONCILER_INTERVAL` + copy time. Measured with
+  defaults (10 s + 30 s + 5 s): 41 s for 6 chunks (5.5 MB copied in one 120 ms
+  round).
+
+## DEC-055 — Repair claims, superseding, and trimming go through pending deletes
+
+- **Choice.**
+  - **Claim** (`ClaimRepair`, one transaction): the object must be READY; the
+    target must have no pending delete for the chunk; either a new PENDING row
+    (refused if the target already has any row, I3) or, for in-place repair,
+    the target's CORRUPT row becomes PENDING (DEC-008). In-place is preferred
+    when the CORRUPT copy's worker is ALIVE.
+  - **Complete** (`CompleteRepair`, one transaction): the object must still
+    be READY; PENDING → OK; the lost replica the repair replaces (if any, and
+    only if still in its observed state) moves to pending deletes with reason
+    `superseded_by_repair`. Its file is deleted when its worker is ALIVE again,
+    so a returning worker leaves neither over-replication nor orphans.
+  - **Failure** (`AbandonRepair`): the PENDING claim becomes a pending delete;
+    the write may have landed (DEC-007).
+  - **Trimming** runs only in rounds with no repair job and no unrecoverable
+    chunk ("once everything is safe", §4.7): lost copies of chunks that have
+    RF effective copies, and effective copies beyond RF (the busiest worker's
+    first). `TrimReplica` re-checks, in the same transaction, that at least RF
+    OK copies on ALIVE workers remain without the trimmed one.
+- **Consequences.** A delete racing a repair wins: the claim fails or the
+  completion fails (the object is no longer READY); a file written by the
+  losing repair is a pending delete or, at worst, an orphan for the Phase 9
+  sweep (§5.6). Tested in `TestRepairRacesWithDelete`.
+
+## DEC-056 — Repair warm-up and unknown workers, pulled forward from Phase 9
+
+- **Context.** After a controller restart the registry is empty. Without
+  protection the first repair round would see every replica on an "absent"
+  worker and copy everything (§4.10 step 5). The plan put the warm-up in
+  Phase 9, but a repair loop without it is unsafe, so it is built with the loop.
+- **Choice.** (1) The repair loop starts only after `DEAD_AFTER` +
+  `HEARTBEAT_INTERVAL` (by then every live worker has re-registered).
+  (2) A worker the registry has never heard from is treated as DEAD since the
+  controller started: its copies count as *potential* until `DEAD_AFTER` +
+  `REPAIR_GRACE` after the start, and as *lost* afterwards (the normal grace
+  period, as §4.10 prescribes).
+- **Consequences.** Phase 9 keeps the rest of recovery (UPLOADING → DELETING,
+  stale PENDING rows, orphan sweep). Tested in
+  `TestNoMassRepairAfterControllerRestart`.
