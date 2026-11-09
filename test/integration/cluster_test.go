@@ -14,6 +14,7 @@ import (
 	"testing"
 	"time"
 
+	"objstore/internal/config"
 	"objstore/internal/controller/api"
 	"objstore/internal/controller/registry"
 	"objstore/internal/httpx"
@@ -57,14 +58,14 @@ func (r *recordingReconciler) inventory(id string) []wire.ChunkInfo {
 // testController serves at a stable URL; its handler can be swapped to
 // simulate a controller restart (all in-memory state lost) or an outage.
 type testController struct {
-	t       *testing.T
+	t       testing.TB
 	ts      *httptest.Server
 	handler atomic.Pointer[http.Handler]
 	stopBg  context.CancelFunc
 	rec     *recordingReconciler
 }
 
-func newTestController(t *testing.T) *testController {
+func newTestController(t testing.TB) *testController {
 	c := &testController{t: t}
 	c.ts = httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		(*c.handler.Load()).ServeHTTP(w, r)
@@ -145,17 +146,19 @@ func (c *testController) waitState(id, state string) wire.WorkerView {
 
 // testWorker is an in-process worker: real store, HTTP server, and agent.
 type testWorker struct {
-	t       *testing.T
+	t       testing.TB
 	id      string
 	dataDir string
 	ctrlURL string
 	ts      *httptest.Server
 	srv     *server.Server
+	store   *store.Store
+	faults  faults // injected failures (helpers_test.go); zero value = none
 	cancel  context.CancelFunc
 	done    chan struct{}
 }
 
-func newTestWorker(t *testing.T, id, ctrlURL string) *testWorker {
+func newTestWorker(t testing.TB, id, ctrlURL string) *testWorker {
 	w := &testWorker{t: t, id: id, dataDir: t.TempDir(), ctrlURL: ctrlURL}
 	w.start()
 	t.Cleanup(w.stop)
@@ -163,12 +166,13 @@ func newTestWorker(t *testing.T, id, ctrlURL string) *testWorker {
 }
 
 func (w *testWorker) start() {
-	st, err := store.Open(w.dataDir, store.Options{MaxPayloadSize: 1 << 16})
+	st, err := store.Open(w.dataDir, store.Options{MaxPayloadSize: config.DefaultChunkSize})
 	if err != nil {
 		w.t.Fatal(err)
 	}
-	w.srv = server.New(st, server.Config{WorkerID: w.id, MaxChunkSize: 1 << 16, MaxConcurrentReads: 4})
-	w.ts = httptest.NewServer(w.srv.Handler())
+	w.store = st
+	w.srv = server.New(st, server.Config{WorkerID: w.id, MaxChunkSize: config.DefaultChunkSize, MaxConcurrentReads: 4})
+	w.ts = httptest.NewServer(w.faults.wrap(w.srv.Handler()))
 	ag := agent.New(agent.Config{
 		WorkerID: w.id, AdvertiseAddr: w.ts.URL, ControllerURL: w.ctrlURL,
 		BackoffMin: 5 * time.Millisecond, BackoffMax: 50 * time.Millisecond,
@@ -217,7 +221,7 @@ func (w *testWorker) put(id string, data []byte) int {
 	return resp.StatusCode
 }
 
-func startCluster(t *testing.T, n int) (*testController, []*testWorker) {
+func startCluster(t testing.TB, n int) (*testController, []*testWorker) {
 	ctrl := newTestController(t)
 	workers := make([]*testWorker, n)
 	for i := range workers {

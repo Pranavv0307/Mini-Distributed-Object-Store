@@ -1,10 +1,9 @@
 # API Reference
 
-> **Status (end of Phase 2):** **IMPLEMENTED** and tested: all worker
-> endpoints (Phase 1), the controller's membership endpoints
-> (`/internal/workers/register`, `/internal/workers/heartbeat`), and
-> controller `/healthz` and `/cluster` (Phase 2). Everything else is the
-> **API contract** for later phases. Each
+> **Status (end of Phase 3):** **IMPLEMENTED** and tested: all worker
+> endpoints (Phase 1); the controller's membership endpoints, `/healthz`, and
+> `/cluster` (Phase 2); **`POST /api/v1/objects`** (Phase 3). Everything else
+> is the **API contract** for later phases. Each
 > endpoint lists the phase that implements it; when that phase completes, its
 > section is marked **IMPLEMENTED**. Until then, details may be refined, and
 > any change is recorded in [`DECISIONS.md`](DECISIONS.md). Verified `curl`
@@ -59,46 +58,74 @@
 | 503 | `NOT_REGISTERED` | Worker refuses writes before it is registered (DEC-006) |
 | 409 | `REGISTRATION_SUPERSEDED` | A newer registration of the same worker started, or it was declared DEAD, during reconciliation; register again |
 | 503 | `INSUFFICIENT_STORAGE` | Worker disk is full |
+| 503 | `SERVER_BUSY` | `MAX_CONCURRENT_UPLOADS` uploads already in progress; retry later |
 
 ---
 
 ## Client API (controller)
 
-### `POST /api/v1/objects` — upload an object · *Phase 3*
+### `POST /api/v1/objects` — upload an object · IMPLEMENTED (Phase 3)
 
 **Request:** `multipart/form-data`, streamed (never buffered whole).
 
 | Part | Required | Content |
 | --- | --- | --- |
-| `file` | yes, exactly once | Object bytes. `filename` → object `name`; part `Content-Type` → object `content_type` (default `application/octet-stream`, DEC-017). |
-| `metadata` | no | JSON object of string → string custom metadata. May appear before or after `file`. |
+| `file` | yes, exactly once | Object bytes. Its `filename` becomes the object `name` (≤ 1024 bytes; may be empty; names are not unique). Its `Content-Type` becomes `content_type` (default `application/octet-stream`, must be a valid media type ≤ 256 bytes, DEC-017). |
+| `metadata` | no, at most once | JSON object of string → string custom metadata (DEC-013, provisional): ≤ 50 keys, non-empty keys ≤ 128 bytes, values ≤ 1 KiB, document ≤ 64 KiB. An empty part means no metadata. May appear **before or after** `file`. |
+| anything else | — | Ignored. |
 
-**Response 201** with `Location: /api/v1/objects/{object_id}`:
+Example (verified):
 
-```json
-{
-  "object_id": "3f2b8c1e-9a4d-4e2f-8b7a-1c2d3e4f5a6b",
-  "name": "photo.jpg",
-  "size": 5767168,
-  "content_type": "image/jpeg",
-  "checksum_sha256": "9f86d081884c7d659a2feaa0c55ad015a3bf4f1b2b0b822cd15d6c15b0f00a08",
-  "num_chunks": 6,
-  "created_at": "2026-11-09T14:10:00.123456789Z",
-  "modified_at": "2026-11-09T14:10:00.123456789Z",
-  "metadata_version": 1,
-  "custom_metadata": { "owner": "alice" }
-}
+```bash
+curl -s -F 'metadata={"owner":"alice"}' -F 'file=@big.bin;type=application/octet-stream'   localhost:8080/api/v1/objects
 ```
 
-**Errors:** 400 `INVALID_REQUEST` / `MISSING_FILE` / `INVALID_METADATA` /
-`METADATA_LIMIT_EXCEEDED` / `OBJECT_TOO_LARGE`; 503 `INSUFFICIENT_WORKERS`
-(admission check) or `UPLOAD_FAILED`; 500.
+**Response 201** with `Location: /api/v1/objects/{object_id}` (verified,
+5,500,000-byte file):
 
-**Guarantees.** 201 is returned only after every chunk has `REPLICATION_FACTOR`
-acknowledged replicas on distinct workers and the object was committed
-`UPLOADING → READY` in one transaction. On any failure or client disconnect, no
-object becomes visible and stored chunks are cleaned up by the delete path.
-After 201, every subsequent GET, metadata, or list request sees the object.
+```json
+{"object_id":"fce67c66-1d5d-4617-badb-adca7c0e1ba8","name":"big.bin","size":5500000,
+ "content_type":"application/octet-stream",
+ "checksum_sha256":"822817db53a46bde7be4f910ef106432460b5aa67336291a5bfbf686644772a3",
+ "num_chunks":6,"created_at":"2026-11-09T11:06:28.872237206Z",
+ "modified_at":"2026-11-09T11:06:29.032769513Z","metadata_version":1,
+ "custom_metadata":{"owner":"alice"}}
+```
+
+`checksum_sha256` is the SHA-256 of the whole object (compare with
+`sha256sum`). `num_chunks` = ⌈size / 1,000,000⌉; an empty file has 0 chunks.
+
+**Errors:**
+
+| Status | Code | When |
+| --- | --- | --- |
+| 400 | `INVALID_REQUEST` | Not `multipart/form-data`; malformed multipart; duplicate `metadata` part; bad file name or Content-Type; request body unreadable or truncated (client disconnected) |
+| 400 | `MISSING_FILE` | No `file` part, or more than one |
+| 400 | `INVALID_METADATA` | Metadata not a flat JSON object of strings |
+| 400 | `METADATA_LIMIT_EXCEEDED` | Metadata over the limits above |
+| 400 | `OBJECT_TOO_LARGE` | File larger than `MAX_OBJECT_SIZE` (default 5 GiB) |
+| 503 | `INSUFFICIENT_WORKERS` | Fewer than `REPLICATION_FACTOR` (2) eligible `ALIVE` workers when the request arrives (nothing is stored) |
+| 503 | `UPLOAD_FAILED` | A chunk could not be placed on 2 distinct workers because workers failed during the upload |
+| 503 | `SERVER_BUSY` | `MAX_CONCURRENT_UPLOADS` (16) uploads in progress |
+| 500 | `INTERNAL` | Unexpected error (details in the controller log) |
+
+**Guarantees.**
+- 201 is returned only after every chunk has `REPLICATION_FACTOR` OK replicas
+  on distinct workers (each acknowledged after the worker verified the
+  checksum and made the write durable) and the object was committed
+  `UPLOADING → READY` in one transaction that re-verifies chunk indexes,
+  sizes, and replication (DEC-034). After 201 the object exists for every
+  later request.
+- On any error, including client disconnect, **no object becomes visible**:
+  the upload is aborted (`UPLOADING → DELETING`, all replica rows become
+  pending deletes) and the janitor deletes every stored chunk file (DEC-035).
+- A worker that fails or times out during an upload is not used again for
+  that upload; its claim becomes a pending delete (a timeout does not prove
+  the write failed) and the replica is written to another worker.
+- Memory per upload is bounded by `UPLOAD_WINDOW` × 1 MB; when the window is
+  full the controller stops reading the body (backpressure). A body read
+  that stalls longer than `CLIENT_READ_TIMEOUT` (60 s) aborts the upload
+  (DEC-036).
 
 ### `GET /api/v1/objects/{object_id}` — download · *Phase 4*
 

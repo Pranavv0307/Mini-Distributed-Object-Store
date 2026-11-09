@@ -6,15 +6,14 @@ original design, with full rationale for decisions D1–D22, is in
 [`reference/Object_Store_Architecture.md`](reference/Object_Store_Architecture.md)
 (called "the design doc" below). Where this implementation differs from or
 clarifies the design doc, the difference is listed in
-[§10 Deviations](#10-deviations-and-clarifications-vs-the-design-doc) with a link
+[§11 Deviations](#11-deviations-and-clarifications-vs-the-design-doc) with a link
 to [`DECISIONS.md`](DECISIONS.md).
 
-> **Current status (end of Phase 2):** implemented: the worker's chunk store
-> and chunk API (§3.1), and cluster membership: the controller's worker
-> registry, registration with inventory, heartbeats, the failure detector,
-> the `SYNCING` protocol with epochs and the draining write gate, `/healthz`,
-> `/cluster`, and the Compose deployment (§4.1, §5.1, §6.1). Not yet: metadata,
-> the client object API, repair, and cleanup (target design below).
+> **Current status (end of Phase 3):** implemented: the worker's chunk store
+> and chunk API (§3.1); cluster membership with the `SYNCING` protocol (§7);
+> the metadata database, the upload path, and a minimal janitor (§8). Not
+> yet: download, the rest of the client API, inventory reconciliation, repair,
+> and the full janitor/recovery (target design below).
 
 ---
 
@@ -48,14 +47,14 @@ observed state reconciled in loops; trust nothing you didn't verify.
 | Worker | Membership agent | Register (with inventory, retried), heartbeat, write gate | `internal/worker/agent` | **Implemented (Phase 2)** |
 | Worker | Scrubber | Throttled re-verification; suspects reported via heartbeat | `internal/worker/scrub` | Phase 8 |
 | Controller | API front end | Membership endpoints (Phase 2, implemented); client REST API, validation, error mapping (Phases 3–5) | `internal/controller/api`, `cmd/controller` | Partly (Phase 2) |
-| Controller | Metadata store | SQLite schema, migrations, short transactions | `internal/controller/meta` | Phase 3 |
+| Controller | Metadata store | SQLite schema, migrations, short conditional transactions | `internal/controller/meta` | **Implemented (Phase 3)** |
 | Controller | Worker registry | In-memory worker states, epochs, controller-clock liveness | `internal/controller/registry` | **Implemented (Phase 2)** |
 | Controller | Failure detector | `ALIVE`/`SYNCING` → `DEAD` on heartbeat silence | `internal/controller/registry` | **Implemented (Phase 2)** |
-| Controller | Placement engine | Distinct ALIVE workers; pluggable (random first) | `internal/controller/placement` | Phase 3 |
-| Controller | Worker client | The only code calling workers: timeouts, retries, checksum headers | `internal/controller/workerclient` | Phase 3 |
-| Controller | Upload / download coordinators | Streaming write and read paths | `internal/controller/upload`, `.../download` | Phases 3–4 |
+| Controller | Placement engine | Distinct ALIVE workers with free space; pluggable (random) | `internal/controller/placement` | **Implemented (Phase 3)** |
+| Controller | Worker client | The only code calling workers: timeouts, checksum headers | `internal/controller/workerclient` | **Implemented (Phase 3)** |
+| Controller | Upload / download coordinators | Streaming write and read paths | `internal/controller/upload`, `.../download` | Upload **implemented (Phase 3)**; download Phase 4 |
 | Controller | Reconciler | Level-triggered repair of under-replicated/corrupt chunks | `internal/controller/reconciler` | Phase 7 |
-| Controller | Janitor | Stale uploads, unfinished deletes, `pending_deletes`, orphan sweep | `internal/controller/janitor` | Phases 5, 9 |
+| Controller | Janitor | `pending_deletes` drain and purge of `DELETING` objects (Phase 3, implemented); stale uploads, orphan sweep (Phase 9) | `internal/controller/janitor` | Partly (Phase 3) |
 | Controller | Recovery | Startup recovery pass, reconciler warm-up | `internal/controller/recovery` | Phase 9 |
 | Controller | Observability | `/healthz`, `/cluster`, audit, structured event log | `internal/controller/api`, `.../audit` | `/healthz`, `/cluster` (workers), event log: implemented; audit Phases 6, 9 |
 | Client | `objctl` | CLI for the REST API; demos and benchmarks | `cmd/objctl` | Phase 5 |
@@ -297,7 +296,76 @@ busybox `wget` on `/healthz`.
 | `docker start worker2` → `ALIVE` (new epoch) | ≈ 1 s |
 | `docker restart controller` → 4 `ALIVE` (new epochs) | ≈ 2 s |
 
-## 8. Failure handling (summary)
+## 8. Write path (implemented, Phase 3)
+
+### 8.1 Metadata store
+
+SQLite (`modernc.org/sqlite`) at `DB_PATH` on the controller volume; schema
+in `internal/controller/meta/schema.sql` (DEC-034). WAL, `synchronous=FULL`,
+foreign keys, 10 s busy timeout, and every write transaction is
+`BEGIN IMMEDIATE`; 16 concurrent uploads run without `SQLITE_BUSY` failures
+(`TestConcurrentWriters`). No transaction spans a network call: the
+coordinator alternates "short transaction" and "network I/O", and each
+transaction re-checks its precondition (`status = 'UPLOADING'`, the expected
+`PENDING` row, no pending delete for the target).
+
+| Operation | One transaction that... |
+| --- | --- |
+| `CreateObject` | inserts the object as `UPLOADING` |
+| `ClaimChunk` | checks `UPLOADING`, checks no pending delete on the targets (I8), inserts the chunk and its `PENDING` replicas |
+| `MarkReplicaOK` | checks `UPLOADING`, flips that `PENDING` row to `OK` |
+| `ReplaceReplica` | checks `UPLOADING`, moves the failed `PENDING` row to `pending_deletes`, inserts a `PENDING` row on the new worker |
+| `CommitObject` | checks `UPLOADING`, re-verifies I1, I2, full replication, then sets `READY` with size, checksum, metadata |
+| `MarkDeleting` | moves the object to `DELETING` and all its replica rows to `pending_deletes` (abort now; client delete in Phase 5) |
+| `FinalizeDeletedObjects` | removes `DELETING` objects with no replicas and no pending deletes (cascade to chunks) |
+
+### 8.2 Upload coordinator (`internal/controller/upload`)
+
+1. **Admission:** fewer than RF eligible workers → `503 INSUFFICIENT_WORKERS`
+   before anything is created. **Concurrency cap:** more than
+   `MAX_CONCURRENT_UPLOADS` → `503 SERVER_BUSY`.
+2. **Parts** are read in order; `metadata` may come before (validated at
+   once) or after `file` (validated before commit; failure aborts).
+3. **File part:** create the object `UPLOADING`; then loop: take a window
+   slot (backpressure), read up to `CHUNK_SIZE` bytes into a pooled buffer
+   (only a clean `io.EOF` ends the file, DEC-039), hash it, and hand it to a
+   goroutine that places, claims, and writes it.
+4. **Per chunk:** choose RF distinct eligible workers (random policy,
+   excluding this upload's failed workers) → `ClaimChunk` → PUT to all targets
+   in parallel → `MarkReplicaOK` per ack. On a PUT error or timeout: add the
+   worker to the failed set, pick another worker not holding the chunk,
+   `ReplaceReplica`, retry (DEC-035).
+5. **Commit** in one conditional transaction; respond `201`.
+6. **Any failure:** `MarkDeleting` on a detached context, kick the janitor,
+   respond with the mapped error.
+
+### 8.3 Janitor (minimal, `internal/controller/janitor`)
+
+Every `JANITOR_INTERVAL` or on kick: DELETE due pending deletes on ALIVE
+workers (bounded concurrency, idempotent; failures back off exponentially),
+then purge `DELETING` objects with nothing left (DEC-037).
+
+### 8.4 Crash windows (Phase 3 status)
+
+| Crash or failure | What is left | Who cleans it |
+| --- | --- | --- |
+| Client disconnects mid-upload | `UPLOADING` object, claims | Handler aborts → janitor (tested) |
+| Worker fails or times out on a PUT | Possibly bytes on that worker | Claim → pending delete → janitor (tested) |
+| Worker stops mid-upload | As above, deleted when it returns | Janitor (tested) |
+| Controller crashes mid-upload | `UPLOADING` object, `PENDING`/`OK` rows | **Not yet**: Phase 9 startup recovery |
+| Controller crashes between a worker's rename and `MarkReplicaOK` | Claimed file; row still `PENDING` | Phase 9 recovery (`PENDING` → pending delete) |
+| PUT lands after the janitor's DELETE for an aborted upload | Orphan file | Phase 9 inventory sweep |
+
+### 8.5 Measured (Phase 3)
+
+- Compose, default settings (fsync on), one 5.5 MB upload: 6 chunks, 12 files,
+  ~166 ms (`upload_committed` log: ≈ 33 MB/s).
+- Window benchmark (in-process, fsync off, 5 ms per PUT): see DEC-036.
+- Random placement shows small-sample unevenness (one manual run put 0 of 12
+  replicas on worker3), as the design doc anticipates for the random policy;
+  rendezvous hashing is stretch S1.
+
+## 9. Failure handling (summary)
 
 See the design doc §5.2 (failure model) and §7 (failure scenario matrix).
 Implemented so far: worker stop/start and controller restart for membership
@@ -308,14 +376,14 @@ chunk (`TestWorkerKilledMidWriteLeavesNoPartialChunk`, e2e). Data-path
 scenarios are implemented in Phases 4–9 and will be listed here with their
 tests.
 
-## 9. Trade-offs and limitations
+## 10. Trade-offs and limitations
 
 Inherited from the design doc §8: single controller (SPOF); controller in the
 data path (throughput ceiling); synchronous 2-way replication (write latency;
 needs ≥ 2 workers); RF = 2 (one failure at a time); immutable objects; repair
 grace period (longer vulnerability window); single-file metadata DB.
 
-## 10. Deviations and clarifications vs. the design doc
+## 11. Deviations and clarifications vs. the design doc
 
 | Topic | Design doc | Implementation | Decision |
 | --- | --- | --- | --- |

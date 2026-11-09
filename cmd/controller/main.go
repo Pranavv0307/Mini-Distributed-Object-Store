@@ -1,6 +1,7 @@
 // Command controller is the single coordinator of the object store. It owns
-// worker membership and liveness (Phase 2); later phases add the metadata
-// database, the client REST API, and the background repair and cleanup loops.
+// worker membership and liveness (Phase 2), the metadata database and the
+// upload path with its cleanup janitor (Phase 3); later phases add the rest
+// of the client REST API and the repair loops.
 //
 // Usage:
 //
@@ -17,13 +18,19 @@ import (
 	"net/http"
 	"os"
 	"os/signal"
+	"path/filepath"
 	"sync"
 	"syscall"
 	"time"
 
 	"objstore/internal/config"
 	"objstore/internal/controller/api"
+	"objstore/internal/controller/janitor"
+	"objstore/internal/controller/meta"
+	"objstore/internal/controller/placement"
 	"objstore/internal/controller/registry"
+	"objstore/internal/controller/upload"
+	"objstore/internal/controller/workerclient"
 	"objstore/internal/version"
 )
 
@@ -55,12 +62,35 @@ func run(args []string) int {
 }
 
 func serve(cfg config.Controller, logger *slog.Logger) error {
+	if err := os.MkdirAll(filepath.Dir(cfg.DBPath), 0o755); err != nil {
+		return fmt.Errorf("create database directory: %w", err)
+	}
+	store, err := meta.Open(cfg.DBPath, meta.Options{})
+	if err != nil {
+		return err
+	}
+	defer store.Close()
+
 	reg := registry.New(registry.Options{DeadAfter: cfg.DeadAfter, Logger: logger})
-	srv := api.New(reg, api.NoopReconciler{Logger: logger}, api.Config{
-		HeartbeatInterval: cfg.HeartbeatInterval,
-		DeadAfter:         cfg.DeadAfter,
-		RepairGrace:       cfg.RepairGrace,
+	workers := workerclient.New(cfg.WorkerConnectTimeout, cfg.WorkerRequestTimeout)
+	jan := janitor.New(store, reg, workers, janitor.Config{Interval: cfg.JanitorInterval, Logger: logger})
+	uploader := upload.New(store, reg, workers, placement.Random{}, upload.Config{
+		ChunkSize:         cfg.ChunkSize,
+		ReplicationFactor: cfg.ReplicationFactor,
+		Window:            cfg.UploadWindow,
+		MaxObjectSize:     cfg.MaxObjectSize,
+		MinFreeBytes:      cfg.MinFreeBytes,
+		ClientReadTimeout: cfg.ClientReadTimeout,
 		Logger:            logger,
+	}, jan.Kick)
+	srv := api.New(reg, api.NoopReconciler{Logger: logger}, api.Config{
+		HeartbeatInterval:    cfg.HeartbeatInterval,
+		DeadAfter:            cfg.DeadAfter,
+		RepairGrace:          cfg.RepairGrace,
+		Meta:                 store,
+		Uploader:             uploader,
+		MaxConcurrentUploads: cfg.MaxConcurrentUploads,
+		Logger:               logger,
 	})
 
 	ln, err := net.Listen("tcp", cfg.ListenAddr)
@@ -82,12 +112,15 @@ func serve(cfg config.Controller, logger *slog.Logger) error {
 	bgCtx, cancelBg := context.WithCancel(context.Background())
 	defer cancelBg()
 	bg.Go(func() { registry.RunFailureDetector(bgCtx, reg, cfg.FailureCheckInterval) })
+	bg.Go(func() { jan.Run(bgCtx) })
 
 	errc := make(chan error, 1)
 	go func() { errc <- httpSrv.Serve(ln) }()
 	logger.Info("controller_started", "version", version.Version, "listen_addr", ln.Addr().String(),
-		"heartbeat_interval", cfg.HeartbeatInterval, "dead_after", cfg.DeadAfter,
-		"repair_grace", cfg.RepairGrace, "failure_check_interval", cfg.FailureCheckInterval)
+		"db_path", cfg.DBPath, "chunk_size", cfg.ChunkSize, "replication_factor", cfg.ReplicationFactor,
+		"upload_window", cfg.UploadWindow, "heartbeat_interval", cfg.HeartbeatInterval,
+		"dead_after", cfg.DeadAfter, "repair_grace", cfg.RepairGrace,
+		"failure_check_interval", cfg.FailureCheckInterval, "janitor_interval", cfg.JanitorInterval)
 
 	var serveErr error
 	select {
@@ -95,15 +128,21 @@ func serve(cfg config.Controller, logger *slog.Logger) error {
 	case <-ctx.Done():
 		logger.Info("controller_stopping")
 	}
-	cancelBg()
-	bg.Wait()
 	if serveErr != nil {
+		cancelBg()
+		bg.Wait()
 		return fmt.Errorf("http server: %w", serveErr)
 	}
+	// Stop accepting requests and let in-flight ones finish (an upload that
+	// does not finish in time is left UPLOADING; Phase 9 recovery aborts it),
+	// then stop the background loops, then close the database (deferred).
 	shutdownCtx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
 	defer cancel()
-	if err := httpSrv.Shutdown(shutdownCtx); err != nil {
-		return fmt.Errorf("shutdown: %w", err)
+	shutdownErr := httpSrv.Shutdown(shutdownCtx)
+	cancelBg()
+	bg.Wait()
+	if shutdownErr != nil {
+		return fmt.Errorf("shutdown: %w", shutdownErr)
 	}
 	if err := <-errc; !errors.Is(err, http.ErrServerClosed) {
 		return fmt.Errorf("http server: %w", err)

@@ -13,7 +13,9 @@ import (
 	"net/url"
 	"time"
 
+	"objstore/internal/controller/meta"
 	"objstore/internal/controller/registry"
+	"objstore/internal/controller/upload"
 	"objstore/internal/httpx"
 	"objstore/internal/ids"
 	"objstore/internal/version"
@@ -55,7 +57,15 @@ type Config struct {
 	HeartbeatInterval time.Duration
 	DeadAfter         time.Duration
 	RepairGrace       time.Duration
-	Logger            *slog.Logger
+	// Meta, if set, is pinged by /healthz.
+	Meta *meta.Store
+	// Uploader, if set, serves POST /api/v1/objects.
+	Uploader *upload.Coordinator
+	// MaxConcurrentUploads bounds simultaneous uploads (MAX_CONCURRENT_UPLOADS);
+	// further uploads get 503 SERVER_BUSY. Upload memory is bounded by
+	// MaxConcurrentUploads × UPLOAD_WINDOW × CHUNK_SIZE.
+	MaxConcurrentUploads int
+	Logger               *slog.Logger
 }
 
 // Server serves the controller's HTTP API.
@@ -64,6 +74,7 @@ type Server struct {
 	reconciler InventoryReconciler
 	cfg        Config
 	startedAt  time.Time
+	uploadSem  chan struct{}
 	log        *slog.Logger
 }
 
@@ -73,7 +84,8 @@ func New(reg *registry.Registry, reconciler InventoryReconciler, cfg Config) *Se
 	if logger == nil {
 		logger = slog.New(slog.DiscardHandler)
 	}
-	return &Server{reg: reg, reconciler: reconciler, cfg: cfg, startedAt: reg.Now(), log: logger}
+	return &Server{reg: reg, reconciler: reconciler, cfg: cfg, startedAt: reg.Now(),
+		uploadSem: make(chan struct{}, max(cfg.MaxConcurrentUploads, 1)), log: logger}
 }
 
 // Handler returns the HTTP handler with logging and panic recovery.
@@ -83,6 +95,9 @@ func (s *Server) Handler() http.Handler {
 	mux.HandleFunc("POST /internal/workers/heartbeat", s.heartbeat)
 	mux.HandleFunc("GET /healthz", s.healthz)
 	mux.HandleFunc("GET /cluster", s.cluster)
+	if s.cfg.Uploader != nil {
+		mux.HandleFunc("POST /api/v1/objects", s.uploadObject)
+	}
 	return httpx.Middleware(s.log, mux)
 }
 
@@ -174,8 +189,75 @@ func (s *Server) heartbeat(w http.ResponseWriter, r *http.Request) {
 	httpx.WriteJSON(w, http.StatusOK, wire.HeartbeatResponse{Action: action})
 }
 
-func (s *Server) healthz(w http.ResponseWriter, _ *http.Request) {
+func (s *Server) healthz(w http.ResponseWriter, r *http.Request) {
+	if s.cfg.Meta != nil {
+		if err := s.cfg.Meta.Ping(r.Context()); err != nil {
+			s.log.Error("healthz_db_failed", "error", err)
+			httpx.WriteError(w, http.StatusServiceUnavailable, wire.CodeInternal, "metadata database unavailable")
+			return
+		}
+	}
 	httpx.WriteJSON(w, http.StatusOK, map[string]string{"status": "ok"})
+}
+
+// uploadObject implements POST /api/v1/objects (architecture §4.1).
+func (s *Server) uploadObject(w http.ResponseWriter, r *http.Request) {
+	select {
+	case s.uploadSem <- struct{}{}:
+		defer func() { <-s.uploadSem }()
+	default:
+		httpx.WriteError(w, http.StatusServiceUnavailable, wire.CodeServerBusy,
+			fmt.Sprintf("too many concurrent uploads (limit %d); retry later", cap(s.uploadSem)))
+		return
+	}
+	mr, err := r.MultipartReader()
+	if err != nil {
+		httpx.WriteError(w, http.StatusBadRequest, wire.CodeInvalidRequest, "expected a multipart/form-data body: "+err.Error())
+		return
+	}
+	rc := http.NewResponseController(w)
+	// Per-read deadlines guard against stalled clients; clear them afterwards
+	// so they do not leak into the next request on a keep-alive connection.
+	defer func() { _ = rc.SetReadDeadline(time.Time{}) }()
+	obj, err := s.cfg.Uploader.Upload(r.Context(), mr, func(t time.Time) { _ = rc.SetReadDeadline(t) })
+	if err != nil {
+		var ue *upload.Error
+		switch {
+		case errors.As(err, &ue) && ue.Status != http.StatusInternalServerError:
+			// 4xx and 503: the message is safe and useful to show the client.
+			if ue.ClientGone {
+				s.log.Info("upload_client_gone", "error", err)
+			}
+			httpx.WriteError(w, ue.Status, ue.Code, ue.Error())
+		case r.Context().Err() != nil:
+			s.log.Info("upload_client_gone", "error", err)
+		default:
+			s.log.Error("upload_failed", "error", err)
+			httpx.WriteError(w, http.StatusInternalServerError, wire.CodeInternal, "internal error")
+		}
+		return
+	}
+	w.Header().Set("Location", "/api/v1/objects/"+obj.ID)
+	httpx.WriteJSON(w, http.StatusCreated, objectInfo(obj))
+}
+
+func objectInfo(o meta.Object) wire.ObjectInfo {
+	md := o.CustomMetadata
+	if md == nil {
+		md = map[string]string{}
+	}
+	return wire.ObjectInfo{
+		ObjectID:        o.ID,
+		Name:            o.Name,
+		Size:            o.Size,
+		ContentType:     o.ContentType,
+		ChecksumSHA256:  o.ChecksumSHA256,
+		NumChunks:       o.NumChunks,
+		CreatedAt:       o.CreatedAt.Format(time.RFC3339Nano),
+		ModifiedAt:      o.ModifiedAt.Format(time.RFC3339Nano),
+		MetadataVersion: o.MetadataVersion,
+		CustomMetadata:  md,
+	}
 }
 
 func (s *Server) cluster(w http.ResponseWriter, _ *http.Request) {

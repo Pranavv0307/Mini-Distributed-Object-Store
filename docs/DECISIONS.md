@@ -45,6 +45,12 @@ explicit owner confirmation; may change) · `SUPERSEDED by DEC-nnn`.
 | DEC-031 | Heartbeat failures do not close the write gate | ACCEPTED | 2 |
 | DEC-032 | Compose: spec container names with optional prefix; loopback-only port | ACCEPTED | 2 |
 | DEC-033 | Liveness timing owned by the controller (`HEARTBEAT_INTERVAL` sent at registration; `FAILURE_CHECK_INTERVAL`) | ACCEPTED | 2 |
+| DEC-034 | Metadata schema and transaction rules; commit re-verifies invariants | ACCEPTED | 3 |
+| DEC-035 | Upload failure handling: per-upload failed-worker set, atomic replace, abort on a detached context | ACCEPTED | 3 |
+| DEC-036 | Upload resource bounds: window, pooled buffers, concurrent-upload cap, per-read client timeout | ACCEPTED | 3 |
+| DEC-037 | Phase 3 janitor: pending deletes for ALIVE workers only, exponential backoff, kick on abort | ACCEPTED | 3 |
+| DEC-038 | Placement free-space threshold `PLACEMENT_MIN_FREE_BYTES` = 100 MB | ACCEPTED | 3 |
+| DEC-039 | End of the file part only on a clean `io.EOF` | ACCEPTED | 3 |
 
 ---
 
@@ -551,3 +557,120 @@ explicit owner confirmation; may change) · `SUPERSEDED by DEC-nnn`.
   `DEAD_AFTER + FAILURE_CHECK_INTERVAL` after its last heartbeat.
 - **Consequences.** Measured in the Compose walkthrough: `DEAD` 10 s after
   `docker stop` with the defaults (3 s / 10 s / 1 s).
+
+## DEC-034 — Metadata schema and transaction rules; commit re-verifies invariants
+
+- **Context.** D7/DEC-003 chose SQLite; the schema and the exact transaction
+  boundaries were left to implementation.
+- **Choice.** Tables `objects`, `chunks` (`UNIQUE(object_id, idx)`, FK with
+  cascade), `replicas` (`PRIMARY KEY(chunk_id, worker_id)`: invariant I3 for
+  every state), `pending_deletes` (no FKs, so entries outlive the rows they
+  came from; indexed by `object_id` and due time), plus `schema_version`. The
+  schema is embedded (`internal/controller/meta/schema.sql`) and applied in a
+  transaction at startup; an unknown version refuses to start. Times are Unix
+  nanoseconds on the controller's clock.
+  Every upload-side write (`ClaimChunk`, `MarkReplicaOK`, `ReplaceReplica`,
+  `CommitObject`) first runs `UPDATE objects SET last_activity = ... WHERE
+  status = 'UPLOADING'` in the same transaction and fails with
+  `ErrNotUploading` if no row matched (DEC-011). `CommitObject` also
+  re-checks, from the rows, chunk indexes 0..n-1 without gaps (I1), the size
+  sum (I2), and at least RF `OK` replicas with no non-`OK` replica per chunk,
+  refusing with `ErrIncomplete` otherwise.
+- **Why.** The commit is the single moment an object becomes visible; checking
+  the invariants inside that transaction means a coordinator bug cannot
+  publish an incomplete object.
+- **Consequences.** A commit costs a few aggregate queries over the object's
+  chunk rows (negligible). Tests: `internal/controller/meta`.
+
+## DEC-035 — Upload failure handling
+
+- **Context.** Architecture §4.1 and §5.5: retry a failed replica on a
+  different worker, never retry a worker that already failed in the request,
+  abort through the delete path. DEC-007: a timeout is not proof of failure.
+- **Choice.**
+  - Each upload keeps a **failed-worker set**. Any PUT error (connection
+    refused, timeout, 5xx, checksum rejection 400) adds the worker to it, and
+    it is excluded from placement for the rest of that upload.
+  - Replacement is one transaction, `ReplaceReplica`: the failed `PENDING`
+    row becomes a pending delete, and a new `PENDING` row is recorded for a
+    worker chosen among eligible workers that have not failed and do not
+    already hold this chunk. The loop ends because every iteration adds a
+    worker to the failed set; with none left the upload fails with
+    `503 UPLOAD_FAILED`.
+  - **Abort** = `MarkDeleting(UPLOADING -> DELETING)`, which moves all the
+    object's replica rows (OK and PENDING) into pending deletes in one
+    transaction. It runs on `context.WithoutCancel(request)` with a 30 s
+    timeout, so it completes after a client disconnect, and then kicks the
+    janitor. If even the abort fails, the object stays `UPLOADING` and is
+    cleaned up by the Phase 9 stale-upload sweep.
+- **Consequences.** An in-flight PUT whose claim was moved by an abort may land
+  after the janitor's DELETE; such a file is an orphan for the Phase 9
+  inventory sweep (DEC-009). Tests: `TestUploadSurvivesWorkerFailureMidUpload`,
+  `TestUploadSurvivesWorkerStopMidUpload`, `TestUploadFailsWhenWorkersRunOut`,
+  `TestUploadTimeoutIsNotTreatedAsFailure`,
+  `TestUploadRetriesAfterTransitCorruption`.
+
+## DEC-036 — Upload resource bounds
+
+- **Choice.**
+  - **Window** (`UPLOAD_WINDOW`, default 4): the reader takes a window slot
+    *before* reading each chunk, so at most `Window` chunk buffers exist per
+    upload, and a full window stops reading the client (backpressure).
+    `Window = 1` is the sequential M3a variant.
+  - **Pooled buffers** (`sync.Pool` of `CHUNK_SIZE` slices) avoid allocating
+    1 MB per chunk.
+  - **Concurrent uploads** are capped (`MAX_CONCURRENT_UPLOADS`, default 16);
+    excess requests get `503 SERVER_BUSY` immediately rather than queuing
+    unbounded memory. Worst-case upload memory is about 16 x 4 x 1 MB = 64 MB.
+  - **Stalled clients:** before each body read the handler sets the
+    connection's read deadline to now + `CLIENT_READ_TIMEOUT` (60 s), and it
+    clears the deadline when the upload ends, so it never leaks into the next
+    request on a keep-alive connection. The controller's HTTP server has no
+    overall read/write timeout because uploads and downloads are arbitrarily
+    large.
+  - Every worker call has `WORKER_CONNECT_TIMEOUT` (2 s) and
+    `WORKER_REQUEST_TIMEOUT` (10 s).
+- **Measured** (`BenchmarkUploadWindow`: 8 MB object, 4 in-process workers,
+  5 ms simulated latency per PUT, fsync off, 3 runs, median): window 1:
+  70.4 MB/s; window 2: 112.7; window 4: 122.1; window 8: 112.2. Windowed is
+  about 1.7x sequential (M3b acceptance met). Window 8 is not faster than 4
+  for an 8-chunk object.
+
+## DEC-037 — Phase 3 janitor scope
+
+- **Choice.** One loop (`JANITOR_INTERVAL`, default 10 s; also triggered by
+  `Kick()` after an abort). Each round: (1) fetch due pending deletes **only
+  for currently ALIVE workers** (so a backlog for a dead worker cannot starve
+  the rest); (2) send idempotent DELETEs with bounded concurrency (8);
+  (3) remove confirmed entries, or record the failure with exponential
+  backoff (interval x 2^attempts, capped at 5 min); (4) remove `DELETING`
+  objects that have no replica rows and no pending deletes left (log event
+  `object_purged`). Stale-upload aborts, the inventory orphan sweep, and
+  startup recovery are Phase 9.
+- **Consequences.** A `DELETING` object whose worker never returns keeps its
+  row (invisible to clients) until the worker returns.
+
+## DEC-038 — Placement free-space threshold
+
+- **Context.** Placement rule 3 (architecture §5.3): skip workers over a
+  fullness threshold if free space is reported.
+- **Choice.** `PLACEMENT_MIN_FREE_BYTES`, default 100,000,000 (100 MB). A
+  worker that reported less free space is not chosen; a worker reporting `-1`
+  (unknown, e.g. on Windows) is not skipped. Free space comes from heartbeats,
+  so it can be one heartbeat interval old; a worker that fills up anyway
+  rejects the write (`503 INSUFFICIENT_STORAGE`) and the upload retries
+  elsewhere.
+
+## DEC-039 — End of the file part only on a clean `io.EOF`
+
+- **Context.** The first coordinator draft read chunks with `io.ReadFull`,
+  which reports `io.ErrUnexpectedEOF` both for a normal short last chunk and
+  when the multipart reader reaches the end of a body truncated before its
+  closing boundary.
+- **Choice.** `readChunk` loops over `Read` and passes errors through
+  unchanged. Only `io.EOF` (the multipart reader saw the closing boundary)
+  ends the file; any other error aborts the upload.
+- **Consequences.** A truncated body is rejected where it is read. (The draft
+  would also have failed one step later, when `NextPart` met the missing
+  boundary, so this is defence in depth rather than a fix for an observed
+  defect.) Test: `TestTruncatedUploadIsNeverCommitted`.

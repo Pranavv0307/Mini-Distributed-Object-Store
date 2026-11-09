@@ -6,10 +6,12 @@ Practical, step-by-step instructions to set up, run, and verify the project.
 > observed at the phase noted. Sections for later phases are marked
 > *not yet available* until those phases are implemented.
 
-**Current state (end of Phase 2):** the cluster runs under Docker Compose:
-one controller and four workers. Workers register (with their inventory),
-heartbeat, and are marked `DEAD` when they stop; `/cluster` shows it. There
-is no client object API yet (Phase 3).
+**Current state (end of Phase 3):** the cluster runs under Docker Compose:
+one controller and four workers. Workers register, heartbeat, and are marked
+`DEAD` when they stop. **Objects can be uploaded** (`POST /api/v1/objects`):
+they are split into 1 MB chunks, each stored on two distinct workers, and
+committed atomically. Download and the rest of the client API come in
+Phases 4–5.
 
 > ⚠️ **Docker name collisions.** Container names are global on a Docker host.
 > The Compose file uses the spec's names `controller` and `worker1`…`worker4`.
@@ -96,6 +98,16 @@ All variables are optional (defaults shown). Set them in the shell or in a
 | `FSYNC_ON_WRITE` | workers | `true` | fsync file and directory on write/delete |
 | `MAX_CONCURRENT_READS` | workers | `16` | Chunk GETs held in memory at once |
 | `LOG_LEVEL` | all | `info` | `debug`, `info`, `warn`, `error` |
+| `DB_PATH` | controller | `/data/meta.db` | SQLite metadata database (controller volume) |
+| `REPLICATION_FACTOR` | controller | `2` | Copies per chunk |
+| `UPLOAD_WINDOW` | controller | `4` | Chunks in flight per upload (1 = sequential) |
+| `MAX_OBJECT_SIZE` | controller | `5368709120` | Largest accepted object (5 GiB) |
+| `MAX_CONCURRENT_UPLOADS` | controller | `16` | More uploads at once get `503 SERVER_BUSY` |
+| `PLACEMENT_MIN_FREE_BYTES` | controller | `100000000` | Workers reporting less free space get no new chunks |
+| `WORKER_CONNECT_TIMEOUT` | controller | `2s` | Connection timeout for worker calls |
+| `WORKER_REQUEST_TIMEOUT` | controller | `10s` | Overall timeout per worker call |
+| `CLIENT_READ_TIMEOUT` | controller | `60s` | Max stall of one read of an upload body |
+| `JANITOR_INTERVAL` | controller | `10s` | Cleanup round period (also runs right after an aborted upload) |
 
 Fixed per service in `docker-compose.yml`: `WORKER_ID=workerN`,
 `ADVERTISE_ADDR=http://workerN:9000`, `CONTROLLER_URL=http://controller:8080`,
@@ -237,9 +249,54 @@ says 1000000; …)` with exit code 1; the inventory reports `"size":1000007`;
 GET returns 1000001 bytes (capped at `CHUNK_SIZE + 1`, DEC-025). The worker
 never judges validity; the controller will (Phase 4).
 
-### 4.3 Client object API
+### 4.3 Upload (verified at Phase 3, Compose cluster)
 
-*Not yet available* (Phases 3–5).
+```bash
+head -c 5500000 /dev/urandom > big.bin
+sha256sum big.bin
+curl -s -w '\nHTTP %{http_code}\n' -F 'metadata={"owner":"alice"}' \
+  -F 'file=@big.bin;type=application/octet-stream' localhost:8080/api/v1/objects | tee up.json
+ID=$(grep -o '"object_id":"[^"]*"' up.json | cut -d'"' -f4); echo "$ID"
+```
+
+Expected: `HTTP 201` and a JSON body with `"size":5500000`,
+`"num_chunks":6`, `"custom_metadata":{"owner":"alice"}`, and a
+`checksum_sha256` equal to the `sha256sum` output.
+
+**Chunking and distribution** (6 chunks × 2 copies = 12 files, each chunk on
+two different workers; file names are the chunk IDs):
+
+```bash
+for w in 1 2 3 4; do echo "worker$w: $(docker exec objstore-worker$w sh -c "ls /data/chunks | grep -c ^$ID")"; done
+for w in 1 2 3 4; do docker exec objstore-worker$w sh -c "ls /data/chunks | grep ^$ID" | sed "s/^/worker$w /"; done | sort -k2
+```
+
+Expected: per-worker counts summing to 12; the sorted list shows each
+`<ID>_00000N` exactly twice, on two different workers. Placement is random,
+so counts vary per run (one verified run: 5, 4, 0, 3). After the next
+heartbeat (3 s), `/cluster` reports the same `chunk_count` per worker:
+
+```bash
+curl -s localhost:8080/cluster | grep -o '"worker_id":"worker[0-9]"\|"chunk_count":[0-9]*' | paste - -
+```
+
+Verify one stored chunk on disk:
+`docker exec objstore-worker1 sh -c "worker inspect /data/chunks/\$(ls /data/chunks | grep ^$ID | head -1)"`
+→ `status: VALID`.
+
+The controller logs one `upload_started` and one `upload_committed` line
+(with `size`, `chunks`, `duration` in nanoseconds, and `mb_per_s`).
+
+**Validation errors** (all `400`, nothing stored):
+
+| Command | Expected |
+| --- | --- |
+| `curl -s -w ' HTTP %{http_code}\n' -F 'metadata={}' localhost:8080/api/v1/objects` | `MISSING_FILE` |
+| `curl -s -w ' HTTP %{http_code}\n' -F 'metadata={"n":1}' -F 'file=@big.bin' localhost:8080/api/v1/objects` | `INVALID_METADATA` ("value of \"n\" must be a string, got number") |
+| `curl -s -w ' HTTP %{http_code}\n' -H 'Content-Type: application/json' -d '{}' localhost:8080/api/v1/objects` | `INVALID_REQUEST` ("expected a multipart/form-data body") |
+
+Retrieving the object (download, metadata, list) is Phases 4–5. Until then,
+metadata rows can be inspected only through tests.
 
 ---
 
@@ -289,7 +346,26 @@ several workers shows each going `DEAD` independently. Network-partition
 simulation (`docker network disconnect`) and multi-worker data scenarios
 arrive with the data path (Phases 6–9).
 
-### 5.4 Corruption, repair, crash consistency
+### 5.4 Uploads with workers unavailable (verified at Phase 3)
+
+With only one worker alive, uploads are refused and nothing is stored:
+
+```bash
+docker stop objstore-worker2 objstore-worker3 objstore-worker4
+# wait ~10 s until /cluster shows "alive":1
+curl -s -w ' HTTP %{http_code}\n' -F 'file=@big.bin' localhost:8080/api/v1/objects
+```
+
+Expected: `{"error":{"code":"INSUFFICIENT_WORKERS","message":"1 eligible
+workers, need at least 2"}} HTTP 503`. Restart them with
+`docker start objstore-worker2 objstore-worker3 objstore-worker4`.
+
+A worker failing *during* an upload (stopped, rejecting, timing out, or
+corrupting data in transit) is covered by automated tests (§6): the upload
+still succeeds with ≥ 2 workers, and any bytes the failed worker may have
+stored are deleted by the janitor.
+
+### 5.5 Corruption, repair, crash consistency
 
 Single-worker corruption visibility: §4.2. Controller-side detection and
 repair: *not yet available* (Phases 4, 7–9). Crash mid-write on a worker:
@@ -299,7 +375,7 @@ covered by automated tests (§6).
 
 ## 6. Automated testing and static analysis
 
-Run from the repository root. All verified at Phase 2.
+Run from the repository root. All verified at Phase 3.
 
 ### Unit and integration tests
 
@@ -312,7 +388,12 @@ Expected (all `ok`; `cmd/*` and `internal/wire` print `[no test files]`):
 ```
 ok  	objstore/internal/config
 ok  	objstore/internal/controller/api
+ok  	objstore/internal/controller/custommeta
+ok  	objstore/internal/controller/janitor
+ok  	objstore/internal/controller/meta
+ok  	objstore/internal/controller/placement
 ok  	objstore/internal/controller/registry
+ok  	objstore/internal/controller/workerclient
 ok  	objstore/internal/httpx
 ok  	objstore/internal/ids
 ok  	objstore/internal/version
@@ -322,9 +403,14 @@ ok  	objstore/internal/worker/store
 ok  	objstore/test/integration
 ```
 
-`test/integration` runs an in-process cluster (controller + 4 workers with
-50 ms heartbeats and a 300 ms `DEAD_AFTER`) and builds and kills the real
-worker binary; about 5–20 s. `go test -short ./...` skips the timing-based and
+`test/integration` runs in-process clusters (controller with SQLite,
+upload coordinator, janitor, and real workers behind a fault injector that
+can fail, delay, or corrupt PUTs; 50 ms heartbeats, 300 ms `DEAD_AFTER`) and
+builds and kills the real worker binary; about 10–45 s. Upload tests cover
+the 5.5 MB checkpoint, edge sizes, window sizes, metadata before/after the
+file, invalid requests, insufficient workers, worker failure/stop/timeout/
+corruption mid-upload, truncated bodies, client disconnect, size limit,
+concurrent uploads, and `SERVER_BUSY`. `go test -short ./...` skips the timing-based and
 process-spawning tests. Add `-count=1` to bypass the cache, `-v` for detail.
 
 ### End-to-end tests (Docker)
@@ -342,10 +428,25 @@ Builds `objstore:e2e` once, then runs:
   `docker start` → `ALIVE` with a newer epoch; `docker restart` controller →
   all four re-register with newer epochs. Removes only its own project
   (`compose down -v`).
+- `TestComposeUpload`: uploads a 5.5 MB object through the real stack and
+  checks 6 chunks stored as 12 files, each chunk on 2 distinct worker volumes;
+  then stops 3 workers and checks the next upload gets
+  `503 INSUFFICIENT_WORKERS` with nothing stored.
 - `TestWorkerContainer`: the standalone worker container checks from Phase 1.
 
-Expected: both `PASS` (about 1 minute including the image build). Set
+Expected: all three `PASS` (about 1–2 minutes including the image build). Set
 `E2E_IMAGE=objstore:dev` to reuse an existing image.
+
+### Benchmark: sequential vs windowed upload
+
+```bash
+go test -run '^$' -bench UploadWindow -benchtime 10x -count 3 ./test/integration/
+```
+
+Uploads an 8 MB object with `UPLOAD_WINDOW` = 1, 2, 4, 8 (in-process, 5 ms
+simulated latency per PUT, fsync off). Verified medians: 70.4, 112.7, 122.1,
+112.2 MB/s, so windowed is about 1.7× sequential (DEC-036). Absolute numbers
+depend on the machine.
 
 ### Race detector
 
@@ -393,6 +494,11 @@ Expected last line: `ALL-OK`. Then run the race detector and the e2e tests.
 | `Conflict. The container name "/worker1" is already in use` on `compose up` | Another project uses the spec's container names | `export OBJSTORE_CONTAINER_PREFIX=objstore-` and retry. Do **not** remove containers you did not create |
 | `port is already allocated` for 8080 | Something else uses port 8080 | `export CONTROLLER_PORT=18080` and use that port with `curl` |
 | `/cluster` shows fewer than 4 workers right after `up` or a controller restart | Workers have not (re-)registered yet | Wait one heartbeat interval (3 s); check `docker logs <worker>` for `worker_register_failed` |
+| Upload returns `503 INSUFFICIENT_WORKERS` | Fewer than 2 workers are `ALIVE` (or the others reported less than `PLACEMENT_MIN_FREE_BYTES` free) | Check `/cluster`; start workers; free disk space |
+| Upload returns `503 UPLOAD_FAILED` | Workers failed during the upload and no distinct second worker was left | Check controller log `replica_write_failed` for the reason; retry |
+| Upload returns `503 SERVER_BUSY` | `MAX_CONCURRENT_UPLOADS` uploads in progress | Retry later or raise the limit |
+| Upload returns `400 INVALID_REQUEST` mentioning the body | Client disconnected, or the body stalled longer than `CLIENT_READ_TIMEOUT` | Retry; nothing was committed, and stored chunks are cleaned up by the janitor |
+| Controller exits with `meta: database schema version … is not supported` | The `controller-data` volume holds a database from an incompatible build | Use a matching build, or reset with `docker compose down -v` (deletes all data) |
 | A worker stays `SYNCING` | Registration failed during inventory reconciliation (possible from Phase 6) | Check controller logs for `inventory_reconcile_failed`; the worker retries automatically |
 | Controller exits with `DEAD_AFTER (…) must be greater than HEARTBEAT_INTERVAL` | Misconfigured timings | Make `DEAD_AFTER` larger (≥ 3 × the heartbeat interval recommended) |
 | Worker logs `heartbeat_failed` repeatedly | Controller down or unreachable | Start the controller; the worker re-registers automatically |

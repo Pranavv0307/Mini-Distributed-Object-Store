@@ -26,7 +26,7 @@ import (
 const testObj = "3f2b8c1e-9a4d-4e2f-8b7a-1c2d3e4f5a6b"
 
 // buildWorker compiles cmd/worker into a temp dir and returns its path.
-func buildWorker(t *testing.T) string {
+func buildWorker(t testing.TB) string {
 	t.Helper()
 	bin := filepath.Join(t.TempDir(), "worker")
 	if runtime.GOOS == "windows" {
@@ -39,7 +39,7 @@ func buildWorker(t *testing.T) string {
 	return bin
 }
 
-func freePort(t *testing.T) int {
+func freePort(t testing.TB) int {
 	t.Helper()
 	ln, err := net.Listen("tcp", "127.0.0.1:0")
 	if err != nil {
@@ -54,7 +54,7 @@ type workerProc struct {
 	base string
 }
 
-func startWorker(t *testing.T, bin, dataDir string, port int) *workerProc {
+func startWorker(t testing.TB, bin, dataDir string, port int) *workerProc {
 	t.Helper()
 	logFile, err := os.OpenFile(filepath.Join(t.TempDir(), "worker.log"), os.O_CREATE|os.O_WRONLY|os.O_APPEND, 0o644)
 	if err != nil {
@@ -87,7 +87,7 @@ func startWorker(t *testing.T, bin, dataDir string, port int) *workerProc {
 }
 
 // waitFor polls cond until it is true or the deadline passes.
-func waitFor(t *testing.T, timeout time.Duration, what string, cond func() bool) {
+func waitFor(t testing.TB, timeout time.Duration, what string, cond func() bool) {
 	t.Helper()
 	deadline := time.Now().Add(timeout)
 	for !cond() {
@@ -98,7 +98,7 @@ func waitFor(t *testing.T, timeout time.Duration, what string, cond func() bool)
 	}
 }
 
-func putChunk(t *testing.T, base, id string, data []byte) {
+func putChunk(t testing.TB, base, id string, data []byte) {
 	t.Helper()
 	sum := sha256.Sum256(data)
 	req, _ := http.NewRequest(http.MethodPut, base+"/internal/chunks/"+id, bytes.NewReader(data))

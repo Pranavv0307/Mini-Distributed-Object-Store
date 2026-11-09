@@ -57,8 +57,20 @@ services:
       DEAD_AFTER: ${DEAD_AFTER:-10s}
       REPAIR_GRACE: ${REPAIR_GRACE:-30s}
       FAILURE_CHECK_INTERVAL: ${FAILURE_CHECK_INTERVAL:-1s}
+      DB_PATH: /data/meta.db
+      # Same variable as the workers' CHUNK_SIZE, so they cannot disagree.
+      CHUNK_SIZE: ${CHUNK_SIZE:-1000000}
+      REPLICATION_FACTOR: ${REPLICATION_FACTOR:-2}
+      UPLOAD_WINDOW: ${UPLOAD_WINDOW:-4}
+      MAX_OBJECT_SIZE: ${MAX_OBJECT_SIZE:-5368709120}
+      MAX_CONCURRENT_UPLOADS: ${MAX_CONCURRENT_UPLOADS:-16}
+      PLACEMENT_MIN_FREE_BYTES: ${PLACEMENT_MIN_FREE_BYTES:-100000000}
+      WORKER_CONNECT_TIMEOUT: ${WORKER_CONNECT_TIMEOUT:-2s}
+      WORKER_REQUEST_TIMEOUT: ${WORKER_REQUEST_TIMEOUT:-10s}
+      CLIENT_READ_TIMEOUT: ${CLIENT_READ_TIMEOUT:-60s}
+      JANITOR_INTERVAL: ${JANITOR_INTERVAL:-10s}
     volumes:
-      - controller-data:/data # metadata DB from Phase 3
+      - controller-data:/data # metadata database (DB_PATH)
     healthcheck:
       test: ["CMD", "wget", "-qO-", "http://127.0.0.1:8080/healthz"]
       interval: 5s

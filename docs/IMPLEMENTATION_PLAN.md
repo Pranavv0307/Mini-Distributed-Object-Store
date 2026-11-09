@@ -12,8 +12,8 @@ owner review. The owner makes the git commit for each phase.
 | --- | --- | --- | --- | --- |
 | 0 | M0 | Setup and design lock-in | — | COMPLETED |
 | 1 | M1 | Worker: durable chunk store over HTTP, in Docker | 0 | COMPLETED |
-| 2 | M2 | Membership, failure detection, `SYNCING`, Compose cluster | 1 | COMPLETED (awaiting review) |
-| 3 | M3a+M3b | Write path: metadata DB, chunk, place, replicate, commit | 2 | NOT STARTED |
+| 2 | M2 | Membership, failure detection, `SYNCING`, Compose cluster | 1 | COMPLETED |
+| 3 | M3a+M3b | Write path: metadata DB, chunk, place, replicate, commit | 2 | COMPLETED (awaiting review) |
 | 4 | M4 | Read path: verify, fall back, stream in order | 3 | NOT STARTED |
 | 5 | M5 | Complete client API, delete path, error mapping | 4 | NOT STARTED |
 | 6 | M6 | Degraded operation, full inventory reconciliation, audit v1 | 5 | NOT STARTED |
@@ -115,7 +115,7 @@ owner review. The owner makes the git commit for each phase.
 - **Testing.** Registry unit tests with a fake clock; integration tests for
   death, return, controller restart, concurrent re-registration; e2e test
   with Compose (`-tags e2e`).
-- **Status.** COMPLETED (awaiting review). As built:
+- **Status.** COMPLETED. As built:
   `internal/controller/registry` (state machine, epochs from boot time
   DEC-029, failure detector), `internal/controller/api` (register, heartbeat,
   `/healthz`, `/cluster`; `InventoryReconciler` hook with a no-op
@@ -153,6 +153,26 @@ owner review. The owner makes the git commit for each phase.
   placement constraints; integration tests with failure-injecting transports
   (timeouts, checksum rejection, worker death mid-upload); concurrency test of
   many simultaneous uploads; Go benchmark sequential vs windowed.
+- **Status.** COMPLETED (awaiting review). As built:
+  `internal/controller/meta` (SQLite schema and conditional transactions,
+  DEC-034), `internal/controller/placement` (random distinct eligible
+  workers, free-space rule DEC-038), `internal/controller/workerclient`,
+  `internal/controller/custommeta` (DEC-013 validation),
+  `internal/controller/upload` (window, claim-before-write, retry with
+  failed-worker set, abort, DEC-035/036/039), a minimal
+  `internal/controller/janitor` (pending deletes on ALIVE workers, purge of
+  finished `DELETING` objects, DEC-037; planned for Phase 5 but needed here
+  for the "no object or chunk remains" criterion), `POST /api/v1/objects`.
+  All acceptance criteria are covered by automated tests: 5.5 MB → 6 chunks,
+  12 rows, files under chunk-ID names (`TestUploadDistributesAndReplicates`,
+  `TestComposeUpload`); worker stopped mid-upload
+  (`TestUploadSurvivesWorkerStopMidUpload`); one worker alive → 503 and
+  nothing stored (`TestUploadInsufficientWorkers`, `TestComposeUpload`);
+  upload failing mid-way leaves nothing (`TestUploadFailsWhenWorkersRunOut`);
+  edge sizes; metadata before/after the file; windowed ≥ sequential
+  (`BenchmarkUploadWindow`: ≈ 1.7×). Known gap until Phase 9: a controller
+  crash mid-upload leaves an `UPLOADING` object (invisible to clients) and
+  its chunk files.
 
 ## Phase 4 — Read path (M4)
 

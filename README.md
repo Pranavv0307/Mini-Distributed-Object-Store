@@ -6,11 +6,11 @@ a single controller keeps the metadata, detects failed workers, and repairs
 lost or corrupted data automatically. The whole system runs on one machine
 with Docker Compose.
 
-> **Implementation status: Phase 2 of 11 complete.** The cluster (1
-> controller + 4 workers) runs under Docker Compose: workers store chunks
-> durably, register with the controller, heartbeat, and are detected as `DEAD`
-> when stopped. The client object API (upload/download) comes next. See
-> [Current status](#current-status).
+> **Implementation status: Phase 3 of 11 complete.** The cluster (1
+> controller + 4 workers) runs under Docker Compose. Objects can be
+> **uploaded**: they are streamed into 1 MB chunks, each chunk is stored on two
+> different workers, and the object is committed atomically. Download and the
+> rest of the client API come next. See [Current status](#current-status).
 
 ## The problem
 
@@ -61,8 +61,8 @@ with rationale: [`docs/reference/Object_Store_Architecture.md`](docs/reference/O
 | --- | --- |
 | Language | Go 1.27 |
 | HTTP | Go standard library (`net/http`, method-pattern routing) |
-| Metadata | SQLite via pure-Go `modernc.org/sqlite` (from Phase 3) |
-| Concurrency helpers | `golang.org/x/sync` (from Phase 3) |
+| Metadata | SQLite via pure-Go `modernc.org/sqlite` |
+| Concurrency helpers | `golang.org/x/sync` (`errgroup`) |
 | Logging | `log/slog` (structured) |
 | Deployment | Docker + Docker Compose (from Phases 1–2) |
 | Static analysis | `go vet`, `gofmt`, `staticcheck` (pinned in `go.mod`) |
@@ -82,7 +82,13 @@ internal/
   wire/              shared JSON types, headers, error codes
   httpx/             JSON errors, request logging middleware
   controller/registry/ worker states, epochs, failure detector
-  controller/api/    controller HTTP API (membership, /healthz, /cluster)
+  controller/api/    controller HTTP API (membership, upload, /healthz, /cluster)
+  controller/meta/   SQLite metadata store (objects, chunks, replicas, pending deletes)
+  controller/upload/ upload coordinator (chunking, placement, replication, commit)
+  controller/placement/ replica placement policy
+  controller/workerclient/ the controller's HTTP client for workers
+  controller/janitor/ deferred cleanup of aborted uploads
+  controller/custommeta/ custom metadata validation
   worker/store/      on-disk chunk store (atomic, checksummed)
   worker/server/     worker HTTP API and write gate
   worker/agent/      worker membership: register, heartbeat, re-register
@@ -124,6 +130,9 @@ Run the cluster (Git Bash / Linux / macOS):
 ```bash
 docker compose up -d --build
 curl -s localhost:8080/cluster        # 4 workers ALIVE
+head -c 5500000 /dev/urandom > big.bin
+curl -s -F 'metadata={"owner":"alice"}' -F 'file=@big.bin' localhost:8080/api/v1/objects
+                                      # 201: 6 chunks, each on 2 workers
 docker stop worker2                   # ~10 s later: worker2 DEAD
 docker start worker2                  # ALIVE again (re-registered)
 docker compose down                   # stop; data volumes are kept (-v deletes them)
@@ -161,8 +170,9 @@ implemented.
 | --- | --- | --- |
 | 0 | Setup and design lock-in | COMPLETED |
 | 1 | Worker: durable chunk store over HTTP, in Docker | COMPLETED |
-| 2 | Membership, failure detection, `SYNCING`, Compose cluster | COMPLETED (awaiting review) |
-| 3–11 | See [implementation plan](docs/IMPLEMENTATION_PLAN.md) | NOT STARTED |
+| 2 | Membership, failure detection, `SYNCING`, Compose cluster | COMPLETED |
+| 3 | Write path: metadata DB, chunking, replication, atomic commit | COMPLETED (awaiting review) |
+| 4–11 | See [implementation plan](docs/IMPLEMENTATION_PLAN.md) | NOT STARTED |
 
 Open item awaiting owner confirmation: string-only custom metadata values
 (DEC-013). The chunk size is confirmed as 1 MB = 1,000,000 bytes (DEC-005).

@@ -321,3 +321,103 @@ reconciliation has metadata to compare.
 Phase 3: metadata DB (SQLite), upload path (chunking, placement on `ALIVE`
 workers, claim-before-write, `pending_deletes`, atomic commit, windowed
 upload).
+
+---
+
+## Phase 3 — Write path (2026-11-09)
+
+### What was implemented
+
+- **Dependencies:** `modernc.org/sqlite` v1.62.0 (pure Go, DEC-003) and
+  `golang.org/x/sync` v0.24.0 (`errgroup`, DEC-004). Verified in the driver
+  source that the `_txlock=immediate` and `_pragma` DSN options exist.
+- **`internal/controller/meta`**: embedded schema (`objects`, `chunks`,
+  `replicas`, `pending_deletes`, `schema_version`), `Open` with WAL / FULL
+  sync / foreign keys / busy timeout / `BEGIN IMMEDIATE`, and the write-path
+  transactions `CreateObject`, `ClaimChunk`, `MarkReplicaOK`, `ReplaceReplica`,
+  `CommitObject` (re-verifies I1, I2, replication), `MarkDeleting`,
+  `DuePendingDeletes`, `CompletePendingDelete`, `FailPendingDelete`,
+  `FinalizeDeletedObjects`, plus `GetObject`, `ChunkMap`, `Counts` (DEC-034).
+- **`internal/controller/placement`**: `Eligible` (ALIVE, not excluded,
+  enough free space) and the `Random` policy (DEC-038).
+- **`internal/controller/workerclient`**: PUT/GET/DELETE chunk with connect
+  and request timeouts and typed worker errors.
+- **`internal/controller/custommeta`**: DEC-013 validation (still
+  provisional).
+- **`internal/controller/upload`**: the coordinator (DEC-035, DEC-036,
+  DEC-039).
+- **`internal/controller/janitor`**: minimal cleanup loop (DEC-037).
+- **`internal/controller/api`**: `POST /api/v1/objects` (concurrency cap,
+  per-read deadlines, error mapping), `/healthz` now pings the database.
+- **`internal/config`**: controller settings `DB_PATH`, `CHUNK_SIZE`,
+  `REPLICATION_FACTOR`, `UPLOAD_WINDOW`, `MAX_OBJECT_SIZE`,
+  `MAX_CONCURRENT_UPLOADS`, `PLACEMENT_MIN_FREE_BYTES`,
+  `WORKER_CONNECT_TIMEOUT`, `WORKER_REQUEST_TIMEOUT`, `CLIENT_READ_TIMEOUT`,
+  `JANITOR_INTERVAL`.
+- **`cmd/controller`**: opens the database, runs the janitor, serves uploads;
+  shutdown order is HTTP drain → background loops → database close.
+- **`docker-compose.yml`**: controller gets the write-path settings and
+  `DB_PATH=/data/meta.db` on its volume; `CHUNK_SIZE` is shared with the
+  workers.
+- **Tests**: unit tests for every new package; in-process integration tests
+  with a worker fault injector; a sequential-vs-windowed benchmark; a Compose
+  upload e2e test. Test helpers were generalised to `testing.TB` so the
+  benchmark can reuse them.
+
+### Important decisions
+
+DEC-034 to DEC-039. The janitor was planned for Phase 5 but a minimal
+version was needed now, because the Phase 3 acceptance criterion says a
+failed upload leaves no object or chunk behind.
+
+### Problems encountered and resolutions
+
+1. **End-of-file detection (DEC-039).** Review of the first draft found that
+   `io.ReadFull` cannot tell a short last chunk from a truncated body. A
+   later `NextPart` call would also have caught the truncation, so no
+   incomplete object could actually have been committed, but the check now
+   happens where the data is read.
+2. **Wrong error reported for an oversized upload (500 instead of 400).**
+   When the read loop stopped with a client error it cancelled the in-flight
+   chunk writes, whose `context canceled` error was then returned first. The
+   read error now takes precedence. Found by `TestUploadTooLarge`.
+3. **Test-helper bugs:** a truncation guard that always failed, and a
+   cleanup check that counted the files of committed objects as leftovers.
+   Both fixed in the tests.
+4. **Janitor starvation risk** (found in design review): fetching due deletes
+   without a worker filter could fill every batch with entries for a dead
+   worker. `DuePendingDeletes` now takes the ALIVE worker list.
+5. **Shell quoting** broke a large documentation heredoc; doc edits are now
+   applied with Python scripts in the scratchpad.
+
+### Tests performed and results (2026-11-09)
+
+- `go build`, `go vet` (default and `-tags e2e`), `gofmt -l` (empty),
+  `go tool staticcheck` (default and `-tags e2e`): pass.
+- `go test -count=3 ./...` (Windows): pass. `go test -race -count=3 ./...` in
+  `golang:1.27.3` (Linux): pass.
+- `go test -tags e2e -count=1 -v ./test/e2e/...`: `TestComposeClusterMembership`,
+  `TestComposeUpload`, `TestWorkerContainer` pass; no leftover resources.
+- `BenchmarkUploadWindow` (3 runs): medians 70.4 / 112.7 / 122.1 / 112.2 MB/s
+  for windows 1 / 2 / 4 / 8.
+- Manual Compose walkthrough (`OBJSTORE_CONTAINER_PREFIX=objstore-`, guarded):
+  5.5 MB upload → 201, 6 chunks, checksum matching `sha256sum`, 12 files
+  (5/4/0/3 per worker), each chunk on 2 distinct workers, `/cluster` chunk
+  counts matching, `worker inspect` VALID, the three 400 cases, and
+  `503 INSUFFICIENT_WORKERS` with three workers stopped; `down -v` left
+  nothing.
+
+### Known limitations
+
+- **Controller crash mid-upload** leaves an `UPLOADING` object (invisible to
+  clients) and its files; Phase 9 startup recovery cleans these up.
+- Download, metadata GET/PATCH, list, and delete are Phases 4–5. Stored
+  objects can be checked only via tests and worker volumes.
+- Random placement is uneven for small samples (one run: 0 of 12 replicas on
+  worker3); rendezvous hashing is stretch S1.
+- DEC-013 (string-only metadata) remains provisional.
+
+### Work remaining
+
+Phase 4: download with per-chunk verification, replica fallback, pre-flight
+503, mid-stream abort, and marking `CORRUPT` replicas.

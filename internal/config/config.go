@@ -22,6 +22,9 @@ import (
 // 1,000,000 bytes, as the specification states (DEC-005, confirmed by the owner).
 const DefaultChunkSize int64 = 1_000_000
 
+// DefaultMaxObjectSize is MAX_OBJECT_SIZE's default: 5 GiB (DEC-016).
+const DefaultMaxObjectSize int64 = 5 << 30
+
 // MaxConfigurableChunkSize bounds CHUNK_SIZE so a typo cannot make a worker
 // accept (and buffer) enormous chunk bodies.
 const MaxConfigurableChunkSize int64 = 64 << 20
@@ -94,6 +97,27 @@ type Controller struct {
 	// detector evaluates heartbeat ages. Detection latency is at most
 	// DeadAfter + FailureCheckInterval after the last heartbeat.
 	FailureCheckInterval time.Duration
+
+	// ---- Metadata and write path (Phase 3) ----
+
+	DBPath            string // DB_PATH: SQLite file on the controller volume
+	ChunkSize         int64  // CHUNK_SIZE (must not exceed the workers' CHUNK_SIZE)
+	ReplicationFactor int    // REPLICATION_FACTOR
+	UploadWindow      int    // UPLOAD_WINDOW: chunks in flight per upload (1 = sequential)
+	MaxObjectSize     int64  // MAX_OBJECT_SIZE
+	// MaxConcurrentUploads (MAX_CONCURRENT_UPLOADS): further uploads get 503.
+	MaxConcurrentUploads int
+	// MinFreeBytes (PLACEMENT_MIN_FREE_BYTES): workers reporting less free
+	// space are not chosen for new chunks (placement rule 3).
+	MinFreeBytes int64
+	// WorkerConnectTimeout / WorkerRequestTimeout bound every worker call.
+	WorkerConnectTimeout time.Duration
+	WorkerRequestTimeout time.Duration
+	// ClientReadTimeout (CLIENT_READ_TIMEOUT) bounds one stalled read of an
+	// upload body.
+	ClientReadTimeout time.Duration
+	// JanitorInterval (JANITOR_INTERVAL): cleanup round period.
+	JanitorInterval time.Duration
 }
 
 // LoadController reads controller configuration through getenv.
@@ -106,6 +130,20 @@ func LoadController(getenv func(string) string) (Controller, error) {
 		DeadAfter:            l.duration("DEAD_AFTER", 10*time.Second, 10*time.Millisecond, time.Hour),
 		RepairGrace:          l.duration("REPAIR_GRACE", 30*time.Second, 0, 24*time.Hour),
 		FailureCheckInterval: l.duration("FAILURE_CHECK_INTERVAL", time.Second, 5*time.Millisecond, time.Minute),
+		DBPath:               l.str("DB_PATH", "/data/meta.db"),
+		ChunkSize:            l.int64("CHUNK_SIZE", DefaultChunkSize, 1, MaxConfigurableChunkSize),
+		ReplicationFactor:    int(l.int64("REPLICATION_FACTOR", 2, 1, 5)),
+		UploadWindow:         int(l.int64("UPLOAD_WINDOW", 4, 1, 64)),
+		MaxObjectSize:        l.int64("MAX_OBJECT_SIZE", DefaultMaxObjectSize, 0, 1<<40),
+		MaxConcurrentUploads: int(l.int64("MAX_CONCURRENT_UPLOADS", 16, 1, 1024)),
+		MinFreeBytes:         l.int64("PLACEMENT_MIN_FREE_BYTES", 100_000_000, 0, 1<<50),
+		WorkerConnectTimeout: l.duration("WORKER_CONNECT_TIMEOUT", 2*time.Second, time.Millisecond, time.Minute),
+		WorkerRequestTimeout: l.duration("WORKER_REQUEST_TIMEOUT", 10*time.Second, time.Millisecond, 10*time.Minute),
+		ClientReadTimeout:    l.duration("CLIENT_READ_TIMEOUT", time.Minute, 10*time.Millisecond, time.Hour),
+		JanitorInterval:      l.duration("JANITOR_INTERVAL", 10*time.Second, 5*time.Millisecond, time.Hour),
+	}
+	if c.DBPath == "" {
+		l.fail("DB_PATH", "must not be empty")
 	}
 	if c.DeadAfter <= c.HeartbeatInterval {
 		l.fail("DEAD_AFTER", "(%v) must be greater than HEARTBEAT_INTERVAL (%v), or every worker would flap", c.DeadAfter, c.HeartbeatInterval)

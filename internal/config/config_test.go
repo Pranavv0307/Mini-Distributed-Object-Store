@@ -94,7 +94,11 @@ func TestLoadController(t *testing.T) {
 		t.Fatal(err)
 	}
 	want := Controller{ListenAddr: ":8080", LogLevel: slog.LevelInfo, HeartbeatInterval: 3 * time.Second,
-		DeadAfter: 10 * time.Second, RepairGrace: 30 * time.Second, FailureCheckInterval: time.Second}
+		DeadAfter: 10 * time.Second, RepairGrace: 30 * time.Second, FailureCheckInterval: time.Second,
+		DBPath: "/data/meta.db", ChunkSize: 1_000_000, ReplicationFactor: 2, UploadWindow: 4,
+		MaxObjectSize: 5 << 30, MaxConcurrentUploads: 16, MinFreeBytes: 100_000_000,
+		WorkerConnectTimeout: 2 * time.Second, WorkerRequestTimeout: 10 * time.Second,
+		ClientReadTimeout: time.Minute, JanitorInterval: 10 * time.Second}
 	if c != want {
 		t.Fatalf("defaults = %+v, want %+v", c, want)
 	}
@@ -108,5 +112,12 @@ func TestLoadController(t *testing.T) {
 	}
 	if _, err := LoadController(env(map[string]string{"DEAD_AFTER": "soon"})); err == nil {
 		t.Fatal("bad duration accepted")
+	}
+	for _, bad := range []map[string]string{
+		{"REPLICATION_FACTOR": "0"}, {"UPLOAD_WINDOW": "0"}, {"MAX_CONCURRENT_UPLOADS": "-1"}, {"CHUNK_SIZE": "0"},
+	} {
+		if _, err := LoadController(env(bad)); err == nil {
+			t.Errorf("LoadController(%v) succeeded", bad)
+		}
 	}
 }

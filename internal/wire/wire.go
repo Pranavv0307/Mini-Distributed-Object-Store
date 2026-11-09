@@ -21,6 +21,15 @@ const (
 	CodeInsufficientStorage    = "INSUFFICIENT_STORAGE"
 	CodeInternal               = "INTERNAL"
 	CodeRegistrationSuperseded = "REGISTRATION_SUPERSEDED"
+	CodeMissingFile            = "MISSING_FILE"
+	CodeInvalidMetadata        = "INVALID_METADATA"
+	CodeMetadataLimitExceeded  = "METADATA_LIMIT_EXCEEDED"
+	CodeObjectTooLarge         = "OBJECT_TOO_LARGE"
+	CodeInsufficientWorkers    = "INSUFFICIENT_WORKERS"
+	CodeUploadFailed           = "UPLOAD_FAILED"
+	CodeServerBusy             = "SERVER_BUSY"
+	CodeObjectNotFound         = "OBJECT_NOT_FOUND"
+	CodeInvalidObjectID        = "INVALID_OBJECT_ID"
 )
 
 // ErrorResponse is the body of every non-2xx JSON response.
@@ -152,4 +161,21 @@ type WorkerView struct {
 	FreeBytes      int64 `json:"free_bytes"`
 	UsedBytes      int64 `json:"used_bytes"`
 	ChunkCount     int64 `json:"chunk_count"`
+}
+
+// ---- Client object API ----------------------------------------------------------
+
+// ObjectInfo describes a committed object (upload response; base of the
+// metadata response).
+type ObjectInfo struct {
+	ObjectID        string            `json:"object_id"`
+	Name            string            `json:"name"`
+	Size            int64             `json:"size"`
+	ContentType     string            `json:"content_type"`
+	ChecksumSHA256  string            `json:"checksum_sha256"`
+	NumChunks       int               `json:"num_chunks"`
+	CreatedAt       string            `json:"created_at"`
+	ModifiedAt      string            `json:"modified_at"`
+	MetadataVersion int64             `json:"metadata_version"`
+	CustomMetadata  map[string]string `json:"custom_metadata"`
 }
