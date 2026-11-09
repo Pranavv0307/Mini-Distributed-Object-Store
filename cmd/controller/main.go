@@ -31,6 +31,7 @@ import (
 	"objstore/internal/controller/meta"
 	"objstore/internal/controller/placement"
 	"objstore/internal/controller/registry"
+	"objstore/internal/controller/resync"
 	"objstore/internal/controller/upload"
 	"objstore/internal/controller/workerclient"
 	"objstore/internal/version"
@@ -86,11 +87,12 @@ func serve(cfg config.Controller, logger *slog.Logger) error {
 		Logger:            logger,
 	}, jan.Kick)
 	downloader := download.New(store, reg, workers, logger)
-	srv := api.New(reg, api.NoopReconciler{Logger: logger}, api.Config{
+	srv := api.New(reg, resync.New(store, logger, jan.Kick), api.Config{
 		HeartbeatInterval:      cfg.HeartbeatInterval,
 		DeadAfter:              cfg.DeadAfter,
 		RepairGrace:            cfg.RepairGrace,
 		Meta:                   store,
+		ReplicationFactor:      cfg.ReplicationFactor,
 		Uploader:               uploader,
 		MaxConcurrentUploads:   cfg.MaxConcurrentUploads,
 		Downloader:             downloader,

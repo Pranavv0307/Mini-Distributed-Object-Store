@@ -62,6 +62,9 @@ explicit owner confirmation; may change) · `SUPERSEDED by DEC-nnn`.
 | DEC-048 | Client delete reuses the abort path; 404 for anything not `READY` | ACCEPTED | 5 |
 | DEC-049 | `objctl` client with local verification; optional Compose `client` service | ACCEPTED | 5 |
 | DEC-050 | Metadata reads re-check status instead of a read transaction | ACCEPTED | 5 |
+| DEC-051 | Inventory reconciliation rules and mechanics | ACCEPTED | 6 |
+| DEC-052 | `/cluster` storage totals computed per request | ACCEPTED | 6 |
+| DEC-053 | Audit v1: safety invariants vs. steady state; I7 via the listing; I8 added | ACCEPTED | 6 |
 
 ---
 
@@ -844,3 +847,60 @@ explicit owner confirmation; may change) · `SUPERSEDED by DEC-nnn`.
 - **Why not a read transaction.** With `_txlock=immediate` every transaction
   takes the write lock; holding it while reading a large chunk map would
   block writers for no benefit.
+
+## DEC-051 — Inventory reconciliation rules and mechanics
+
+- **Context.** Design doc §4.5 gives the table; this records the details it
+  leaves open.
+- **Choice.**
+  | Replica row for (chunk, worker) | File in inventory | Action |
+  | --- | --- | --- |
+  | `OK` | yes, size = chunk size | nothing |
+  | `OK` | yes, size differs | mark `CORRUPT` |
+  | `OK` or `CORRUPT` | no | remove the row (the copy is lost) |
+  | `CORRUPT` | yes | nothing (repair rewrites it, Phases 7–8) |
+  | `PENDING` | either | nothing: an upload or repair in progress owns it (stale `PENDING` rows are Phase 9 recovery) |
+  | none | yes | orphan → pending delete (reason `orphan`) |
+  Mechanics: one read of the worker's rows, a plan in memory, then batches of
+  500 conditional writes per transaction. Each write re-checks the state it
+  planned on (`DELETE … AND state = ?`, `UPDATE … AND state = 'OK'`), and the
+  orphan insert checks "no replica row" in the same statement
+  (`INSERT … SELECT … WHERE NOT EXISTS`), so I8 holds against concurrent
+  claims. The run is idempotent; a partially applied run (e.g. the
+  registration request timed out) is completed by the next registration.
+  Orphans kick the janitor. Runs inside the register handler while the worker
+  is `SYNCING` (DEC-006), so placement and reads cannot use the worker.
+- **Consequences.** "Missing" is handled differently on the two detection
+  paths: a read that gets 404 marks the row `CORRUPT` (DEC-040, so it is
+  repairable in place), while reconciliation removes the row (§4.5). Both make
+  the copy non-effective, and the Phase 7 repair treats both as lost. A
+  registration whose reconciliation finds damage is logged at WARN.
+  Measured: a 4-chunk inventory reconciles in < 1 ms; 1,507 orphans in one
+  test run take four batches (500 + 500 + 500 + 7).
+
+## DEC-052 — `/cluster` storage totals computed per request
+
+- **Choice.** `meta.ChunkHealth` counts, for every chunk of a READY object,
+  its `OK` replicas on currently ALIVE workers (a correlated subquery), and
+  buckets the counts against RF; it also counts objects by status, replicas
+  by state, and pending deletes. No caching.
+- **Consequences.** A full scan of the chunks of READY objects per request:
+  fine for this system's size (thousands of chunks); a large deployment would
+  maintain counters incrementally.
+
+## DEC-053 — Audit v1
+
+- **Choice.** `GET /admin/audit` (`meta.Audit`) reports each invariant with a
+  violation count and up to 10 examples, and two summary flags: `ok` (all
+  **safety** invariants: I1, I2, I3, I7, I8) and `steady_state` (I5). I7 is
+  checked through the same `ListObjects` code the API uses (every listed
+  object is READY, and the count matches the READY objects). I8 (no
+  replica row and pending delete for the same pair, from DEC-007) is added.
+  I4 needs worker inventories (Phase 9, audit v2); I6 is checked by every
+  download (DEC-042).
+- **Why split.** The design says I5 holds "in steady state (no failures in
+  progress, repair complete)". With one flag, the audit would "fail" after
+  every worker stop, and the M6 checkpoint ("audit passes after each
+  scenario") could not be met before repair exists. Safety invariants must
+  never fail; I5 failing during a failure is expected and is reported, not
+  hidden.

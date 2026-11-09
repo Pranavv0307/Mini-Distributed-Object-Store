@@ -2,6 +2,7 @@ package integration
 
 import (
 	"bytes"
+	"crypto/sha256"
 	"io"
 	"mime/multipart"
 	"net/http"
@@ -24,11 +25,13 @@ type faults struct {
 	slowResponse  atomic.Int64 // nanoseconds: store the chunk, then delay the response
 	putLatency    atomic.Int64 // nanoseconds: delay before handling a PUT (simulated network/disk latency)
 	getLatency    atomic.Int64 // nanoseconds: delay before answering a chunk GET
+	getsSeen      atomic.Int64 // chunk GETs received
 }
 
 func (f *faults) wrap(next http.Handler) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		if r.Method == http.MethodGet && strings.HasPrefix(r.URL.Path, "/internal/chunks/") {
+			f.getsSeen.Add(1)
 			if d := time.Duration(f.getLatency.Load()); d > 0 {
 				time.Sleep(d)
 			}
@@ -130,3 +133,7 @@ func truncate(t testing.TB, body []byte, keep int) []byte {
 	}
 	return body[:keep]
 }
+
+func sha256sum(b []byte) [32]byte { return sha256.Sum256(b) }
+
+func bytesReader(b []byte) io.Reader { return bytes.NewReader(b) }

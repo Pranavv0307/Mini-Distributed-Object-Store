@@ -15,8 +15,8 @@ owner review. The owner makes the git commit for each phase.
 | 2 | M2 | Membership, failure detection, `SYNCING`, Compose cluster | 1 | COMPLETED |
 | 3 | M3a+M3b | Write path: metadata DB, chunk, place, replicate, commit | 2 | COMPLETED |
 | 4 | M4 | Read path: verify, fall back, stream in order | 3 | COMPLETED |
-| 5 | M5 | Complete client API, delete path, error mapping | 4 | COMPLETED (awaiting review) |
-| 6 | M6 | Degraded operation, full inventory reconciliation, audit v1 | 5 | NOT STARTED |
+| 5 | M5 | Complete client API, delete path, error mapping | 4 | COMPLETED |
+| 6 | M6 | Degraded operation, full inventory reconciliation, audit v1 | 5 | COMPLETED (awaiting review) |
 | 7 | M7 | Self-healing re-replication (reconciler) | 6 | NOT STARTED |
 | 8 | M8 | Data integrity: scrubber, cross-check, corrupt repair | 7 | NOT STARTED |
 | 9 | M9 | Crash consistency, janitor, recovery, audit v2 | 8 | NOT STARTED |
@@ -220,7 +220,7 @@ owner review. The owner makes the git commit for each phase.
   completes when it returns.
 - **Testing.** Conformance test table; pagination stability under concurrent
   inserts; PATCH/DELETE race test.
-- **Status.** COMPLETED (awaiting review). As built: `meta.UpdateMetadata`,
+- **Status.** COMPLETED. As built: `meta.UpdateMetadata`,
   `meta.ListObjects`; `custommeta.ParsePatch`/`Merge`; handlers in
   `internal/controller/api/objects.go`; client delete reuses
   `MarkDeleting` + janitor (built in Phase 3); `cmd/objctl` and the Compose
@@ -246,6 +246,17 @@ owner review. The owner makes the git commit for each phase.
   under-replicated counts grow then return to normal on restart inside grace
   with no data movement; wiped volume → missing replicas dropped; races 1–3 of
   DEC-006 covered by tests; audit passes after each scenario.
+- **Status.** COMPLETED (awaiting review). As built:
+  `meta.ReconcileInventory` + `internal/controller/resync` (DEC-051),
+  `meta.ChunkHealth` and the `/cluster` storage section (DEC-052),
+  `meta.Audit` and `GET /admin/audit` (DEC-053: "passes" means the safety
+  invariants hold; I5 is reported as `steady_state`). Acceptance:
+  degraded uploads/downloads and growing under-replicated counts, return
+  within grace with no data movement (`TestDegradedOperationAndReturnWithinGrace`,
+  `TestComposeResync`); wiped volume (`TestWipedWorkerReturns`, e2e); size
+  damage (`TestSizeMismatchOnReturn`); orphan (`TestOrphanOnReturn`); DEC-006
+  races 1 and 3 with metadata (`TestSyncingWorkerNotUsedDuringReconciliation`,
+  `TestWipedWorkerPreflightIs503`); audit `ok` after every scenario.
 
 ## Phase 7 — Self-healing re-replication (M7)
 

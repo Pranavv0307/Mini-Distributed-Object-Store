@@ -6,13 +6,15 @@ Practical, step-by-step instructions to set up, run, and verify the project.
 > observed at the phase noted. Sections for later phases are marked
 > *not yet available* until those phases are implemented.
 
-**Current state (end of Phase 5):** the cluster runs under Docker Compose:
+**Current state (end of Phase 6):** the cluster runs under Docker Compose:
 one controller and four workers. **Every client API endpoint of the
 specification works:** upload (1 MB chunks, two copies on distinct workers,
 atomic commit), verified download with replica fallback, metadata GET and
-PATCH, list with pagination, and delete. The `objctl` client is available
-natively and as a Compose `client` container. Repair and crash recovery come
-in Phases 6–9.
+PATCH, list with pagination, and delete; `objctl` natively and as a Compose
+`client` container. Returning workers are reconciled against the metadata
+(missing, damaged, and orphaned chunks are detected); `/cluster` shows
+replication health and `/admin/audit` checks the invariants. Automatic repair
+and crash recovery come in Phases 7–9.
 
 > ⚠️ **Docker name collisions.** Container names are global on a Docker host.
 > The Compose file uses the spec's names `controller` and `worker1`…`worker4`.
@@ -511,7 +513,65 @@ disappear within one janitor round; the stopped holder's files stay (its
 pending deletes wait); after `docker start`, its files are removed and the
 object's rows are purged (`object_purged` in the controller log).
 
-### 5.8 Repair, crash consistency
+### 5.8 Degraded operation and worker return (verified at Phase 6, default timings)
+
+Helpers (Git Bash):
+
+```bash
+st() { curl -s localhost:8080/cluster | grep -o '"storage":{.*}'; }
+au() { curl -s localhost:8080/admin/audit | grep -o '"ok":[a-z]*,"steady_state":[a-z]*'; }
+```
+
+With one 5.5 MB object stored (`$ID`):
+
+| Step | Command | Observed |
+| --- | --- | --- |
+| Healthy | `st; au` | `"total":6,"fully_replicated":6`; `"ok":true,"steady_state":true` |
+| How many copies worker2 holds | `curl -s localhost:8080/api/v1/objects/$ID/metadata \| grep -o '"worker_id":"worker2"' \| wc -l` | `4` (varies: random placement) |
+| Stop it | `docker stop objstore-worker2`, wait ~10 s, `st; au` | `"fully_replicated":2,"under_replicated":4`; `"ok":true,"steady_state":false`, I5 4 violations |
+| Still serving | `curl -s localhost:8080/api/v1/objects/$ID \| cmp - big.bin && echo IDENTICAL` | `IDENTICAL` |
+| Return within grace | `docker start objstore-worker2`, wait ~2 s, `st; au` | `"fully_replicated":6`, `"pending_deletes":0`; `"ok":true,"steady_state":true` |
+| What reconciliation did | `docker logs objstore-controller 2>&1 \| grep inventory_reconciled \| tail -1` | `"worker_id":"worker2",…,"inventory":4,"matched":4,"missing_removed":0,…,"orphans_queued":0` |
+
+`under_replicated` counts chunks with one usable copy; it returns to 0 when
+the worker comes back, with no files written or deleted (no data movement).
+
+**Size damage while away** (appended bytes):
+
+```bash
+C=$(docker exec objstore-worker2 sh -c "ls /data/chunks | grep ^$ID | head -1")
+docker exec objstore-worker2 sh -c "printf garbage >> /data/chunks/$C"
+docker restart objstore-worker2      # wait ~4 s
+docker logs objstore-controller 2>&1 | grep inventory_reconciled | tail -1
+st; au
+```
+
+Observed: `"inventory":4,"matched":3,…,"size_mismatch_corrupt":1` (logged at
+WARN); the copy is `CORRUPT` in the metadata; `"fully_replicated":5,"under_replicated":1`,
+`"replicas_by_state":{"CORRUPT":1,"OK":11}`; `"ok":true,"steady_state":false`.
+
+**Wiped volume.** Stop the worker, empty its volume, start it:
+
+```bash
+docker stop objstore-worker2
+docker run --rm -v objstore_worker2-data:/data alpine:3.24 sh -c 'rm -f /data/chunks/*'
+docker start objstore-worker2
+```
+
+> This exact sequence is executed and verified by the automated test
+> `TestComposeResync` (on its own uniquely named volume). The manual run of
+> the `rm` step was blocked by Claude Code's safety check during this phase,
+> so run it yourself; the volume name is `objstore_<worker>-data` (the project
+> name `objstore` comes from `docker-compose.yml`). Expected: the controller
+> logs `inventory_reconciled` with `missing_removed` equal to the copies the
+> worker held; the metadata shows no replicas on it; `under_replicated` equals
+> that count; the audit is `ok` with `steady_state` false; downloads are still
+> identical. The copies are restored by repair in Phase 7.
+
+Orphans (a chunk file no metadata claims) are queued and deleted by the
+janitor when the worker registers (`TestOrphanOnReturn`).
+
+### 5.9 Repair, crash consistency
 
 Repair: *not yet available* (Phases 7–9). Crash mid-write on a worker:
 covered by automated tests (§6).
@@ -520,7 +580,7 @@ covered by automated tests (§6).
 
 ## 6. Automated testing and static analysis
 
-Run from the repository root. All verified at Phase 5.
+Run from the repository root. All verified at Phase 6.
 
 ### Unit and integration tests
 
@@ -551,7 +611,7 @@ ok  	objstore/test/integration
 
 `test/integration` runs in-process clusters (controller with SQLite,
 upload coordinator, janitor, and real workers behind a fault injector that
-can fail, delay, or corrupt PUTs; 50 ms heartbeats, 300 ms `DEAD_AFTER`) and
+can fail, delay, or corrupt PUTs; 50 ms heartbeats, 1 s `DEAD_AFTER`) and
 builds and kills the real worker binary; about 10–45 s. Upload tests cover
 the 5.5 MB checkpoint, edge sizes, window sizes, metadata before/after the
 file, invalid requests, insufficient workers, worker failure/stop/timeout/
@@ -561,7 +621,9 @@ fallback; object tests cover metadata, PATCH (merge, If-Match, limits,
 concurrency, chunks untouched), list paging (including during concurrent
 uploads), delete (immediate invisibility, cleanup, worker down, during a
 download), and the `objctl` binary; `TestSpecConformance` walks every row of
-the spec's endpoint and status tables. `go test -short ./...` skips the timing-based and
+the spec's endpoint and status tables; resync tests cover a worker's stop
+and return within grace (no data movement), a wiped volume, size damage, an
+orphan, and the `SYNCING` races with reconciliation held open. `go test -short ./...` skips the timing-based and
 process-spawning tests. Add `-count=1` to bypass the cache, `-v` for detail.
 
 ### End-to-end tests (Docker)
@@ -579,6 +641,11 @@ Builds `objstore:e2e` once, then runs:
   `docker start` → `ALIVE` with a newer epoch; `docker restart` controller →
   all four re-register with newer epochs. Removes only its own project
   (`compose down -v`).
+- `TestComposeResync`: stops the worker holding most replicas (under-replicated
+  count, downloads and uploads still work, audit ok but not steady), starts it
+  (everything back to normal, same files, no pending deletes), then stops it,
+  empties its volume with `docker run … rm -f /data/chunks/*`, and starts it
+  (missing replicas dropped, audit ok with I5 = lost copies, downloads intact).
 - `TestComposeObjectAPI`: drives `objctl` in the Compose `client` container:
   upload, stat (chunk map with replicas), patch, list, download (verified by
   `objctl`), delete (files removed from all volumes), and delete with a holder
@@ -593,7 +660,7 @@ Builds `objstore:e2e` once, then runs:
   `503 INSUFFICIENT_WORKERS` with nothing stored.
 - `TestWorkerContainer`: the standalone worker container checks from Phase 1.
 
-Expected: all five `PASS` (about 1.5–2 minutes including the image build). Set
+Expected: all six `PASS` (about 1.5–2.5 minutes including the image build). Set
 `E2E_IMAGE=objstore:dev` to reuse an existing image.
 
 ### Benchmark: sequential vs windowed upload
@@ -664,6 +731,8 @@ Expected last line: `ALL-OK`. Then run the race detector and the e2e tests.
 | Upload returns `503 SERVER_BUSY` | `MAX_CONCURRENT_UPLOADS` uploads in progress | Retry later or raise the limit |
 | Upload returns `400 INVALID_REQUEST` mentioning the body | Client disconnected, or the body stalled longer than `CLIENT_READ_TIMEOUT` | Retry; nothing was committed, and stored chunks are cleaned up by the janitor |
 | Controller exits with `meta: database schema version … is not supported` | The `controller-data` volume holds a database from an incompatible build | Use a matching build, or reset with `docker compose down -v` (deletes all data) |
+| `/admin/audit` shows `"ok":false` | A safety invariant is violated: a bug | Read `checks[].examples` and the controller log `audit_violation`; report it |
+| `/admin/audit` shows `"steady_state":false` | Some chunk lacks RF usable copies: a worker is down, or copies were lost or damaged and repair has not run (Phase 7) | Check `/cluster` `storage.chunks`; start stopped workers |
 | A worker stays `SYNCING` | Registration failed during inventory reconciliation (possible from Phase 6) | Check controller logs for `inventory_reconcile_failed`; the worker retries automatically |
 | Controller exits with `DEAD_AFTER (…) must be greater than HEARTBEAT_INTERVAL` | Misconfigured timings | Make `DEAD_AFTER` larger (≥ 3 × the heartbeat interval recommended) |
 | Worker logs `heartbeat_failed` repeatedly | Controller down or unreachable | Start the controller; the worker re-registers automatically |

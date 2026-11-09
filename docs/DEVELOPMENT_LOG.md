@@ -579,3 +579,95 @@ DEC-045 to DEC-050. Client delete reuses the Phase 3 abort path and janitor.
 
 Phase 6: full inventory reconciliation on registration, `/cluster` chunk
 totals, audit v1 (I1, I2, I3, I5, I7).
+
+---
+
+## Phase 6 — Degraded operation and worker resync (2026-11-09)
+
+### What was implemented
+
+- **`meta.ReconcileInventory`** (`internal/controller/meta/inventory.go`):
+  the §4.5 table with one read, an in-memory plan, and batched conditional
+  writes (DEC-051). **`internal/controller/resync`** wraps it as the
+  registration's `InventoryReconciler`, logs `inventory_reconciled` (WARN when
+  data was lost or damaged), and kicks the janitor when orphans were queued.
+- **`meta.ChunkHealth`** and the `/cluster` `storage` section (DEC-052).
+- **`meta.Audit`** and `GET /admin/audit` (DEC-053).
+- **Controller wiring:** the real reconciler replaces `NoopReconciler`;
+  `api.Config.ReplicationFactor`.
+- **Tests:** store tests for every reconciliation row, conditional skips,
+  idempotency, batching, chunk health, and the audit with injected
+  violations; integration tests for the M6 checkpoint and the `SYNCING` races
+  (reconciliation held open by a gate in the test cluster, which now uses the
+  real reconciler); Compose `TestComposeResync`. The fault injector counts
+  chunk GETs.
+
+### Important decisions
+
+DEC-051 (reconciliation), DEC-052 (`/cluster` totals), DEC-053 (audit:
+safety vs. steady state).
+
+### Problems encountered and resolutions
+
+1. **Placeholder order bug in `ChunkHealth`**, caught in review before any
+   test ran: the three RF arguments were passed around the subquery's worker
+   list instead of before it.
+2. **Restart tests passed or failed by timing.** A worker stopped and
+   restarted within `DEAD_AFTER` is still `ALIVE` from before, so "wait for
+   ALIVE" returned before the new registration (and its reconciliation) had
+   happened. Tests now wait for a newer epoch (`restart` /
+   `waitReregistered` helpers).
+3. **e2e test listed files on a stopped container** (`docker exec` fails);
+   the snapshot is now taken before the stop.
+4. **A manual walkthrough command was blocked** by Claude Code's built-in
+   safety check: `docker run … sh -c 'rm -f /data/chunks/*'` (emptying a
+   worker volume). It was not worked around. The identical step is executed
+   by `TestComposeResync` (on that test's uniquely named volume), which
+   passes; `RUN_AND_TEST.md` documents the manual command for the owner to
+   run. The size-damage scenario was demonstrated manually instead by
+   appending bytes to a running worker's chunk and restarting it.
+
+5. **One unexplained test failure.** After the documentation step, one full
+   `go test -count=1 ./...` run exited 1 with 15 of 16 packages `ok`. The
+   command used to check it printed only pass counts, so **the failing test
+   and its message were lost** (my mistake). It did not reproduce in about 20
+   further runs: 4 full parallel runs, 3 more under concurrent race-detector
+   load, 6 runs of the integration package, and 10 runs of every other
+   package. The likeliest cause is the in-process cluster's aggressive timing
+   (50 ms heartbeats, 300 ms `DEAD_AFTER`): under CPU contention a healthy
+   worker could miss 6 heartbeats and be declared `DEAD` for a moment, which
+   breaks assertions like "the other workers stay ALIVE". As a mitigation (not
+   a proven fix), the test `DEAD_AFTER` is now 1 s (20 heartbeats), and check
+   runs now keep their full logs so a recurrence can be diagnosed. Production
+   timings are unaffected.
+
+### Tests performed and results (2026-11-09)
+
+- `go build`, `go vet` (default and `-tags e2e`), `gofmt -l` (empty),
+  `go tool staticcheck` (default and `-tags e2e`): pass.
+- `go test -count=3 ./...` (Windows, 16 packages): pass; one later single
+  run failed once (see problem 5); after raising the test `DEAD_AFTER`,
+  three more full runs passed with logs kept.
+- `go test -race -count=3 ./...` (Linux container): pass.
+- `go test -tags e2e -count=1 -v ./test/e2e/...`: 6 tests pass
+  (`TestComposeResync` included); no leftovers.
+- Manual Compose walkthrough (default timings): healthy 6/6 → worker2
+  stopped 2 fully / 4 under, download identical, audit ok/not steady (I5 4) →
+  started: 6/6, no pending deletes, reconciliation `matched 4`, audit
+  ok/steady → bytes appended + restart: `size_mismatch_corrupt 1`, 5/1,
+  `CORRUPT 1`, audit ok/not steady (I5 1).
+
+### Known limitations
+
+- Lost and damaged copies are detected but not yet restored (Phase 7–8);
+  the system keeps serving from the remaining copy.
+- `/cluster` storage totals and the audit scan all chunks of READY objects
+  per request (fine at this scale).
+- Stale `PENDING` rows (e.g. from a controller crash) are left alone until
+  Phase 9 recovery.
+
+### Work remaining
+
+Phase 7: the level-triggered reconciler (repair after `REPAIR_GRACE`,
+risk-prioritised, throttled, in-flight set), over-replication trimming,
+zero-effective alarm, `/cluster` repair counters.

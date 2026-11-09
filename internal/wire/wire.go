@@ -129,6 +129,26 @@ type ClusterView struct {
 	Config     ClusterConfig  `json:"config"`
 	Summary    WorkerSummary  `json:"summary"`
 	Workers    []WorkerView   `json:"workers"`
+	// Storage is present when the controller has a metadata database.
+	Storage *StorageView `json:"storage,omitempty"`
+}
+
+// StorageView summarises data health (architecture §5.9).
+type StorageView struct {
+	Chunks          ChunkTotals    `json:"chunks"`
+	ObjectsByStatus map[string]int `json:"objects_by_status"`
+	ReplicasByState map[string]int `json:"replicas_by_state"`
+	PendingDeletes  int            `json:"pending_deletes"`
+}
+
+// ChunkTotals classifies the chunks of READY objects by effective replicas
+// (OK on an ALIVE worker) against the replication factor.
+type ChunkTotals struct {
+	Total           int `json:"total"`
+	FullyReplicated int `json:"fully_replicated"`
+	UnderReplicated int `json:"under_replicated"`
+	ZeroEffective   int `json:"zero_effective"`
+	OverReplicated  int `json:"over_replicated"`
 }
 
 // ControllerInfo identifies the controller process.
@@ -139,6 +159,7 @@ type ControllerInfo struct {
 
 // ClusterConfig echoes the liveness settings in effect.
 type ClusterConfig struct {
+	ReplicationFactor   int   `json:"replication_factor,omitempty"`
 	HeartbeatIntervalMs int64 `json:"heartbeat_interval_ms"`
 	DeadAfterMs         int64 `json:"dead_after_ms"`
 	RepairGraceMs       int64 `json:"repair_grace_ms"`

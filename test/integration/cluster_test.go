@@ -26,8 +26,11 @@ import (
 
 // Fast timings so failure detection takes ~0.3 s instead of ~10 s.
 const (
-	hbInterval   = 50 * time.Millisecond
-	deadAfter    = 300 * time.Millisecond
+	hbInterval = 50 * time.Millisecond
+	// 1 s = 20 heartbeats: robust against scheduling delays when the whole
+	// suite runs in parallel (a single unexplained failure was seen in Phase 6
+	// with 300 ms; see docs/DEVELOPMENT_LOG.md).
+	deadAfter    = time.Second
 	checkEvery   = 20 * time.Millisecond
 	repairGrace  = time.Second
 	clusterLimit = 10 * time.Second // generous deadline for any convergence

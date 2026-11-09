@@ -25,6 +25,7 @@ import (
 	"objstore/internal/controller/meta"
 	"objstore/internal/controller/placement"
 	"objstore/internal/controller/registry"
+	"objstore/internal/controller/resync"
 	"objstore/internal/controller/upload"
 	"objstore/internal/controller/workerclient"
 	"objstore/internal/wire"
@@ -33,6 +34,7 @@ import (
 // uploadCluster is an in-process controller with metadata DB, upload
 // coordinator, janitor, and N real workers (each behind a fault injector).
 type uploadCluster struct {
+	gate    *gatedReconciler
 	t       testing.TB
 	url     string
 	meta    *meta.Store
@@ -79,9 +81,11 @@ func newUploadCluster(t testing.TB, o clusterOpts) *uploadCluster {
 		ChunkSize: o.chunkSize, ReplicationFactor: 2, Window: o.window, MaxObjectSize: o.maxObjectSize,
 		ClientReadTimeout: 5 * time.Second,
 	}, jan.Kick)
-	srv := api.New(reg, api.NoopReconciler{}, api.Config{
+	gate := &gatedReconciler{inner: resync.New(m, nil, jan.Kick)}
+	srv := api.New(reg, gate, api.Config{
 		HeartbeatInterval: hbInterval, DeadAfter: deadAfter, RepairGrace: repairGrace,
-		Meta: m, Uploader: up, MaxConcurrentUploads: o.maxUploads,
+		Meta: m, ReplicationFactor: 2, OnDelete: jan.Kick,
+		Uploader: up, MaxConcurrentUploads: o.maxUploads,
 		Downloader: download.New(m, reg, wc, nil), MaxConcurrentDownloads: 32,
 	})
 	ts := httptest.NewServer(srv.Handler())
@@ -91,7 +95,7 @@ func newUploadCluster(t testing.TB, o clusterOpts) *uploadCluster {
 	bg.Go(func() { jan.Run(ctx) })
 	t.Cleanup(func() { cancel(); bg.Wait(); ts.Close(); m.Close() })
 
-	c := &uploadCluster{t: t, url: ts.URL, meta: m, reg: reg, jan: jan, byID: map[string]*testWorker{}}
+	c := &uploadCluster{t: t, url: ts.URL, meta: m, reg: reg, jan: jan, gate: gate, byID: map[string]*testWorker{}}
 	for i := range o.workers {
 		w := newTestWorker(t, fmt.Sprintf("worker%d", i+1), ts.URL)
 		c.workers = append(c.workers, w)

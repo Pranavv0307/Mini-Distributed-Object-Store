@@ -1,10 +1,11 @@
 # API Reference
 
-> **Status (end of Phase 5):** **every client endpoint of the specification
-> is IMPLEMENTED** and tested (see the conformance checklist at the end of
-> the client API section), as are all worker endpoints and the controller's
-> membership endpoints, `/healthz`, and `/cluster`. Only `/admin/audit`
-> (Phase 6) and later `/cluster` counters are still contract. Each
+> **Status (end of Phase 6):** **every endpoint is IMPLEMENTED** and tested:
+> all client endpoints of the specification (see the conformance checklist at
+> the end of the client API section), all worker endpoints, the controller's
+> membership endpoints (with real inventory reconciliation), `/healthz`,
+> `/cluster` (workers and storage totals), and `/admin/audit` (v1). Repair
+> counters (Phase 7) and audit I4 (Phase 9) are still to come. Each
 > endpoint lists the phase that implements it; when that phase completes, its
 > section is marked **IMPLEMENTED**. Until then, details may be refined, and
 > any change is recorded in [`DECISIONS.md`](DECISIONS.md). Verified `curl`
@@ -311,7 +312,7 @@ error code, non-empty message); all pass.
 200 `{"status":"ok"}` while the controller is serving. (From Phase 3 it also
 requires the metadata database to be open.) Used by the Compose healthcheck.
 
-### `GET /cluster` — observability · IMPLEMENTED (Phase 2: workers); chunk and repair counters in Phases 6–8
+### `GET /cluster` — observability · IMPLEMENTED (Phase 2: workers; Phase 6: storage); repair counters in Phase 7
 
 200, JSON snapshot (verified example, worker2 stopped):
 
@@ -343,9 +344,58 @@ requires the metadata database to be open.) Used by the Compose healthcheck.
 Workers are sorted by ID. The registry is in memory only, so `workers` is
 empty right after a controller restart until workers re-register (seconds).
 
-### `GET /admin/audit` — invariant audit · *Phase 6 (v1), Phase 9 (v2)*
+**Storage section (Phase 6).** `config.replication_factor` and a `storage`
+object (verified, worker2 stopped, one 5.5 MB object):
 
-Evaluates invariants I1–I7 and returns violations. Schema fixed in Phase 6.
+```json
+"storage":{"chunks":{"total":6,"fully_replicated":2,"under_replicated":4,"zero_effective":0,"over_replicated":0},
+           "objects_by_status":{"READY":1},"replicas_by_state":{"OK":12},"pending_deletes":0}
+```
+
+| Field | Meaning |
+| --- | --- |
+| `chunks.total` | Chunks of `READY` objects |
+| `fully_replicated` | Exactly RF effective replicas (`OK` on an `ALIVE` worker) |
+| `under_replicated` | 1 to RF−1 effective replicas: readable, at risk |
+| `zero_effective` | No effective replica: unreadable (503) until a holder returns |
+| `over_replicated` | More than RF effective replicas (trimmed from Phase 7) |
+| `objects_by_status` | Object rows per status (`UPLOADING`, `READY`, `DELETING`) |
+| `replicas_by_state` | Replica rows per state (`PENDING`, `OK`, `CORRUPT`) |
+| `pending_deletes` | Chunk files queued for deletion (DEC-007) |
+
+Computed on each request from the metadata and the current `ALIVE` set.
+
+### `GET /admin/audit` — invariant audit · IMPLEMENTED (Phase 6, v1); I4 in Phase 9
+
+Checks the correctness invariants against live metadata (architecture
+§3.4, §5.9). Always 200 (500 only if the database fails). Verified example
+(worker2 stopped):
+
+```json
+{"checked_at":"2026-11-09T…","ok":true,"steady_state":false,
+ "checks":[{"id":"I1","description":"a READY object has chunk rows for every index 0..num_chunks-1, without gaps or duplicates","kind":"safety","violations":0,"examples":[]},
+           …,
+           {"id":"I5","description":"every chunk of every READY object has exactly 2 effective replicas (OK on an ALIVE worker)","kind":"steady_state","violations":4,"examples":["fd97…_000000: 1 effective", …]}]}
+```
+
+| Check | Kind | Invariant |
+| --- | --- | --- |
+| I1 | safety | A READY object has chunk rows for every index 0..n−1, no gaps or duplicates |
+| I2 | safety | The sizes of a READY object's chunks sum to its size |
+| I3 | safety | No two replica rows of one chunk on one worker |
+| I7 | safety | The listing contains exactly the READY objects |
+| I8 | safety | No (chunk, worker) has both a replica row and a pending delete |
+| I5 | steady_state | Every chunk of every READY object has exactly RF effective replicas |
+
+`ok` is true when every **safety** invariant holds; these must hold at all
+times, and a false `ok` is a bug (also logged as `audit_violation`).
+`steady_state` reports I5, which the design only promises "in steady state":
+it is expected to be false while a worker is down or until repair (Phase 7)
+has restored the lost copies. `examples` lists up to 10 violations per check.
+Not in the audit: I4 (needs worker inventories, Phase 9) and I6 (checked by
+every download). The checks are independent reads, so a check racing a
+concurrent operation can report a transient I5 change; the safety checks only
+look at READY objects, whose chunk rows never change.
 
 ---
 
@@ -372,8 +422,11 @@ DEC-030), so the inventory is exact.
    path or query; every chunk ID valid; sizes ≥ 0). Body limit 64 MiB.
 2. Mark the worker `SYNCING` under a **new epoch** (DEC-029). A `SYNCING`
    worker is never used for placement, reads, or repair.
-3. Reconcile the inventory against metadata (§4.5 table). *Phase 2: no
-   metadata yet, so this only logs the inventory size; implemented in Phase 6.*
+3. Reconcile the inventory against metadata (§4.5 table, implemented in
+   Phase 6, DEC-051): matching files are left alone; rows whose file is
+   missing are removed; `OK` rows whose file size differs become `CORRUPT`;
+   `PENDING` rows are left to their operation; files no row claims are queued
+   as orphan pending deletes. Logged as `inventory_reconciled` with counts.
 4. Mark it `ALIVE` **only if that epoch is still current and the worker is
    still `SYNCING`.**
 

@@ -6,16 +6,16 @@ original design, with full rationale for decisions D1–D22, is in
 [`reference/Object_Store_Architecture.md`](reference/Object_Store_Architecture.md)
 (called "the design doc" below). Where this implementation differs from or
 clarifies the design doc, the difference is listed in
-[§13 Deviations](#13-deviations-and-clarifications-vs-the-design-doc) with a link
+[§14 Deviations](#14-deviations-and-clarifications-vs-the-design-doc) with a link
 to [`DECISIONS.md`](DECISIONS.md).
 
-> **Current status (end of Phase 5):** implemented: the worker's chunk store
+> **Current status (end of Phase 6):** implemented: the worker's chunk store
 > and chunk API (§3.1); cluster membership with the `SYNCING` protocol (§7);
 > the metadata database, the upload path, and a minimal janitor (§8); the
-> verified download path (§9); metadata, list, and delete, and the `objctl`
-> client (§10). **Every client endpoint of the specification works.** Not yet:
-> inventory reconciliation, the audit, repair, the scrubber, and full
-> janitor/recovery (target design below).
+> verified download path (§9); metadata, list, delete, and `objctl` (§10);
+> inventory reconciliation, `/cluster` storage totals, and audit v1 (§11).
+> **Every client endpoint of the specification works.** Not yet: repair,
+> the scrubber, and full janitor/recovery (target design below).
 
 ---
 
@@ -179,7 +179,7 @@ heartbeat from an unknown or `DEAD` worker is answered with `reregister`.
 - **Delete (Phase 5):** transaction `READY → DELETING` and replicas →
   `pending_deletes` → 204 → janitor issues idempotent DELETEs until confirmed
   → object, chunk rows removed.
-- **Register / resync (Phases 2, 6):** worker cleans temp files, snapshots
+- **Register / resync (Phases 2, 6, implemented):** worker cleans temp files, snapshots
   its inventory while writes are gated, registers; controller assigns an epoch,
   marks `SYNCING`, reconciles (§4.5 table) in short DB transactions, marks
   `ALIVE` if the epoch is still current.
@@ -431,7 +431,44 @@ identical and one `corruption_detected` log line.
 **Client:** `objctl` (DEC-049) and the Compose `client` service (`tools`
 profile).
 
-## 11. Failure handling (summary)
+## 11. Degraded operation and resync (implemented, Phase 6)
+
+**Inventory reconciliation** (`meta.ReconcileInventory`, wrapped by
+`internal/controller/resync`) is the `InventoryReconciler` of every
+registration. It runs while the worker is `SYNCING`; rules and mechanics in
+DEC-051:
+
+| Situation on registration | Result |
+| --- | --- |
+| File present, `OK` row, size matches | Nothing |
+| `OK`/`CORRUPT` row, file missing (wiped volume, deleted file) | Row removed; chunk under-replicated |
+| `OK` row, file size differs (bytes appended or truncated while down) | Row `CORRUPT` |
+| `CORRUPT` row, file present | Nothing (repaired in Phase 7–8) |
+| `PENDING` row | Nothing (owned by an operation in progress) |
+| File present, no row (deleted object, aborted upload, unknown object) | Orphan → pending delete → janitor deletes it |
+
+**Degraded operation.** Placement uses only `ALIVE` workers (§8), reads use
+only effective replicas (§9), and the `SYNCING` state keeps a returning
+worker out of both until reconciliation has finished (tested with
+reconciliation held open: no GET and no PUT reached the worker).
+
+**Observability.** `/cluster` has a `storage` section (DEC-052):
+fully/under/over-replicated and zero-effective chunk counts, objects by
+status, replicas by state, pending deletes. `GET /admin/audit` reports the
+invariants (DEC-053).
+
+**Measured** (Compose, default timings, one 5.5 MB object, worker2 holding 4
+of 12 replicas):
+
+| Step | `/cluster` chunks | Audit |
+| --- | --- | --- |
+| Healthy | 6 fully | ok, steady |
+| worker2 stopped (DEAD) | 2 fully, 4 under-replicated; download identical | ok, not steady (I5: 4) |
+| worker2 started (within grace) | 6 fully, no pending deletes; reconciliation `matched 4` | ok, steady |
+| 7 bytes appended to one worker2 chunk, worker2 restarted | 5 fully, 1 under; reconciliation `size_mismatch_corrupt 1` | ok, not steady (I5: 1) |
+| Volume wiped, worker restarted (e2e test) | missing rows removed; under-replicated = lost copies | ok, not steady |
+
+## 12. Failure handling (summary)
 
 See the design doc §5.2 (failure model) and §7 (failure scenario matrix).
 Implemented so far: worker stop/start and controller restart for membership
@@ -442,14 +479,14 @@ chunk (`TestWorkerKilledMidWriteLeavesNoPartialChunk`, e2e). Data-path
 scenarios are implemented in Phases 4–9 and will be listed here with their
 tests.
 
-## 12. Trade-offs and limitations
+## 13. Trade-offs and limitations
 
 Inherited from the design doc §8: single controller (SPOF); controller in the
 data path (throughput ceiling); synchronous 2-way replication (write latency;
 needs ≥ 2 workers); RF = 2 (one failure at a time); immutable objects; repair
 grace period (longer vulnerability window); single-file metadata DB.
 
-## 13. Deviations and clarifications vs. the design doc
+## 14. Deviations and clarifications vs. the design doc
 
 | Topic | Design doc | Implementation | Decision |
 | --- | --- | --- | --- |
@@ -466,3 +503,5 @@ grace period (longer vulnerability window); single-file metadata DB.
 | Missing chunk file on read | "Unreachable → try other replica" | Treated as `CORRUPT` (repairable in place) | DEC-040 |
 | 409 | "If adopted" (§9.4) | Adopted: optional `If-Match` on PATCH | DEC-014 |
 | Janitor for client deletes | Phase 5 scope | Built in Phase 3 (needed for aborts), reused | DEC-037, DEC-048 |
+| Audit result | Pass/fail on I1–I5 | `ok` = safety invariants (I1, I2, I3, I7, I8); I5 reported as `steady_state` | DEC-053 |
+| Missing file on registration vs. on read | §4.5: remove the row | Registration removes the row; a read marks it `CORRUPT` (both non-effective, both repaired in Phase 7) | DEC-040, DEC-051 |

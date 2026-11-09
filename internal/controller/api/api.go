@@ -58,8 +58,11 @@ type Config struct {
 	HeartbeatInterval time.Duration
 	DeadAfter         time.Duration
 	RepairGrace       time.Duration
-	// Meta, if set, is pinged by /healthz.
+	// Meta, if set, is pinged by /healthz, and enables the object API,
+	// /cluster storage totals, and /admin/audit.
 	Meta *meta.Store
+	// ReplicationFactor is used for /cluster totals and the audit.
+	ReplicationFactor int
 	// Uploader, if set, serves POST /api/v1/objects.
 	Uploader *upload.Coordinator
 	// Downloader, if set, serves GET/HEAD /api/v1/objects/{object_id}.
@@ -105,6 +108,9 @@ func (s *Server) Handler() http.Handler {
 	mux.HandleFunc("POST /internal/workers/heartbeat", s.heartbeat)
 	mux.HandleFunc("GET /healthz", s.healthz)
 	mux.HandleFunc("GET /cluster", s.cluster)
+	if s.cfg.Meta != nil {
+		mux.HandleFunc("GET /admin/audit", s.audit)
+	}
 	if s.cfg.Uploader != nil {
 		mux.HandleFunc("POST /api/v1/objects", s.uploadObject)
 	}
@@ -298,8 +304,50 @@ func objectInfo(o meta.Object) wire.ObjectInfo {
 	}
 }
 
-func (s *Server) cluster(w http.ResponseWriter, _ *http.Request) {
-	httpx.WriteJSON(w, http.StatusOK, s.ClusterView())
+func (s *Server) cluster(w http.ResponseWriter, r *http.Request) {
+	v := s.ClusterView()
+	if s.cfg.Meta != nil {
+		h, err := s.cfg.Meta.ChunkHealth(r.Context(), s.aliveIDs(), s.cfg.ReplicationFactor)
+		if err != nil {
+			s.log.Error("cluster_storage_failed", "error", err)
+			httpx.WriteError(w, http.StatusInternalServerError, wire.CodeInternal, "internal error")
+			return
+		}
+		v.Config.ReplicationFactor = s.cfg.ReplicationFactor
+		v.Storage = &wire.StorageView{
+			Chunks: wire.ChunkTotals{Total: h.Total, FullyReplicated: h.FullyReplicated,
+				UnderReplicated: h.UnderReplicated, ZeroEffective: h.ZeroEffective, OverReplicated: h.OverReplicated},
+			ObjectsByStatus: h.ObjectsByStatus,
+			ReplicasByState: h.ReplicasByState,
+			PendingDeletes:  h.PendingDeletes,
+		}
+	}
+	httpx.WriteJSON(w, http.StatusOK, v)
+}
+
+func (s *Server) aliveIDs() []string {
+	alive := s.reg.Alive()
+	ids := make([]string, len(alive))
+	for i, w := range alive {
+		ids[i] = w.ID
+	}
+	return ids
+}
+
+// audit implements GET /admin/audit (architecture §5.9): invariants checked
+// against live metadata. Always 200; "ok" reports the safety invariants,
+// "steady_state" reports I5.
+func (s *Server) audit(w http.ResponseWriter, r *http.Request) {
+	rep, err := s.cfg.Meta.Audit(r.Context(), s.aliveIDs(), s.cfg.ReplicationFactor)
+	if err != nil {
+		s.log.Error("audit_failed", "error", err)
+		httpx.WriteError(w, http.StatusInternalServerError, wire.CodeInternal, "internal error")
+		return
+	}
+	if !rep.OK {
+		s.log.Error("audit_violation", "checks", rep.Checks)
+	}
+	httpx.WriteJSON(w, http.StatusOK, rep)
 }
 
 // ClusterView builds the /cluster snapshot.
