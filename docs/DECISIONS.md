@@ -56,6 +56,12 @@ explicit owner confirmation; may change) · `SUPERSEDED by DEC-nnn`.
 | DEC-042 | Whole-object checksum verified before the last chunk is sent | ACCEPTED | 4 |
 | DEC-043 | Sequential download, one chunk in memory, `MAX_CONCURRENT_DOWNLOADS`, `HEAD` without fetching | ACCEPTED | 4 |
 | DEC-044 | Client error messages never name workers | ACCEPTED | 4 |
+| DEC-045 | PATCH body parsed as JSON regardless of `Content-Type` | ACCEPTED | 5 |
+| DEC-046 | Metadata update: one read-merge-write transaction, idempotent no-op, limits on the merged result | ACCEPTED | 5 |
+| DEC-047 | List: keyset cursor over (`created_at`, `object_id`), opaque base64url JSON | ACCEPTED | 5 |
+| DEC-048 | Client delete reuses the abort path; 404 for anything not `READY` | ACCEPTED | 5 |
+| DEC-049 | `objctl` client with local verification; optional Compose `client` service | ACCEPTED | 5 |
+| DEC-050 | Metadata reads re-check status instead of a read transaction | ACCEPTED | 5 |
 
 ---
 
@@ -757,3 +763,84 @@ explicit owner confirmation; may change) · `SUPERSEDED by DEC-nnn`.
   `replica_write_failed`). 400 messages keep their detail because they describe
   the client's own request. Tested by `TestErrorsDoNotRevealWorkers` and in
   `TestUploadFailsWhenWorkersRunOut`.
+
+## DEC-045 — PATCH body parsed as JSON regardless of `Content-Type`
+
+- **Context.** The first implementation required `application/json` or
+  `application/merge-patch+json`. The Phase 5 walkthrough showed that the
+  most natural call, `curl -X PATCH -d '{...}'`, sends
+  `application/x-www-form-urlencoded` and was rejected with 400.
+- **Choice.** `Content-Type` is not checked; the body must be a JSON object
+  whose values are strings or null.
+- **Why.** The strict body validation is what protects the data; the header
+  check added friction and no safety.
+
+## DEC-046 — Metadata update semantics
+
+- **Choice.** `meta.UpdateMetadata` runs read → merge (`custommeta.Merge`) →
+  validate → write in one `BEGIN IMMEDIATE` transaction; the merge function is
+  pure (no I/O inside the transaction). Limits are checked on the merged
+  result, so a PATCH cannot sneak past the 50-key limit. If the merged map
+  equals the current one, nothing is written: `metadata_version` and
+  `modified_at` stay, which makes PATCH retries idempotent. `If-Match` is
+  compared inside the same transaction. Only `READY` objects can be updated.
+- **Consequences.** PATCHes on one object are serialised by SQLite's write
+  lock (fine at this scale). Tests: `TestUpdateMetadata`,
+  `TestConcurrentMetadataUpdatesAreNotLost`, `TestConcurrentPatchesAreNotLost`.
+
+## DEC-047 — List: keyset cursor
+
+- **Choice.** `ORDER BY created_at, object_id` over `READY` objects with the
+  partial index `objects_ready_by_created`; the next page continues
+  `WHERE (created_at, object_id) > (cursor)`; the query fetches `limit + 1`
+  rows to know whether a next page exists. The cursor is base64url (no
+  padding) of `{"t": <created_at ns>, "id": "<object_id>"}`; clients must
+  treat it as opaque. A cursor that does not decode, has a negative time, or a
+  malformed ID is `400 INVALID_PAGINATION`.
+- **Why.** Offset pagination shifts under concurrent inserts and deletes;
+  keyset pagination does not and stays an index range scan.
+- **Consequences.** `created_at` is the upload *start* time (spec field
+  "creation time"), so an object that commits during a listing with a start
+  time before the cursor is not seen in that pass. Documented in `API.md`.
+  Tests: `TestListObjectsKeyset` (including equal timestamps),
+  `TestListPagination`, `TestListStableUnderConcurrentUploads`.
+
+## DEC-048 — Client delete reuses the abort path
+
+- **Choice.** `DELETE` calls `MarkDeleting(READY → DELETING)` (the same
+  transaction an aborted upload uses from `UPLOADING`, DEC-035), returns 204,
+  and kicks the janitor (`api.Config.OnDelete`). If the object is not `READY`
+  (unknown, still uploading, already deleting) the response is 404: none of
+  those exist for clients (I7).
+- **Consequences.** One cleanup mechanism for aborts and deletes (§4.4 "abort
+  = delete"). A `DELETING` object stays in the database (invisible) until
+  every worker that held a copy has confirmed the delete; tested with a
+  worker down (`TestDeleteWithWorkerDown`, `TestComposeObjectAPI`).
+
+## DEC-049 — `objctl` client and Compose `client` service
+
+- **Choice.** `cmd/objctl` (standard library only): `upload` (streams a
+  multipart body from disk, `-meta k=v`, `-type`, `-name`), `download`
+  (writes to a temp file and renames only after checking the byte count
+  against `Content-Length` and the SHA-256 against
+  `X-Object-Checksum-SHA256`: layer 4 of §3.6), `stat`, `patch` (`k=v`, `k=`
+  removes, `-if-match`), `list` (`-limit`, `-all`), `delete`, `cluster`.
+  Server from `-server` or `OBJSTORE_URL`. Exit 0 / 1 (request failed) /
+  2 (usage). The Compose file has a `client` service in the `tools` profile
+  (not started by `up`) with `OBJSTORE_URL=http://controller:8080`, run as
+  `docker compose --profile tools run --rm client <command>`.
+- **Why.** The spec deploys "1 or more clients"; the design doc §6.1 lists an
+  optional client container.
+
+## DEC-050 — Metadata reads re-check status instead of a read transaction
+
+- **Context.** GET metadata reads the object row and then its chunk map. A
+  concurrent DELETE in between would otherwise produce a `READY` object with
+  no replicas.
+- **Choice.** Read the object, read the chunk map, then re-read the status;
+  if it is no longer `READY`, answer 404. An object never returns to `READY`,
+  so this is sufficient. Replica states may change between rows (e.g. a
+  concurrent read marking one `CORRUPT`); each row is individually consistent.
+- **Why not a read transaction.** With `_txlock=immediate` every transaction
+  takes the write lock; holding it while reading a large chunk map would
+  block writers for no benefit.

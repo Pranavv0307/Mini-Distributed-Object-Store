@@ -6,14 +6,16 @@ original design, with full rationale for decisions D1–D22, is in
 [`reference/Object_Store_Architecture.md`](reference/Object_Store_Architecture.md)
 (called "the design doc" below). Where this implementation differs from or
 clarifies the design doc, the difference is listed in
-[§12 Deviations](#12-deviations-and-clarifications-vs-the-design-doc) with a link
+[§13 Deviations](#13-deviations-and-clarifications-vs-the-design-doc) with a link
 to [`DECISIONS.md`](DECISIONS.md).
 
-> **Current status (end of Phase 4):** implemented: the worker's chunk store
+> **Current status (end of Phase 5):** implemented: the worker's chunk store
 > and chunk API (§3.1); cluster membership with the `SYNCING` protocol (§7);
 > the metadata database, the upload path, and a minimal janitor (§8); the
-> verified download path (§9). Not yet: metadata/list/delete API, inventory
-> reconciliation, repair, and the full janitor/recovery (target design below).
+> verified download path (§9); metadata, list, and delete, and the `objctl`
+> client (§10). **Every client endpoint of the specification works.** Not yet:
+> inventory reconciliation, the audit, repair, the scrubber, and full
+> janitor/recovery (target design below).
 
 ---
 
@@ -54,10 +56,10 @@ observed state reconciled in loops; trust nothing you didn't verify.
 | Controller | Worker client | The only code calling workers: timeouts, checksum headers | `internal/controller/workerclient` | **Implemented (Phase 3)** |
 | Controller | Upload / download coordinators | Streaming write and read paths | `internal/controller/upload`, `.../download` | **Implemented (Phases 3, 4)** |
 | Controller | Reconciler | Level-triggered repair of under-replicated/corrupt chunks | `internal/controller/reconciler` | Phase 7 |
-| Controller | Janitor | `pending_deletes` drain and purge of `DELETING` objects (Phase 3, implemented); stale uploads, orphan sweep (Phase 9) | `internal/controller/janitor` | Partly (Phase 3) |
+| Controller | Janitor | `pending_deletes` drain and purge of `DELETING` objects for aborted uploads and client deletes (Phases 3, 5, implemented); stale uploads, orphan sweep (Phase 9) | `internal/controller/janitor` | Partly |
 | Controller | Recovery | Startup recovery pass, reconciler warm-up | `internal/controller/recovery` | Phase 9 |
 | Controller | Observability | `/healthz`, `/cluster`, audit, structured event log | `internal/controller/api`, `.../audit` | `/healthz`, `/cluster` (workers), event log: implemented; audit Phases 6, 9 |
-| Client | `objctl` | CLI for the REST API; demos and benchmarks | `cmd/objctl` | Phase 5 |
+| Client | `objctl` | CLI for the REST API with local download verification; Compose `client` service | `cmd/objctl` | **Implemented (Phase 5)** |
 
 Shared packages (implemented in Phase 1): `internal/ids` (object/chunk/worker
 ID generation and validation, DEC-028), `internal/config` (environment
@@ -401,7 +403,35 @@ Measured (Compose, 3.5 MB): download identical to upload; with a holder
 stopped, identical; after appending bytes to one copy, 6 of 6 downloads
 identical and one `corruption_detected` log line.
 
-## 10. Failure handling (summary)
+## 10. Metadata, list, and delete (implemented, Phase 5)
+
+`internal/controller/api/objects.go`, backed by `meta`:
+
+- **GET metadata:** object row + chunk map, then a status re-check (DEC-050);
+  `ETag: "v<metadata_version>"`. No worker is contacted.
+- **PATCH metadata:** `custommeta.ParsePatch` (strings or null) →
+  `meta.UpdateMetadata` with `custommeta.Merge` inside one transaction
+  (DEC-046); optional `If-Match` → 409; no-op merges write nothing. Chunks
+  and replicas are never touched (asserted by comparing the chunk map before
+  and after).
+- **List:** keyset pagination over `READY` objects (DEC-047).
+- **DELETE:** `MarkDeleting(READY → DELETING)` + replicas → pending deletes in
+  one transaction, 204, janitor kick (DEC-048). The janitor deletes on `ALIVE`
+  workers, retries the rest when they return, and purges the rows when
+  nothing is left.
+
+| Race | Behaviour (tested) |
+| --- | --- |
+| Concurrent PATCHes on one object | Serialised; none lost |
+| PATCH vs DELETE | First to commit wins; the other gets 404 |
+| DELETE during a streaming download | Download returns a correct prefix, then is cut |
+| Listing while uploads commit | No duplicates; pre-existing objects all listed once |
+| DELETE with a holder down | 204 at once; live holders cleaned; the down holder cleaned on return; rows purged then |
+
+**Client:** `objctl` (DEC-049) and the Compose `client` service (`tools`
+profile).
+
+## 11. Failure handling (summary)
 
 See the design doc §5.2 (failure model) and §7 (failure scenario matrix).
 Implemented so far: worker stop/start and controller restart for membership
@@ -412,14 +442,14 @@ chunk (`TestWorkerKilledMidWriteLeavesNoPartialChunk`, e2e). Data-path
 scenarios are implemented in Phases 4–9 and will be listed here with their
 tests.
 
-## 11. Trade-offs and limitations
+## 12. Trade-offs and limitations
 
 Inherited from the design doc §8: single controller (SPOF); controller in the
 data path (throughput ceiling); synchronous 2-way replication (write latency;
 needs ≥ 2 workers); RF = 2 (one failure at a time); immutable objects; repair
 grace period (longer vulnerability window); single-file metadata DB.
 
-## 12. Deviations and clarifications vs. the design doc
+## 13. Deviations and clarifications vs. the design doc
 
 | Topic | Design doc | Implementation | Decision |
 | --- | --- | --- | --- |
@@ -434,3 +464,5 @@ grace period (longer vulnerability window); single-file metadata DB.
 | Download header timing | Headers right after pre-flight (§4.2 step 4) | Chunk 0 fetched and verified first; flush per chunk | DEC-041 |
 | Object checksum on read | Client-side, optional (§3.6 layer 4) | Also checked by the controller before the last chunk is sent | DEC-042 |
 | Missing chunk file on read | "Unreachable → try other replica" | Treated as `CORRUPT` (repairable in place) | DEC-040 |
+| 409 | "If adopted" (§9.4) | Adopted: optional `If-Match` on PATCH | DEC-014 |
+| Janitor for client deletes | Phase 5 scope | Built in Phase 3 (needed for aborts), reused | DEC-037, DEC-048 |

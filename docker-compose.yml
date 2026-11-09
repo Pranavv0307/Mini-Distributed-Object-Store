@@ -119,6 +119,19 @@ services:
     volumes:
       - worker4-data:/data
 
+  # Optional client container (spec: "1 or more clients"). Not started by
+  # `up`; run commands with:
+  #   docker compose run --rm client list
+  #   docker compose run --rm -v "$PWD:/work" client upload /work/file.bin
+  client:
+    image: ${OBJSTORE_IMAGE:-objstore:dev}
+    profiles: ["tools"]
+    entrypoint: ["objctl"]
+    environment:
+      OBJSTORE_URL: http://controller:8080
+    working_dir: /tmp
+    restart: "no"
+
 volumes:
   controller-data:
   worker1-data:

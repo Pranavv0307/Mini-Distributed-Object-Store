@@ -278,8 +278,15 @@ func (c *Coordinator) markCorrupt(ctx context.Context, objectID string, ch meta.
 		c.log.Error("mark_corrupt_failed", "object_id", objectID, "chunk_id", ch.ID, "worker_id", workerID, "error", err)
 		return
 	}
+	if !changed {
+		// The row is no longer OK: already marked by a concurrent read, or the
+		// object was deleted while this download was streaming (§5.6).
+		c.log.Debug("replica_bad_already_handled", "object_id", objectID, "chunk_id", ch.ID,
+			"worker_id", workerID, "reason", reason)
+		return
+	}
 	c.log.Warn("corruption_detected", "object_id", objectID, "chunk_id", ch.ID, "chunk_index", ch.Idx,
-		"worker_id", workerID, "reason", reason, "detected_by", "read", "marked_corrupt", changed)
+		"worker_id", workerID, "reason", reason, "detected_by", "read", "marked_corrupt", true)
 }
 
 // abort ends a response whose headers were already sent: the client sees a

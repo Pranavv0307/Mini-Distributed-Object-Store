@@ -6,12 +6,12 @@ a single controller keeps the metadata, detects failed workers, and repairs
 lost or corrupted data automatically. The whole system runs on one machine
 with Docker Compose.
 
-> **Implementation status: Phase 4 of 11 complete.** The cluster (1
-> controller + 4 workers) runs under Docker Compose. Objects can be
-> **uploaded** (1 MB chunks, each on two different workers, atomic commit) and
-> **downloaded** (every chunk verified, failing over to the other copy; corrupt
-> data is never returned). Metadata, list, and delete come next. See
-> [Current status](#current-status).
+> **Implementation status: Phase 5 of 11 complete.** The cluster (1
+> controller + 4 workers) runs under Docker Compose and **every client API
+> endpoint of the specification works**: upload (1 MB chunks, two copies on
+> different workers, atomic commit), verified download with replica fallback,
+> metadata GET/PATCH, list, and delete, plus the `objctl` client. Self-healing
+> and crash recovery come next. See [Current status](#current-status).
 
 ## The problem
 
@@ -76,7 +76,7 @@ Reasons for each choice: [`docs/DECISIONS.md`](docs/DECISIONS.md).
 cmd/
   controller/        controller binary
   worker/            worker binary (+ `worker inspect` debug tool)
-  objctl/            client CLI (stub)
+  objctl/            client CLI (upload, download, stat, patch, list, delete, cluster)
 internal/
   ids/               object/chunk/worker ID generation and validation
   config/            environment-variable configuration
@@ -136,6 +136,10 @@ head -c 5500000 /dev/urandom > big.bin
 curl -s -F 'metadata={"owner":"alice"}' -F 'file=@big.bin' localhost:8080/api/v1/objects
                                       # 201: 6 chunks, each on 2 workers
 curl -s -o got.bin localhost:8080/api/v1/objects/<object_id> && cmp big.bin got.bin
+curl -s localhost:8080/api/v1/objects/<object_id>/metadata   # chunk map: which workers hold each chunk
+curl -s -X PATCH -d '{"owner":"bob"}' localhost:8080/api/v1/objects/<object_id>/metadata
+curl -s 'localhost:8080/api/v1/objects?limit=10'
+curl -s -X DELETE localhost:8080/api/v1/objects/<object_id>
 docker stop worker2                   # ~10 s later: worker2 DEAD
 docker start worker2                  # ALIVE again (re-registered)
 docker compose down                   # stop; data volumes are kept (-v deletes them)
@@ -175,8 +179,9 @@ implemented.
 | 1 | Worker: durable chunk store over HTTP, in Docker | COMPLETED |
 | 2 | Membership, failure detection, `SYNCING`, Compose cluster | COMPLETED |
 | 3 | Write path: metadata DB, chunking, replication, atomic commit | COMPLETED |
-| 4 | Read path: verified, in-order download with replica fallback | COMPLETED (awaiting review) |
-| 5–11 | See [implementation plan](docs/IMPLEMENTATION_PLAN.md) | NOT STARTED |
+| 4 | Read path: verified, in-order download with replica fallback | COMPLETED |
+| 5 | Complete client API: metadata, PATCH, list, delete; `objctl` | COMPLETED (awaiting review) |
+| 6–11 | See [implementation plan](docs/IMPLEMENTATION_PLAN.md) | NOT STARTED |
 
 Open item awaiting owner confirmation: string-only custom metadata values
 (DEC-013). The chunk size is confirmed as 1 MB = 1,000,000 bytes (DEC-005).

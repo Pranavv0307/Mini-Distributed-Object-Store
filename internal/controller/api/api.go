@@ -64,6 +64,8 @@ type Config struct {
 	Uploader *upload.Coordinator
 	// Downloader, if set, serves GET/HEAD /api/v1/objects/{object_id}.
 	Downloader *download.Coordinator
+	// OnDelete, if set, is called after a client delete (kicks the janitor).
+	OnDelete func()
 	// MaxConcurrentDownloads bounds simultaneous downloads
 	// (MAX_CONCURRENT_DOWNLOADS); each holds at most one chunk in memory.
 	MaxConcurrentDownloads int
@@ -106,6 +108,7 @@ func (s *Server) Handler() http.Handler {
 	if s.cfg.Uploader != nil {
 		mux.HandleFunc("POST /api/v1/objects", s.uploadObject)
 	}
+	s.objectRoutes(mux)
 	if s.cfg.Downloader != nil {
 		// "GET" patterns also match HEAD.
 		mux.HandleFunc("GET /api/v1/objects/{object_id}", s.downloadObject)

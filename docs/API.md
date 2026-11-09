@@ -1,10 +1,10 @@
 # API Reference
 
-> **Status (end of Phase 4):** **IMPLEMENTED** and tested: all worker
-> endpoints (Phase 1); the controller's membership endpoints, `/healthz`, and
-> `/cluster` (Phase 2); `POST /api/v1/objects` (Phase 3);
-> **`GET`/`HEAD /api/v1/objects/{object_id}`** (Phase 4). Everything else is
-> the **API contract** for later phases. Each
+> **Status (end of Phase 5):** **every client endpoint of the specification
+> is IMPLEMENTED** and tested (see the conformance checklist at the end of
+> the client API section), as are all worker endpoints and the controller's
+> membership endpoints, `/healthz`, and `/cluster`. Only `/admin/audit`
+> (Phase 6) and later `/cluster` counters are still contract. Each
 > endpoint lists the phase that implements it; when that phase completes, its
 > section is marked **IMPLEMENTED**. Until then, details may be refined, and
 > any change is recorded in [`DECISIONS.md`](DECISIONS.md). Verified `curl`
@@ -178,79 +178,133 @@ the controller log has the details.
 - A delete racing with a streaming download (Phase 5) may cut the stream
   (architecture §5.6).
 
-### `GET /api/v1/objects/{object_id}/metadata` — metadata · *Phase 5*
+### `GET /api/v1/objects/{object_id}/metadata` — metadata · IMPLEMENTED (Phase 5)
 
-**Response 200** with `ETag: "v<metadata_version>"`: the upload response fields
-plus the chunk map:
-
-```json
-{
-  "object_id": "...", "name": "...", "size": 5767168, "content_type": "...",
-  "checksum_sha256": "...", "num_chunks": 6,
-  "created_at": "...", "modified_at": "...", "metadata_version": 1,
-  "custom_metadata": { "owner": "alice" },
-  "chunks": [
-    { "index": 0, "chunk_id": "3f2b...a6b_000000", "size": 1000000,
-      "checksum_sha256": "...",
-      "replicas": [ { "worker_id": "worker1", "state": "OK" },
-                    { "worker_id": "worker3", "state": "OK" } ] }
-  ]
-}
-```
-
-Replica `state` is one of `PENDING`, `OK`, `CORRUPT`. Worker liveness is not
-included here (see `/cluster`). **Errors:** 400 `INVALID_OBJECT_ID`; 404.
-
-### `PATCH /api/v1/objects/{object_id}/metadata` — update custom metadata · *Phase 5*
-
-**Request:** `application/json` object. A string value adds or updates a key;
-`null` removes a key; keys not mentioned are unchanged (DEC-014). Optional
-header `If-Match: "v<metadata_version>"`.
+**Response 200** with `ETag: "v<metadata_version>"`: every field of the
+upload response plus the chunk map (verified example, abbreviated):
 
 ```json
-{ "owner": "bob", "obsolete-key": null }
+{"object_id":"7f129833-eb06-4ffe-9cc1-87b7e53f9778","name":"obj.bin","size":2500000,
+ "content_type":"application/octet-stream","checksum_sha256":"be435f21…","num_chunks":3,
+ "created_at":"2026-11-09T11:42:31.380947647Z","modified_at":"2026-11-09T11:42:31.420749821Z",
+ "metadata_version":1,"custom_metadata":{"owner":"alice"},
+ "chunks":[{"index":0,"chunk_id":"7f129833-…_000000","size":1000000,"checksum_sha256":"fa7990ff…",
+            "replicas":[{"worker_id":"worker1","state":"OK"},{"worker_id":"worker2","state":"OK"}]}, …]}
 ```
 
-**Response 200:** same body as GET metadata (new `metadata_version`,
-`modified_at` updated).
+`chunks` is ordered by `index`; `replicas` by `worker_id`, with `state`
+`PENDING`, `OK`, or `CORRUPT`. Showing replica locations is required by the
+specification (§3 "chunk information and storage locations"; the replication
+demonstration). Only worker IDs are shown, never addresses.
 
-**Errors:** 400 `INVALID_REQUEST` (not a JSON object) / `INVALID_METADATA`
-(non-string, non-null value) / `METADATA_LIMIT_EXCEEDED` (limits checked on the
-merged result); 404; 409 `VERSION_CONFLICT`.
+**Errors:** 400 `INVALID_OBJECT_ID`; 404 `OBJECT_NOT_FOUND` (unknown,
+`UPLOADING`, or `DELETING`, including an object deleted while the chunk map
+was being read, DEC-050).
 
-**Guarantees.** Single DB transaction; never touches chunks, replicas, or
-workers. PATCH racing DELETE: whichever commits first wins; the loser gets 404.
+### `PATCH /api/v1/objects/{object_id}/metadata` — update custom metadata · IMPLEMENTED (Phase 5)
 
-### `DELETE /api/v1/objects/{object_id}` — delete · *Phase 5*
+**Request:** a JSON object. A string value adds or updates that key; `null`
+removes it; keys not mentioned are unchanged (JSON merge semantics on a flat
+map, DEC-014). The body is parsed as JSON whatever `Content-Type` says, so
+plain `curl -X PATCH -d '{...}'` works (DEC-045). Optional
+`If-Match: "v<n>"` (or `*`).
 
-**Response 204**, empty body. **Errors:** 400 `INVALID_OBJECT_ID`; 404.
+```bash
+curl -s -X PATCH -d '{"owner":"bob","project":"demo"}' localhost:8080/api/v1/objects/$ID/metadata
+curl -s -X PATCH -d '{"project":null}' localhost:8080/api/v1/objects/$ID/metadata
+curl -s -X PATCH -H 'If-Match: "v3"' -d '{"x":"y"}' localhost:8080/api/v1/objects/$ID/metadata
+```
 
-**Guarantees.** The object disappears for all clients atomically (status
-`READY → DELETING`) before 204 is returned. Physical removal of chunk files
-happens afterwards and is retried until it completes, including on workers
-that are down at delete time (D18, DEC-007). A download already streaming may be
-aborted mid-stream (architecture §5.6).
+**Response 200:** the same body as GET metadata, with the new
+`metadata_version` (also as `ETag`) and `modified_at`.
 
-### `GET /api/v1/objects` — list · *Phase 5*
+**Errors:**
 
-**Query:** `limit` (1–1000, default 100); `cursor` (opaque string from a
-previous response).
+| Status | Code | When |
+| --- | --- | --- |
+| 400 | `INVALID_OBJECT_ID` | Malformed ID |
+| 400 | `INVALID_REQUEST` | Malformed `If-Match` (must be `"v<n>"` or `*`) |
+| 400 | `INVALID_METADATA` | Body not a JSON object, or a value that is not a string or null, or an empty key |
+| 400 | `METADATA_LIMIT_EXCEEDED` | The **merged** result exceeds the limits (50 keys, key ≤ 128 B, value ≤ 1 KiB), or the body > 64 KiB |
+| 404 | `OBJECT_NOT_FOUND` | Unknown, `UPLOADING`, or `DELETING` |
+| 409 | `VERSION_CONFLICT` | `If-Match` version ≠ current version, e.g. `"metadata version conflict: current version 3, expected 1"` |
 
-**Response 200:**
+**Guarantees (DEC-046).** One transaction reads, merges, validates, and
+writes, so concurrent PATCHes are serialised and none is lost (20 concurrent
+PATCHes → 20 keys, version 21). A PATCH whose result equals the current
+metadata changes nothing (same version, same `modified_at`), so retries are
+idempotent. Chunks, replicas, size, and checksum are never touched. PATCH
+racing DELETE: whichever commits first wins; the loser gets 404.
+
+### `DELETE /api/v1/objects/{object_id}` — delete · IMPLEMENTED (Phase 5)
+
+**Response 204**, empty body. **Errors:** 400 `INVALID_OBJECT_ID`; 404
+`OBJECT_NOT_FOUND` (unknown, still uploading, or already deleted).
+
+**Guarantees (D18, DEC-048).** Before 204 is returned, one transaction moves
+the object `READY → DELETING` and turns every replica into a pending delete:
+from that moment GET, HEAD, metadata, PATCH, list, and a second DELETE all
+see 404. The janitor then deletes the chunk files (immediately, then every
+`JANITOR_INTERVAL`), retrying with backoff, and removes the object's rows when
+every copy is confirmed gone (log `object_purged`). Files on a worker that is
+down are removed when it is `ALIVE` again. A download already streaming may be
+cut off (§5.6): it returns a correct prefix, never wrong bytes.
+
+### `GET /api/v1/objects` — list · IMPLEMENTED (Phase 5)
+
+**Query:** `limit` (1–1000, default 100); `cursor` (opaque, from the
+previous page's `next_cursor`). Other parameters are ignored.
+
+**Response 200** (verified):
 
 ```json
-{
-  "objects": [
-    { "object_id": "...", "name": "...", "size": 123, "content_type": "...",
-      "checksum_sha256": "...", "created_at": "...", "modified_at": "..." }
-  ],
-  "next_cursor": "eyJ0IjoiMjAyNi0..."
-}
+{"objects":[{"object_id":"7f129833-…","name":"obj.bin","size":2500000,
+             "content_type":"application/octet-stream","checksum_sha256":"be435f21…",
+             "num_chunks":3,"created_at":"…","modified_at":"…"}, …],
+ "next_cursor":"eyJ0IjoxNzk0MjI0NTUzMDgzNjA3NTQ0LCJpZCI6ImY4ZjIwMzZkLTJhNjItNGZhMC05MjFjLTBhZTYxZDYxYmI3OSJ9"}
 ```
 
-`next_cursor` is `null` on the last page. Ordering: `created_at`, then
-`object_id` (keyset pagination; stable under concurrent inserts).
-**Errors:** 400 `INVALID_PAGINATION`.
+`next_cursor` is `null` on the last page. Only `READY` objects are listed
+(I7). Ordering: `created_at`, then `object_id`.
+
+**Errors:** 400 `INVALID_PAGINATION` (`limit` not an integer in [1, 1000],
+or a cursor that is not one this server issued).
+
+**Guarantees (DEC-047).** Keyset pagination: no object is listed twice and
+no object that exists for the whole listing is skipped, even while uploads
+and deletes happen between pages. `created_at` is when the upload *started*,
+so an object committed during a listing with a `created_at` before the
+cursor is not included in that pass (it appears in the next listing).
+
+### Conformance checklist (spec §5 and §5.7)
+
+Every row is asserted by `TestSpecConformance` (status, JSON content type,
+error code, non-empty message); all pass.
+
+| Request | Expected | Code |
+| --- | --- | --- |
+| `POST /api/v1/objects` (file + metadata) | 201 | — |
+| `POST` without a `file` part | 400 | `MISSING_FILE` |
+| `POST` not multipart | 400 | `INVALID_REQUEST` |
+| `POST` with fewer than 2 `ALIVE` workers | 503 | `INSUFFICIENT_WORKERS` |
+| `GET /api/v1/objects/{id}` | 200 | — |
+| `GET` unknown ID | 404 | `OBJECT_NOT_FOUND` |
+| `GET` malformed ID | 400 | `INVALID_OBJECT_ID` |
+| `GET` when a chunk has no valid copy | 503 | `STORAGE_UNAVAILABLE` |
+| `GET /api/v1/objects/{id}/metadata` | 200 | — |
+| `GET .../metadata` unknown ID | 404 | `OBJECT_NOT_FOUND` |
+| `PATCH .../metadata` | 200 | — |
+| `PATCH` unknown ID | 404 | `OBJECT_NOT_FOUND` |
+| `PATCH` invalid value | 400 | `INVALID_METADATA` |
+| `PATCH` stale `If-Match` | 409 | `VERSION_CONFLICT` |
+| `DELETE /api/v1/objects/{id}` | 204 | — |
+| `DELETE` again | 404 | `OBJECT_NOT_FOUND` |
+| `GET` after delete | 404 | `OBJECT_NOT_FOUND` |
+| `GET /api/v1/objects` | 200 | — |
+| `GET /api/v1/objects?limit=0` | 400 | `INVALID_PAGINATION` |
+
+500 `INTERNAL` has no deterministic trigger (unit tests cover the mapping);
+503 `SERVER_BUSY` is covered by `TestServerBusy`.
 
 ### `GET /healthz` — liveness (controller) · IMPLEMENTED (Phase 2)
 

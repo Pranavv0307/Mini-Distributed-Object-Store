@@ -94,6 +94,7 @@ func serve(cfg config.Controller, logger *slog.Logger) error {
 		Uploader:               uploader,
 		MaxConcurrentUploads:   cfg.MaxConcurrentUploads,
 		Downloader:             downloader,
+		OnDelete:               jan.Kick,
 		MaxConcurrentDownloads: cfg.MaxConcurrentDownloads,
 		Logger:                 logger,
 	})

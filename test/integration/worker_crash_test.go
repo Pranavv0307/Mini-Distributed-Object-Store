@@ -26,15 +26,18 @@ import (
 const testObj = "3f2b8c1e-9a4d-4e2f-8b7a-1c2d3e4f5a6b"
 
 // buildWorker compiles cmd/worker into a temp dir and returns its path.
-func buildWorker(t testing.TB) string {
+func buildWorker(t testing.TB) string { return buildBinary(t, "worker") }
+
+// buildBinary compiles objstore/cmd/<name> into a temp dir.
+func buildBinary(t testing.TB, name string) string {
 	t.Helper()
-	bin := filepath.Join(t.TempDir(), "worker")
+	bin := filepath.Join(t.TempDir(), name)
 	if runtime.GOOS == "windows" {
 		bin += ".exe"
 	}
-	out, err := exec.Command("go", "build", "-o", bin, "objstore/cmd/worker").CombinedOutput()
+	out, err := exec.Command("go", "build", "-o", bin, "objstore/cmd/"+name).CombinedOutput()
 	if err != nil {
-		t.Fatalf("go build worker: %v\n%s", err, out)
+		t.Fatalf("go build %s: %v\n%s", name, err, out)
 	}
 	return bin
 }

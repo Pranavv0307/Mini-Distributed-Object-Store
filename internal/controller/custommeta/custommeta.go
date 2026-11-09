@@ -94,3 +94,50 @@ func jsonType(v any) string {
 		return fmt.Sprintf("%T", v)
 	}
 }
+
+// ParsePatch parses a PATCH body (DEC-014): a JSON object whose values are
+// strings (add or update the key) or null (remove the key).
+func ParsePatch(raw []byte) (map[string]*string, error) {
+	if len(raw) > MaxDocumentBytes {
+		return nil, fmt.Errorf("%w: document larger than %d bytes", ErrLimit, MaxDocumentBytes)
+	}
+	var generic map[string]any
+	dec := json.NewDecoder(bytes.NewReader(raw))
+	if err := dec.Decode(&generic); err != nil {
+		return nil, fmt.Errorf("%w: body must be a JSON object: %v", ErrInvalid, err)
+	}
+	if dec.More() {
+		return nil, fmt.Errorf("%w: trailing data after the JSON object", ErrInvalid)
+	}
+	if generic == nil {
+		return nil, fmt.Errorf("%w: body must be a JSON object, not null", ErrInvalid)
+	}
+	out := make(map[string]*string, len(generic))
+	for k, v := range generic {
+		switch x := v.(type) {
+		case nil:
+			out[k] = nil
+		case string:
+			out[k] = &x
+		default:
+			return nil, fmt.Errorf("%w: value of %q must be a string or null, got %s", ErrInvalid, k, jsonType(v))
+		}
+	}
+	return out, nil
+}
+
+// Merge applies patch to current (which it may modify) and validates the
+// result against the limits.
+func Merge(current map[string]string, patch map[string]*string) (map[string]string, error) {
+	if current == nil {
+		current = map[string]string{}
+	}
+	for k, v := range patch {
+		if v == nil {
+			delete(current, k)
+		} else {
+			current[k] = *v
+		}
+	}
+	return current, Validate(current)
+}

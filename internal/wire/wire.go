@@ -34,6 +34,8 @@ const (
 	CodeObjectNotFound         = "OBJECT_NOT_FOUND"
 	CodeInvalidObjectID        = "INVALID_OBJECT_ID"
 	CodeStorageUnavailable     = "STORAGE_UNAVAILABLE"
+	CodeVersionConflict        = "VERSION_CONFLICT"
+	CodeInvalidPagination      = "INVALID_PAGINATION"
 )
 
 // ErrorResponse is the body of every non-2xx JSON response.
@@ -182,4 +184,45 @@ type ObjectInfo struct {
 	ModifiedAt      string            `json:"modified_at"`
 	MetadataVersion int64             `json:"metadata_version"`
 	CustomMetadata  map[string]string `json:"custom_metadata"`
+}
+
+// ObjectMetadata is the body of GET/PATCH .../metadata: the object's fields
+// plus its chunk map (which workers hold which chunk, spec §3).
+type ObjectMetadata struct {
+	ObjectInfo
+	Chunks []ChunkView `json:"chunks"`
+}
+
+// ChunkView is one chunk of an object, in index order.
+type ChunkView struct {
+	Index          int           `json:"index"`
+	ChunkID        string        `json:"chunk_id"`
+	Size           int64         `json:"size"`
+	ChecksumSHA256 string        `json:"checksum_sha256"`
+	Replicas       []ReplicaView `json:"replicas"`
+}
+
+// ReplicaView is one copy of a chunk.
+type ReplicaView struct {
+	WorkerID string `json:"worker_id"`
+	State    string `json:"state"` // PENDING | OK | CORRUPT
+}
+
+// ObjectSummary is one entry of a listing.
+type ObjectSummary struct {
+	ObjectID       string `json:"object_id"`
+	Name           string `json:"name"`
+	Size           int64  `json:"size"`
+	ContentType    string `json:"content_type"`
+	ChecksumSHA256 string `json:"checksum_sha256"`
+	NumChunks      int    `json:"num_chunks"`
+	CreatedAt      string `json:"created_at"`
+	ModifiedAt     string `json:"modified_at"`
+}
+
+// ObjectList is the body of GET /api/v1/objects.
+type ObjectList struct {
+	Objects []ObjectSummary `json:"objects"`
+	// NextCursor is null on the last page.
+	NextCursor *string `json:"next_cursor"`
 }

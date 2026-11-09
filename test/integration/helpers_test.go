@@ -23,10 +23,16 @@ type faults struct {
 	corruptPuts   atomic.Bool  // flip a byte of the PUT body (worker rejects: checksum)
 	slowResponse  atomic.Int64 // nanoseconds: store the chunk, then delay the response
 	putLatency    atomic.Int64 // nanoseconds: delay before handling a PUT (simulated network/disk latency)
+	getLatency    atomic.Int64 // nanoseconds: delay before answering a chunk GET
 }
 
 func (f *faults) wrap(next http.Handler) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.Method == http.MethodGet && strings.HasPrefix(r.URL.Path, "/internal/chunks/") {
+			if d := time.Duration(f.getLatency.Load()); d > 0 {
+				time.Sleep(d)
+			}
+		}
 		if r.Method != http.MethodPut {
 			next.ServeHTTP(w, r)
 			return

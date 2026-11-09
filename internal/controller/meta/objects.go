@@ -6,6 +6,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"maps"
 	"strings"
 	"time"
 )
@@ -390,4 +391,115 @@ func (s *Store) MarkReplicaCorrupt(ctx context.Context, chunkID, workerID string
 		return err
 	})
 	return changed, err
+}
+
+// ErrVersionConflict: the caller's expected metadata_version does not match
+// (If-Match, DEC-014).
+var ErrVersionConflict = errors.New("meta: metadata version conflict")
+
+// UpdateMetadata applies fn to a READY object's custom metadata in one
+// transaction (read, merge, write), so concurrent updates are serialised and
+// none is lost. fn must be pure (no I/O): it receives a copy of the current
+// map and returns the new one or an error, which aborts the update.
+//
+// If ifVersion is non-nil and differs from the current metadata_version, the
+// update fails with ErrVersionConflict. If fn's result equals the current
+// metadata, nothing is written (the version and modified_at are unchanged),
+// so repeating a PATCH is idempotent. Chunks and replicas are never touched.
+func (s *Store) UpdateMetadata(ctx context.Context, objectID string, ifVersion *int64,
+	fn func(current map[string]string) (map[string]string, error)) (Object, error) {
+	now := s.nowNanos()
+	err := s.tx(ctx, func(tx *sql.Tx) error {
+		var status, raw string
+		var version int64
+		err := tx.QueryRowContext(ctx,
+			`SELECT status, custom_metadata, metadata_version FROM objects WHERE object_id = ?`, objectID).
+			Scan(&status, &raw, &version)
+		if errors.Is(err, sql.ErrNoRows) || (err == nil && status != StatusReady) {
+			return fmt.Errorf("%w: object %s", ErrNotFound, objectID)
+		}
+		if err != nil {
+			return err
+		}
+		if ifVersion != nil && *ifVersion != version {
+			return fmt.Errorf("%w: current version %d, expected %d", ErrVersionConflict, version, *ifVersion)
+		}
+		var current map[string]string
+		if err := json.Unmarshal([]byte(raw), &current); err != nil {
+			return fmt.Errorf("meta: object %s: decode metadata: %w", objectID, err)
+		}
+		next, err := fn(maps.Clone(nonNil(current)))
+		if err != nil {
+			return err
+		}
+		if maps.Equal(nonNil(current), nonNil(next)) {
+			return nil // no change: idempotent
+		}
+		enc, err := json.Marshal(nonNil(next))
+		if err != nil {
+			return err
+		}
+		_, err = tx.ExecContext(ctx, `
+			UPDATE objects SET custom_metadata = ?, metadata_version = metadata_version + 1, modified_at = ?
+			WHERE object_id = ? AND status = 'READY'`, string(enc), now, objectID)
+		return err
+	})
+	if err != nil {
+		return Object{}, err
+	}
+	return s.GetObject(ctx, objectID)
+}
+
+// ListCursor is the keyset position after which a listing continues.
+type ListCursor struct {
+	CreatedAt int64 // Unix nanoseconds
+	ObjectID  string
+}
+
+// ListObjects returns up to limit READY objects ordered by (created_at,
+// object_id), starting after the cursor (nil = from the beginning), and the
+// cursor for the next page (nil if this is the last page). Keyset pagination
+// never returns an object twice and never skips one that existed at both
+// page reads.
+func (s *Store) ListObjects(ctx context.Context, limit int, after *ListCursor) ([]Object, *ListCursor, error) {
+	q := `SELECT object_id, name, size, content_type, checksum_sha256, num_chunks, status,
+	             created_at, modified_at, last_activity, metadata_version, custom_metadata
+	      FROM objects WHERE status = 'READY'`
+	args := []any{}
+	if after != nil {
+		q += ` AND (created_at > ? OR (created_at = ? AND object_id > ?))`
+		args = append(args, after.CreatedAt, after.CreatedAt, after.ObjectID)
+	}
+	q += ` ORDER BY created_at, object_id LIMIT ?`
+	args = append(args, limit+1)
+	rows, err := s.db.QueryContext(ctx, q, args...)
+	if err != nil {
+		return nil, nil, err
+	}
+	defer rows.Close()
+	var out []Object
+	for rows.Next() {
+		var o Object
+		var created, modified, activity int64
+		var md string
+		if err := rows.Scan(&o.ID, &o.Name, &o.Size, &o.ContentType, &o.ChecksumSHA256, &o.NumChunks, &o.Status,
+			&created, &modified, &activity, &o.MetadataVersion, &md); err != nil {
+			return nil, nil, err
+		}
+		o.CreatedAt, o.ModifiedAt, o.LastActivity = fromNanos(created), fromNanos(modified), fromNanos(activity)
+		if err := json.Unmarshal([]byte(md), &o.CustomMetadata); err != nil {
+			return nil, nil, err
+		}
+		out = append(out, o)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, nil, err
+	}
+	var next *ListCursor
+	if len(out) > limit {
+		out = out[:limit]
+		last := out[limit-1]
+		next = &ListCursor{CreatedAt: last.CreatedAt.UnixNano(), ObjectID: last.ID}
+	}
+	return out, next, nil
 }

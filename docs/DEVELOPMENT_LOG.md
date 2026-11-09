@@ -503,3 +503,79 @@ bounded, HEAD), DEC-044 (client errors never name workers).
 
 Phase 5: metadata GET (chunk map) and PATCH, list with pagination, client
 delete, conformance checklist.
+
+---
+
+## Phase 5 — Complete API surface (2026-11-09)
+
+### What was implemented
+
+- **`internal/controller/meta`**: `UpdateMetadata` (one read-merge-write
+  transaction, If-Match version check, no-op detection) and `ListObjects`
+  (keyset pagination, `limit + 1` probe).
+- **`internal/controller/custommeta`**: `ParsePatch` (strings or null) and
+  `Merge` (limits on the merged result).
+- **`internal/controller/api/objects.go`**: `GET`/`PATCH .../metadata`,
+  `GET /api/v1/objects`, `DELETE /api/v1/objects/{id}`; the cursor codec;
+  `If-Match` parsing; delete kicks the janitor through `Config.OnDelete`.
+- **`internal/wire`**: `ObjectMetadata`, `ChunkView`, `ReplicaView`,
+  `ObjectSummary`, `ObjectList`; codes `VERSION_CONFLICT`, `INVALID_PAGINATION`.
+- **`internal/controller/download`**: `corruption_detected` is logged only
+  when a replica row actually changes (a delete racing a download produced
+  misleading log lines).
+- **`cmd/objctl`**: the full client (DEC-049). **`docker-compose.yml`**:
+  `client` service in the `tools` profile.
+- **Tests**: store tests, `custommeta` tests, integration tests for every
+  endpoint and race, `TestSpecConformance`, `TestObjctl`, and the Compose
+  `TestComposeObjectAPI`. `buildWorker` was generalised to `buildBinary`, and
+  the worker fault injector gained a GET latency.
+
+### Important decisions
+
+DEC-045 to DEC-050. Client delete reuses the Phase 3 abort path and janitor.
+
+### Problems encountered and resolutions
+
+1. **PATCH rejected plain `curl -d`** (form-urlencoded content type). Found
+   in the manual walkthrough; the `Content-Type` check was removed (DEC-045)
+   and the test inverted to assert acceptance.
+2. **Misleading `corruption_detected` logs** when a download raced a delete
+   (the file vanished, so the read saw 404, but there was no row to mark).
+   Now logged only when a row changes.
+3. **`objctl list` printed `"objects": null`** on an empty store. Fixed, with
+   a test.
+4. **409 message carried an internal `meta: ` prefix.** Trimmed.
+5. **Test bugs:** comparing structs containing maps with `!=` (compile
+   error), a pointless self-comparison helper (replaced with a comparison
+   against the uploaded data), and an invalid percent-encoded cursor that
+   Go's query parser drops before the handler sees it.
+6. **A large documentation edit failed on escaping** inside an inline Python
+   heredoc; doc edits use scratchpad scripts or the Edit tool.
+
+### Tests performed and results (2026-11-09)
+
+- `go build`, `go vet` (default and `-tags e2e`), `gofmt -l` (empty),
+  `go tool staticcheck` (default and `-tags e2e`): pass.
+- `go test -count=3 ./...` (Windows, 16 packages): pass.
+  `go test -race -count=3 ./...` (Linux container): pass.
+- `go test -tags e2e -count=1 -v ./test/e2e/...`: 5 tests pass; no leftovers.
+- `TestSpecConformance`: 19 of 19 rows pass.
+- Manual Compose walkthroughs (guarded `objstore-` names): metadata with
+  `ETag "v1"` and replica locations; PATCH add/update/remove via plain `curl -d`;
+  If-Match 409 then 200; invalid value 400; list paging 2 + 1 with a cursor;
+  `limit=0` 400; delete 204 then 404 everywhere, files gone from all 4 workers,
+  `object_purged`; every `objctl` command of `RUN_AND_TEST.md` §4.6 in the
+  client container and natively.
+
+### Known limitations
+
+- Listing order uses the upload *start* time, so an object committing during
+  a listing may be missed by that pass (DEC-047).
+- A deleted object whose holder never returns keeps an invisible `DELETING`
+  row and pending deletes (worker decommissioning is out of scope).
+- DEC-013 (string-only metadata values) is still provisional.
+
+### Work remaining
+
+Phase 6: full inventory reconciliation on registration, `/cluster` chunk
+totals, audit v1 (I1, I2, I3, I5, I7).

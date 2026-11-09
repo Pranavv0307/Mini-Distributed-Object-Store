@@ -14,8 +14,8 @@ owner review. The owner makes the git commit for each phase.
 | 1 | M1 | Worker: durable chunk store over HTTP, in Docker | 0 | COMPLETED |
 | 2 | M2 | Membership, failure detection, `SYNCING`, Compose cluster | 1 | COMPLETED |
 | 3 | M3a+M3b | Write path: metadata DB, chunk, place, replicate, commit | 2 | COMPLETED |
-| 4 | M4 | Read path: verify, fall back, stream in order | 3 | COMPLETED (awaiting review) |
-| 5 | M5 | Complete client API, delete path, error mapping | 4 | NOT STARTED |
+| 4 | M4 | Read path: verify, fall back, stream in order | 3 | COMPLETED |
+| 5 | M5 | Complete client API, delete path, error mapping | 4 | COMPLETED (awaiting review) |
 | 6 | M6 | Degraded operation, full inventory reconciliation, audit v1 | 5 | NOT STARTED |
 | 7 | M7 | Self-healing re-replication (reconciler) | 6 | NOT STARTED |
 | 8 | M8 | Data integrity: scrubber, cross-check, corrupt repair | 7 | NOT STARTED |
@@ -190,7 +190,7 @@ owner review. The owner makes the git commit for each phase.
   → truncated response, never wrong bytes.
 - **Testing.** Integration tests with stopped workers, corrupted files,
   missing files, both replicas bad; concurrency test of parallel downloads.
-- **Status.** COMPLETED (awaiting review). As built:
+- **Status.** COMPLETED. As built:
   `internal/controller/download` (pre-flight, chunk 0 before headers, per-chunk
   verification with random replica order and fallback, `CORRUPT` marking,
   whole-object checksum guard, flush per chunk, abort mid-stream, `HEAD`),
@@ -220,6 +220,18 @@ owner review. The owner makes the git commit for each phase.
   completes when it returns.
 - **Testing.** Conformance test table; pagination stability under concurrent
   inserts; PATCH/DELETE race test.
+- **Status.** COMPLETED (awaiting review). As built: `meta.UpdateMetadata`,
+  `meta.ListObjects`; `custommeta.ParsePatch`/`Merge`; handlers in
+  `internal/controller/api/objects.go`; client delete reuses
+  `MarkDeleting` + janitor (built in Phase 3); `cmd/objctl` and the Compose
+  `client` service (DEC-045 to DEC-050). Acceptance: `TestSpecConformance`
+  (19 rows, all pass); PATCH leaves the chunk map unchanged
+  (`TestMetadataPatch`); delete → instant 404 everywhere, files gone shortly
+  after (`TestDelete`, `TestComposeObjectAPI`); delete with a worker down →
+  204, completes on return (`TestDeleteWithWorkerDown`, e2e); pagination
+  stable under concurrent inserts (`TestListStableUnderConcurrentUploads`);
+  PATCH/DELETE and concurrent PATCH races (`TestConcurrentPatchesAreNotLost`,
+  `TestDelete`).
 
 ## Phase 6 — Degraded operation and worker resync (M6)
 

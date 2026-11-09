@@ -7,6 +7,7 @@ import (
 	"path/filepath"
 	"sync"
 	"testing"
+	"time"
 
 	"objstore/internal/ids"
 )
@@ -397,5 +398,155 @@ func TestMarkReplicaCorrupt(t *testing.T) {
 	s.ClaimChunk(ctx, c, []string{"w1", "w2"})
 	if changed, _ := s.MarkReplicaCorrupt(ctx, c.ID, "w1"); changed {
 		t.Fatal("PENDING replica marked CORRUPT")
+	}
+}
+
+func readyObject(t *testing.T, s *Store, md map[string]string) string {
+	t.Helper()
+	obj, _ := upload(t, s, 1, 10)
+	if _, err := s.CommitObject(ctx, CommitInput{ObjectID: obj, Size: 10, NumChunks: 1, ReplicationFactor: 2, CustomMetadata: md}); err != nil {
+		t.Fatal(err)
+	}
+	return obj
+}
+
+func setKV(k string, v *string) func(map[string]string) (map[string]string, error) {
+	return func(m map[string]string) (map[string]string, error) {
+		if v == nil {
+			delete(m, k)
+		} else {
+			m[k] = *v
+		}
+		return m, nil
+	}
+}
+
+func ptr[T any](v T) *T { return &v }
+
+func TestUpdateMetadata(t *testing.T) {
+	s, _ := openTest(t)
+	obj := readyObject(t, s, map[string]string{"a": "1", "b": "2"})
+	before, _ := s.ChunkMap(ctx, obj)
+
+	o, err := s.UpdateMetadata(ctx, obj, nil, setKV("a", ptr("x")))
+	if err != nil || o.CustomMetadata["a"] != "x" || o.CustomMetadata["b"] != "2" || o.MetadataVersion != 2 {
+		t.Fatalf("update = %+v, %v", o, err)
+	}
+	if !o.ModifiedAt.After(o.CreatedAt) && !o.ModifiedAt.Equal(o.CreatedAt) {
+		t.Fatalf("modified_at %v before created_at %v", o.ModifiedAt, o.CreatedAt)
+	}
+	// Removing a key.
+	o, _ = s.UpdateMetadata(ctx, obj, nil, setKV("b", nil))
+	if _, ok := o.CustomMetadata["b"]; ok || o.MetadataVersion != 3 {
+		t.Fatalf("after delete: %+v", o)
+	}
+	// No change: version and modified_at stay (idempotent).
+	same, _ := s.UpdateMetadata(ctx, obj, nil, setKV("a", ptr("x")))
+	if same.MetadataVersion != 3 || !same.ModifiedAt.Equal(o.ModifiedAt) {
+		t.Fatalf("no-op update changed the object: %+v", same)
+	}
+	// If-Match semantics.
+	if _, err := s.UpdateMetadata(ctx, obj, ptr(int64(2)), setKV("c", ptr("3"))); !errors.Is(err, ErrVersionConflict) {
+		t.Fatalf("stale version: err = %v", err)
+	}
+	if o, err := s.UpdateMetadata(ctx, obj, ptr(int64(3)), setKV("c", ptr("3"))); err != nil || o.MetadataVersion != 4 {
+		t.Fatalf("matching version: %+v, %v", o, err)
+	}
+	// An error from fn aborts without writing.
+	boom := errors.New("invalid")
+	if _, err := s.UpdateMetadata(ctx, obj, nil, func(map[string]string) (map[string]string, error) { return nil, boom }); !errors.Is(err, boom) {
+		t.Fatalf("fn error: %v", err)
+	}
+	if o, _ := s.GetObject(ctx, obj); o.MetadataVersion != 4 {
+		t.Fatalf("failed update wrote: %+v", o)
+	}
+	// Chunks and replicas are untouched.
+	after, _ := s.ChunkMap(ctx, obj)
+	if fmt.Sprint(before) != fmt.Sprint(after) {
+		t.Fatalf("chunk map changed:\n%v\n%v", before, after)
+	}
+	// Only READY objects can be updated.
+	up := ids.NewObjectID()
+	s.CreateObject(ctx, up, "u", "x")
+	if _, err := s.UpdateMetadata(ctx, up, nil, setKV("k", ptr("v"))); !errors.Is(err, ErrNotFound) {
+		t.Fatalf("UPLOADING object: %v", err)
+	}
+	s.MarkDeleting(ctx, obj, "test", StatusReady)
+	if _, err := s.UpdateMetadata(ctx, obj, nil, setKV("k", ptr("v"))); !errors.Is(err, ErrNotFound) {
+		t.Fatalf("DELETING object: %v", err)
+	}
+}
+
+func TestConcurrentMetadataUpdatesAreNotLost(t *testing.T) {
+	s, _ := openTest(t)
+	obj := readyObject(t, s, nil)
+	var wg sync.WaitGroup
+	for i := range 16 {
+		wg.Go(func() {
+			if _, err := s.UpdateMetadata(ctx, obj, nil, setKV(fmt.Sprintf("k%d", i), ptr("v"))); err != nil {
+				t.Error(err)
+			}
+		})
+	}
+	wg.Wait()
+	o, _ := s.GetObject(ctx, obj)
+	if len(o.CustomMetadata) != 16 || o.MetadataVersion != 17 {
+		t.Fatalf("after 16 concurrent updates: %d keys, version %d", len(o.CustomMetadata), o.MetadataVersion)
+	}
+}
+
+func TestListObjectsKeyset(t *testing.T) {
+	// A frozen clock makes every created_at equal, so ordering relies on the
+	// object_id tie-break; then a ticking clock checks ordering by time.
+	for _, frozen := range []bool{true, false} {
+		t.Run(fmt.Sprintf("frozen=%v", frozen), func(t *testing.T) {
+			var mu sync.Mutex
+			tick := time.Date(2026, 11, 9, 0, 0, 0, 0, time.UTC)
+			now := func() time.Time {
+				mu.Lock()
+				defer mu.Unlock()
+				if !frozen {
+					tick = tick.Add(time.Millisecond)
+				}
+				return tick
+			}
+			s, err := Open(filepath.Join(t.TempDir(), "m.db"), Options{Now: now})
+			if err != nil {
+				t.Fatal(err)
+			}
+			defer s.Close()
+			want := map[string]bool{}
+			for range 25 {
+				want[readyObject(t, s, nil)] = true
+			}
+			s.CreateObject(ctx, ids.NewObjectID(), "uploading", "x") // never listed
+			seen := map[string]bool{}
+			var cur *ListCursor
+			var prev Object
+			pages := 0
+			for {
+				objs, next, err := s.ListObjects(ctx, 10, cur)
+				if err != nil {
+					t.Fatal(err)
+				}
+				pages++
+				for _, o := range objs {
+					if seen[o.ID] || !want[o.ID] {
+						t.Fatalf("object %s duplicated or unexpected", o.ID)
+					}
+					if prev.ID != "" && (o.CreatedAt.Before(prev.CreatedAt) || (o.CreatedAt.Equal(prev.CreatedAt) && o.ID <= prev.ID)) {
+						t.Fatalf("out of order: %s after %s", o.ID, prev.ID)
+					}
+					seen[o.ID], prev = true, o
+				}
+				if next == nil {
+					break
+				}
+				cur = next
+			}
+			if len(seen) != 25 || pages != 3 {
+				t.Fatalf("saw %d objects in %d pages", len(seen), pages)
+			}
+		})
 	}
 }

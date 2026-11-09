@@ -56,3 +56,32 @@ func TestLimitsAreInclusive(t *testing.T) {
 		t.Fatalf("max-size key and value rejected: %v", err)
 	}
 }
+
+func TestParsePatchAndMerge(t *testing.T) {
+	p, err := ParsePatch([]byte(`{"a":"1","b":null}`))
+	if err != nil || *p["a"] != "1" || p["b"] != nil || len(p) != 2 {
+		t.Fatalf("ParsePatch = %v, %v", p, err)
+	}
+	m, err := Merge(map[string]string{"b": "x", "c": "y"}, p)
+	if err != nil || len(m) != 2 || m["a"] != "1" || m["c"] != "y" {
+		t.Fatalf("Merge = %v, %v", m, err)
+	}
+	for _, bad := range []string{`[]`, `null`, `{"a":1}`, `{"a":{}}`, `{"a":"b"}x`, ``} {
+		if _, err := ParsePatch([]byte(bad)); !errors.Is(err, ErrInvalid) {
+			t.Errorf("ParsePatch(%q) err = %v", bad, err)
+		}
+	}
+	// Limits apply to the merged result.
+	cur := map[string]string{}
+	for i := range MaxKeys {
+		cur[fmt.Sprint(i)] = "v"
+	}
+	if _, err := Merge(cur, map[string]*string{"extra": ptr("v")}); !errors.Is(err, ErrLimit) {
+		t.Fatalf("51st key: %v", err)
+	}
+	if _, err := Merge(map[string]string{"k": "v"}, map[string]*string{"": ptr("v")}); !errors.Is(err, ErrInvalid) {
+		t.Fatalf("empty key: %v", err)
+	}
+}
+
+func ptr(s string) *string { return &s }

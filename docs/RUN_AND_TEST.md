@@ -6,13 +6,13 @@ Practical, step-by-step instructions to set up, run, and verify the project.
 > observed at the phase noted. Sections for later phases are marked
 > *not yet available* until those phases are implemented.
 
-**Current state (end of Phase 4):** the cluster runs under Docker Compose:
-one controller and four workers. Workers register, heartbeat, and are marked
-`DEAD` when they stop. Objects can be **uploaded** (`POST /api/v1/objects`:
-1 MB chunks, two copies on distinct workers, atomic commit) and
-**downloaded** (`GET /api/v1/objects/{id}`: every chunk verified against its
-checksum, failing over to the other copy, corrupt copies marked). Metadata,
-list, and delete come in Phase 5.
+**Current state (end of Phase 5):** the cluster runs under Docker Compose:
+one controller and four workers. **Every client API endpoint of the
+specification works:** upload (1 MB chunks, two copies on distinct workers,
+atomic commit), verified download with replica fallback, metadata GET and
+PATCH, list with pagination, and delete. The `objctl` client is available
+natively and as a Compose `client` container. Repair and crash recovery come
+in Phases 6–9.
 
 > ⚠️ **Docker name collisions.** Container names are global on a Docker host.
 > The Compose file uses the spec's names `controller` and `worker1`…`worker4`.
@@ -74,8 +74,8 @@ go build -o bin/ ./cmd/...     # binaries into bin/ (git-ignored)
 docker build -t objstore:dev . # the image Compose uses (DEC-023)
 ```
 
-`bin/controller` and `bin/worker` are functional; `bin/objctl` is still a
-stub. `docker compose up --build` (below) also builds the image.
+`bin/controller`, `bin/worker`, and `bin/objctl` are all functional.
+`docker compose up --build` (below) also builds the image.
 
 ---
 
@@ -297,7 +297,7 @@ The controller logs one `upload_started` and one `upload_committed` line
 | `curl -s -w ' HTTP %{http_code}\n' -F 'metadata={"n":1}' -F 'file=@big.bin' localhost:8080/api/v1/objects` | `INVALID_METADATA` ("value of \"n\" must be a string, got number") |
 | `curl -s -w ' HTTP %{http_code}\n' -H 'Content-Type: application/json' -d '{}' localhost:8080/api/v1/objects` | `INVALID_REQUEST` ("expected a multipart/form-data body") |
 
-Metadata GET/PATCH, list, and delete are Phase 5.
+Metadata, list, and delete: §4.5.
 
 ### 4.4 Download (verified at Phase 4, Compose cluster)
 
@@ -322,6 +322,66 @@ hashes; `IDENTICAL`.
 | `curl -s -w ' HTTP %{http_code}\n' localhost:8080/api/v1/objects/not-a-uuid` | `400`, `INVALID_OBJECT_ID` |
 
 The controller logs `download_completed` with size, duration, and MB/s.
+
+
+### 4.5 Metadata, list, delete (verified at Phase 5, Compose cluster)
+
+With an object `ID` uploaded with `-F 'metadata={"owner":"alice"}'` (§4.3):
+
+```bash
+curl -s -D - localhost:8080/api/v1/objects/$ID/metadata
+```
+
+Expected: `HTTP/1.1 200 OK`, `Etag: "v1"`, and JSON with all object fields,
+`"custom_metadata":{"owner":"alice"}`, and `"chunks":[{"index":0,…,"replicas":[{"worker_id":"worker1","state":"OK"},{"worker_id":"worker2","state":"OK"}]},…]`
+(which workers hold each chunk: the replication demonstration).
+
+| Command | Expected |
+| --- | --- |
+| `curl -s -X PATCH -d '{"owner":"bob","project":"demo"}' localhost:8080/api/v1/objects/$ID/metadata` | 200, `"metadata_version":2`, `"custom_metadata":{"owner":"bob","project":"demo"}`, `Etag: "v2"` |
+| `curl -s -X PATCH -d '{"project":null}' localhost:8080/api/v1/objects/$ID/metadata` | 200, version 3, `{"owner":"bob"}` |
+| `curl -s -w ' HTTP %{http_code}\n' -X PATCH -H 'If-Match: "v1"' -d '{"x":"y"}' localhost:8080/api/v1/objects/$ID/metadata` | `VERSION_CONFLICT` "current version 3, expected 1", HTTP 409 |
+| same with `If-Match: "v3"` | 200, version 4 |
+| `curl -s -w ' HTTP %{http_code}\n' -X PATCH -d '{"n":1}' localhost:8080/api/v1/objects/$ID/metadata` | `INVALID_METADATA`, HTTP 400 |
+| `curl -s 'localhost:8080/api/v1/objects?limit=2'` (3 objects stored) | 2 objects and a `"next_cursor":"eyJ…"` |
+| `curl -s "localhost:8080/api/v1/objects?limit=2&cursor=$CUR"` (CUR = that cursor) | the third object, `"next_cursor":null` |
+| `curl -s -w ' HTTP %{http_code}\n' 'localhost:8080/api/v1/objects?limit=0'` | `INVALID_PAGINATION`, HTTP 400 |
+| `curl -s -w 'HTTP %{http_code}\n' -X DELETE localhost:8080/api/v1/objects/$ID` | `HTTP 204` |
+| metadata, download, or DELETE again for `$ID` | `OBJECT_NOT_FOUND`, HTTP 404 |
+
+PATCH never changes the object's data or chunk map. After the delete, within
+about two seconds no worker holds a file of `$ID`:
+
+```bash
+for w in 1 2 3 4; do echo "worker$w: $(docker exec objstore-worker$w sh -c "ls /data/chunks | grep -c ^$ID")"; done
+```
+
+Expected: `0` for every worker. Controller log: `metadata_updated` (per
+PATCH), `object_deleted`, then `object_purged`.
+
+### 4.6 The `objctl` client (verified at Phase 5)
+
+In the Compose `client` container (no Go needed; mount a directory for
+files; `--no-deps` avoids restarting the cluster):
+
+```bash
+mkdir -p work && cp big.bin work/
+docker compose --profile tools run --rm --no-deps -v "$(pwd -W)/work:/work" client upload /work/big.bin -meta owner=alice
+docker compose --profile tools run --rm --no-deps client stat <object_id>
+docker compose --profile tools run --rm --no-deps client patch <object_id> owner=bob tmp=
+docker compose --profile tools run --rm --no-deps client list -all
+docker compose --profile tools run --rm --no-deps -v "$(pwd -W)/work:/work" client download <object_id> -o /work/got.bin
+docker compose --profile tools run --rm --no-deps client delete <object_id>
+docker compose --profile tools run --rm --no-deps client cluster
+```
+
+(`$(pwd -W)` is Git Bash; use `$(pwd)` on Linux/macOS.) `download` prints
+`objctl: wrote N bytes to /work/got.bin (sha256 … verified)`; it checks the
+length and the whole-object SHA-256 and writes no file if either is wrong.
+`patch k=` removes `k`; `patch -if-match v3 …` sets `If-Match`.
+
+Natively: `go build -o bin/ ./cmd/...` then
+`OBJSTORE_URL=http://localhost:8080 ./bin/objctl list` (or `-server URL`).
 
 ---
 
@@ -443,7 +503,15 @@ identical to the original.) Error
 messages never name workers; details are in the controller log
 (`download_unavailable`, `download_aborted`).
 
-### 5.7 Repair, crash consistency
+### 5.7 Delete with a worker down (verified in automated tests)
+
+`TestDeleteWithWorkerDown` (in-process) and `TestComposeObjectAPI` (Compose):
+`DELETE` returns 204 while a holder is stopped; the files on the live holders
+disappear within one janitor round; the stopped holder's files stay (its
+pending deletes wait); after `docker start`, its files are removed and the
+object's rows are purged (`object_purged` in the controller log).
+
+### 5.8 Repair, crash consistency
 
 Repair: *not yet available* (Phases 7–9). Crash mid-write on a worker:
 covered by automated tests (§6).
@@ -452,7 +520,7 @@ covered by automated tests (§6).
 
 ## 6. Automated testing and static analysis
 
-Run from the repository root. All verified at Phase 4.
+Run from the repository root. All verified at Phase 5.
 
 ### Unit and integration tests
 
@@ -488,7 +556,12 @@ builds and kills the real worker binary; about 10–45 s. Upload tests cover
 the 5.5 MB checkpoint, edge sizes, window sizes, metadata before/after the
 file, invalid requests, insufficient workers, worker failure/stop/timeout/
 corruption mid-upload, truncated bodies, client disconnect, size limit,
-concurrent uploads, and `SERVER_BUSY`. `go test -short ./...` skips the timing-based and
+concurrent uploads, and `SERVER_BUSY`; download tests cover verification and
+fallback; object tests cover metadata, PATCH (merge, If-Match, limits,
+concurrency, chunks untouched), list paging (including during concurrent
+uploads), delete (immediate invisibility, cleanup, worker down, during a
+download), and the `objctl` binary; `TestSpecConformance` walks every row of
+the spec's endpoint and status tables. `go test -short ./...` skips the timing-based and
 process-spawning tests. Add `-count=1` to bypass the cache, `-v` for detail.
 
 ### End-to-end tests (Docker)
@@ -506,6 +579,10 @@ Builds `objstore:e2e` once, then runs:
   `docker start` → `ALIVE` with a newer epoch; `docker restart` controller →
   all four re-register with newer epochs. Removes only its own project
   (`compose down -v`).
+- `TestComposeObjectAPI`: drives `objctl` in the Compose `client` container:
+  upload, stat (chunk map with replicas), patch, list, download (verified by
+  `objctl`), delete (files removed from all volumes), and delete with a holder
+  stopped (its files removed after `docker start`).
 - `TestComposeDownload`: uploads 3.5 MB, downloads and compares; stops a
   holder of chunk 1 and downloads again (before and after `DEAD`); appends
   bytes to one copy on disk and downloads 6 times (all correct, controller logs
@@ -516,7 +593,7 @@ Builds `objstore:e2e` once, then runs:
   `503 INSUFFICIENT_WORKERS` with nothing stored.
 - `TestWorkerContainer`: the standalone worker container checks from Phase 1.
 
-Expected: all four `PASS` (about 1–2 minutes including the image build). Set
+Expected: all five `PASS` (about 1.5–2 minutes including the image build). Set
 `E2E_IMAGE=objstore:dev` to reuse an existing image.
 
 ### Benchmark: sequential vs windowed upload
@@ -576,6 +653,10 @@ Expected last line: `ALL-OK`. Then run the race detector and the e2e tests.
 | `Conflict. The container name "/worker1" is already in use` on `compose up` | Another project uses the spec's container names | `export OBJSTORE_CONTAINER_PREFIX=objstore-` and retry. Do **not** remove containers you did not create |
 | `port is already allocated` for 8080 | Something else uses port 8080 | `export CONTROLLER_PORT=18080` and use that port with `curl` |
 | `/cluster` shows fewer than 4 workers right after `up` or a controller restart | Workers have not (re-)registered yet | Wait one heartbeat interval (3 s); check `docker logs <worker>` for `worker_register_failed` |
+| PATCH returns `409 VERSION_CONFLICT` | `If-Match` names an old `metadata_version` | GET the metadata, use the current `ETag`, retry |
+| List returns `400 INVALID_PAGINATION` | `limit` outside 1–1000, or a cursor not issued by this server (e.g. edited, or from a reset database) | Start the listing again without `cursor` |
+| A deleted object's files are still on a worker | That worker was down; its deletes wait until it is `ALIVE` | Start the worker; the janitor removes them within one round |
+| `objctl: download incomplete` / `checksum mismatch` | The download was cut off or corrupted in transit; no output file was written | Retry; check the controller log |
 | Download returns `503 STORAGE_UNAVAILABLE` | Some chunk has no valid copy on an `ALIVE` worker: both holders down, or both copies corrupt | Check the controller log (`download_unavailable`, `corruption_detected`); start the holders. Both copies corrupt cannot be fixed automatically: re-upload |
 | `curl: (18) end of response with … bytes missing` on download | A chunk failed after the response started; the controller cut the connection rather than send wrong bytes | Check the controller log for `download_aborted`; retry |
 | Upload returns `503 INSUFFICIENT_WORKERS` | Fewer than 2 workers are `ALIVE` (or the others reported less than `PLACEMENT_MIN_FREE_BYTES` free) | Check `/cluster`; start workers; free disk space |
