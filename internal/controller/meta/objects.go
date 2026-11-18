@@ -393,6 +393,29 @@ func (s *Store) MarkReplicaCorrupt(ctx context.Context, chunkID, workerID string
 	return changed, err
 }
 
+// MarkSuspectCorrupt cross-checks a scrubber report against the controller's
+// metadata before changing state. The worker report is only a trigger; the
+// controller's chunk and object records remain authoritative.
+func (s *Store) MarkSuspectCorrupt(ctx context.Context, chunkID, workerID string) (bool, error) {
+	now := s.nowNanos()
+	changed := false
+	err := s.tx(ctx, func(tx *sql.Tx) error {
+		res, err := tx.ExecContext(ctx, `
+			UPDATE replicas SET state = 'CORRUPT', updated_at = ?
+			WHERE chunk_id = ? AND worker_id = ? AND state = 'OK'
+			  AND EXISTS (SELECT 1 FROM chunks c JOIN objects o ON o.object_id = c.object_id
+			              WHERE c.chunk_id = replicas.chunk_id AND o.status = 'READY')`,
+			now, chunkID, workerID)
+		if err != nil {
+			return err
+		}
+		n, err := res.RowsAffected()
+		changed = n == 1
+		return err
+	})
+	return changed, err
+}
+
 // ErrVersionConflict: the caller's expected metadata_version does not match
 // (If-Match, DEC-014).
 var ErrVersionConflict = errors.New("meta: metadata version conflict")

@@ -80,6 +80,8 @@ type Config struct {
 	// MaxConcurrentUploads × UPLOAD_WINDOW × CHUNK_SIZE.
 	MaxConcurrentUploads int
 	Logger               *slog.Logger
+	// Inventories supplies metadata-only worker snapshots for audit v2.
+	Inventories func(context.Context, []registry.Worker) (map[string][]meta.InventoryEntry, error)
 }
 
 // Server serves the controller's HTTP API.
@@ -206,6 +208,22 @@ func (s *Server) heartbeat(w http.ResponseWriter, r *http.Request) {
 	reregister := s.reg.Heartbeat(req.WorkerID, req.Epoch, registry.Capacity{
 		FreeBytes: req.FreeBytes, UsedBytes: req.UsedBytes, ChunkCount: req.ChunkCount,
 	})
+	if !reregister && s.cfg.Meta != nil {
+		for _, chunkID := range req.SuspectChunks {
+			if !ids.ValidChunkID(chunkID) {
+				s.log.Warn("scrub_suspect_rejected", "worker_id", req.WorkerID, "chunk_id", chunkID, "reason", "invalid_id")
+				continue
+			}
+			changed, err := s.cfg.Meta.MarkSuspectCorrupt(r.Context(), chunkID, req.WorkerID)
+			if err != nil {
+				s.log.Error("scrub_crosscheck_failed", "worker_id", req.WorkerID, "chunk_id", chunkID, "error", err)
+				continue
+			}
+			if changed {
+				s.log.Warn("corruption_detected", "worker_id", req.WorkerID, "chunk_id", chunkID, "detected_by", "scrubber")
+			}
+		}
+	}
 	action := wire.ActionOK
 	if reregister {
 		action = wire.ActionReregister
@@ -357,6 +375,24 @@ func (s *Server) audit(w http.ResponseWriter, r *http.Request) {
 		s.log.Error("audit_failed", "error", err)
 		httpx.WriteError(w, http.StatusInternalServerError, wire.CodeInternal, "internal error")
 		return
+	}
+	if s.cfg.Inventories != nil {
+		invs, err := s.cfg.Inventories(r.Context(), s.reg.Alive())
+		if err != nil {
+			s.log.Error("audit_inventory_failed", "error", err)
+			httpx.WriteError(w, http.StatusInternalServerError, wire.CodeInternal, "internal error")
+			return
+		}
+		check, err := s.cfg.Meta.AuditInventory(r.Context(), invs)
+		if err != nil {
+			s.log.Error("audit_inventory_failed", "error", err)
+			httpx.WriteError(w, http.StatusInternalServerError, wire.CodeInternal, "internal error")
+			return
+		}
+		rep.Checks = append(rep.Checks, check)
+		if check.Violations > 0 {
+			rep.OK = false
+		}
 	}
 	if !rep.OK {
 		s.log.Error("audit_violation", "checks", rep.Checks)

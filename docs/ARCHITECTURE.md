@@ -9,13 +9,13 @@ clarifies the design doc, the difference is listed in
 [§15 Deviations](#15-deviations-and-clarifications-vs-the-design-doc) with a link
 to [`DECISIONS.md`](DECISIONS.md).
 
-> **Current status (end of Phase 7):** implemented: the worker's chunk store
+> **Current status (Phase 11):** implemented: the worker's chunk store
 > and chunk API (§3.1); cluster membership with the `SYNCING` protocol (§7);
 > the metadata database, the upload path, and a minimal janitor (§8); the
 > verified download path (§9); metadata, list, delete, and `objctl` (§10);
 > inventory reconciliation, `/cluster` storage totals, and audit v1 (§11);
-> **self-healing re-replication** (§12). Not yet: the worker scrubber and the
-> rest of crash recovery (target design below).
+> **self-healing re-replication** (§12), worker scrubber, crash recovery,
+> inventory audit v2, and packaged demo.
 
 ---
 
@@ -56,8 +56,8 @@ observed state reconciled in loops; trust nothing you didn't verify.
 | Controller | Worker client | The only code calling workers: timeouts, checksum headers | `internal/controller/workerclient` | **Implemented (Phase 3)** |
 | Controller | Upload / download coordinators | Streaming write and read paths | `internal/controller/upload`, `.../download` | **Implemented (Phases 3, 4)** |
 | Controller | Reconciler (repair loop) | Level-triggered repair of under-replicated/corrupt chunks; trimming | `internal/controller/repair` | **Implemented (Phase 7)** |
-| Controller | Janitor | `pending_deletes` drain and purge of `DELETING` objects for aborted uploads and client deletes (Phases 3, 5, implemented); stale uploads, orphan sweep (Phase 9) | `internal/controller/janitor` | Partly |
-| Controller | Recovery | Startup recovery pass (Phase 9); repair warm-up and unknown-worker rule (Phase 7, DEC-056) | `internal/controller/recovery`, `.../repair` | Partly (Phase 7) |
+| Controller | Janitor | `pending_deletes` drain, stale-upload cleanup, purge of `DELETING` objects, and periodic inventory/orphan sweep | `internal/controller/janitor` | Implemented (Phases 3, 5, 9) |
+| Controller | Recovery | Startup recovery of `UPLOADING` objects and dangling `PENDING` claims; repair warm-up and unknown-worker rule | `internal/controller/meta`, `.../repair` | Implemented (Phase 9; repair pieces in Phase 7) |
 | Controller | Observability | `/healthz`, `/cluster`, audit, structured event log | `internal/controller/api`, `.../audit` | `/healthz`, `/cluster` (workers), event log: implemented; audit Phases 6, 9 |
 | Client | `objctl` | CLI for the REST API with local download verification; Compose `client` service | `cmd/objctl` | **Implemented (Phase 5)** |
 
@@ -354,9 +354,9 @@ then purge `DELETING` objects with nothing left (DEC-037).
 | Client disconnects mid-upload | `UPLOADING` object, claims | Handler aborts → janitor (tested) |
 | Worker fails or times out on a PUT | Possibly bytes on that worker | Claim → pending delete → janitor (tested) |
 | Worker stops mid-upload | As above, deleted when it returns | Janitor (tested) |
-| Controller crashes mid-upload | `UPLOADING` object, `PENDING`/`OK` rows | **Not yet**: Phase 9 startup recovery |
-| Controller crashes between a worker's rename and `MarkReplicaOK` | Claimed file; row still `PENDING` | Phase 9 recovery (`PENDING` → pending delete) |
-| PUT lands after the janitor's DELETE for an aborted upload | Orphan file | Phase 9 inventory sweep |
+| Controller crashes mid-upload | `UPLOADING` object, `PENDING`/`OK` rows | Startup recovery changes it to `DELETING`; janitor removes files |
+| Controller crashes between a worker's rename and `MarkReplicaOK` | Claimed file; row still `PENDING` | Recovery changes the claim to pending delete |
+| PUT lands after the janitor's DELETE for an aborted upload | Orphan file | Periodic inventory sweep queues and removes the orphan |
 
 ### 8.5 Measured (Phase 3)
 

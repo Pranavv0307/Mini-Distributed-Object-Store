@@ -74,10 +74,16 @@ func serve(cfg config.Controller, logger *slog.Logger) error {
 		return err
 	}
 	defer store.Close()
+	if recovered, err := store.RecoverUploading(context.Background()); err != nil {
+		return fmt.Errorf("startup recovery: %w", err)
+	} else if recovered > 0 {
+		logger.Warn("startup_recovery", "uploads_aborted", recovered)
+	}
 
 	reg := registry.New(registry.Options{DeadAfter: cfg.DeadAfter, Logger: logger})
 	workers := workerclient.New(cfg.WorkerConnectTimeout, cfg.WorkerRequestTimeout)
-	jan := janitor.New(store, reg, workers, janitor.Config{Interval: cfg.JanitorInterval, Logger: logger})
+	jan := janitor.New(store, reg, workers, janitor.Config{Interval: cfg.JanitorInterval,
+		UploadStaleAfter: cfg.UploadStaleAfter, InventorySweepInterval: cfg.InventorySweepInterval, Logger: logger})
 	uploader := upload.New(store, reg, workers, placement.Random{}, upload.Config{
 		ChunkSize:         cfg.ChunkSize,
 		ReplicationFactor: cfg.ReplicationFactor,
@@ -111,6 +117,21 @@ func serve(cfg config.Controller, logger *slog.Logger) error {
 		OnDelete:               jan.Kick,
 		MaxConcurrentDownloads: cfg.MaxConcurrentDownloads,
 		Logger:                 logger,
+		Inventories: func(ctx context.Context, workersIn []registry.Worker) (map[string][]meta.InventoryEntry, error) {
+			out := make(map[string][]meta.InventoryEntry, len(workersIn))
+			for _, w := range workersIn {
+				inv, err := workers.Inventory(ctx, w.Address, w.ID)
+				if err != nil {
+					return nil, err
+				}
+				entries := make([]meta.InventoryEntry, len(inv.Chunks))
+				for i, c := range inv.Chunks {
+					entries[i] = meta.InventoryEntry{ChunkID: c.ChunkID, Size: c.Size}
+				}
+				out[w.ID] = entries
+			}
+			return out, nil
+		},
 	})
 
 	ln, err := net.Listen("tcp", cfg.ListenAddr)

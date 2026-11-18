@@ -1,11 +1,11 @@
 # API Reference
 
-> **Status (end of Phase 6):** **every endpoint is IMPLEMENTED** and tested:
+> **Status (Phase 11):** **every endpoint is IMPLEMENTED** and tested:
 > all client endpoints of the specification (see the conformance checklist at
 > the end of the client API section), all worker endpoints, the controller's
 > membership endpoints (with real inventory reconciliation), `/healthz`,
 > `/cluster` (workers, storage totals, and repair counters), and
-> `/admin/audit` (v1). Audit I4 (Phase 9) is still to come. Each
+> `/admin/audit` (v2), including inventory I4. Each
 > endpoint lists the phase that implements it; when that phase completes, its
 > section is marked **IMPLEMENTED**. Until then, details may be refined, and
 > any change is recorded in [`DECISIONS.md`](DECISIONS.md). Verified `curl`
@@ -388,7 +388,7 @@ lost and repaired:
 (every `RECONCILER_INTERVAL`), so they lag a state change by up to one
 round. Absent when the controller runs without a repair loop.
 
-### `GET /admin/audit` — invariant audit · IMPLEMENTED (Phase 6, v1); I4 in Phase 9
+### `GET /admin/audit` — invariant audit · IMPLEMENTED (Phase 9, v2)
 
 Checks the correctness invariants against live metadata (architecture
 §3.4, §5.9). Always 200 (500 only if the database fails). Verified example
@@ -408,6 +408,7 @@ Checks the correctness invariants against live metadata (architecture
 | I3 | safety | No two replica rows of one chunk on one worker |
 | I7 | safety | The listing contains exactly the READY objects |
 | I8 | safety | No (chunk, worker) has both a replica row and a pending delete |
+| I4 | safety | ALIVE worker inventories match replica rows and pending-delete intents |
 | I5 | steady_state | Every chunk of every READY object has exactly RF effective replicas |
 
 `ok` is true when every **safety** invariant holds; these must hold at all
@@ -415,8 +416,9 @@ times, and a false `ok` is a bug (also logged as `audit_violation`).
 `steady_state` reports I5, which the design only promises "in steady state":
 it is expected to be false while a worker is down or until repair (Phase 7)
 has restored the lost copies. `examples` lists up to 10 violations per check.
-Not in the audit: I4 (needs worker inventories, Phase 9) and I6 (checked by
-every download). The checks are independent reads, so a check racing a
+I6 is checked by every download. I4 is checked for workers that are currently
+ALIVE; unavailable workers are handled by liveness and inventory resync. The
+checks are independent reads, so a check racing a
 concurrent operation can report a transient I5 change; the safety checks only
 look at READY objects, whose chunk rows never change.
 

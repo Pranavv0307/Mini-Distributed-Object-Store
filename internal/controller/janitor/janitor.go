@@ -20,11 +20,16 @@ import (
 
 	"objstore/internal/controller/meta"
 	"objstore/internal/controller/registry"
+	"objstore/internal/wire"
 )
 
 // Deleter deletes chunk files on workers (workerclient.Client).
 type Deleter interface {
 	DeleteChunk(ctx context.Context, baseURL, chunkID string) error
+}
+
+type InventoryLister interface {
+	Inventory(ctx context.Context, baseURL, workerID string) (wire.InventoryResponse, error)
 }
 
 // Config configures a Janitor.
@@ -33,18 +38,21 @@ type Config struct {
 	BatchSize   int           // pending deletes handled per round (default 256)
 	Concurrency int           // parallel DELETE calls (default 8)
 	// MaxBackoff caps the retry delay after failed deletes (default 5m).
-	MaxBackoff time.Duration
-	Logger     *slog.Logger
+	MaxBackoff             time.Duration
+	UploadStaleAfter       time.Duration
+	InventorySweepInterval time.Duration
+	Logger                 *slog.Logger
 }
 
 // Janitor is the cleanup loop.
 type Janitor struct {
-	meta    *meta.Store
-	reg     *registry.Registry
-	deleter Deleter
-	cfg     Config
-	kick    chan struct{}
-	log     *slog.Logger
+	meta      *meta.Store
+	reg       *registry.Registry
+	deleter   Deleter
+	cfg       Config
+	kick      chan struct{}
+	log       *slog.Logger
+	lastSweep time.Time
 }
 
 // New creates a Janitor.
@@ -57,6 +65,12 @@ func New(m *meta.Store, reg *registry.Registry, d Deleter, cfg Config) *Janitor 
 	}
 	if cfg.MaxBackoff <= 0 {
 		cfg.MaxBackoff = 5 * time.Minute
+	}
+	if cfg.UploadStaleAfter <= 0 {
+		cfg.UploadStaleAfter = 10 * time.Minute
+	}
+	if cfg.InventorySweepInterval <= 0 {
+		cfg.InventorySweepInterval = 5 * time.Minute
 	}
 	logger := cfg.Logger
 	if logger == nil {
@@ -101,6 +115,17 @@ type Result struct {
 // RunOnce performs one round.
 func (j *Janitor) RunOnce(ctx context.Context) (Result, error) {
 	var res Result
+	if n, err := j.meta.AbortStaleUploads(ctx, j.cfg.UploadStaleAfter); err != nil {
+		return res, err
+	} else if n > 0 {
+		j.log.Warn("stale_uploads_aborted", "objects", n)
+	}
+	if j.cfg.InventorySweepInterval > 0 && (j.lastSweep.IsZero() || time.Since(j.lastSweep) >= j.cfg.InventorySweepInterval) {
+		if err := j.sweepInventories(ctx); err != nil {
+			return res, err
+		}
+		j.lastSweep = time.Now()
+	}
 	alive := j.reg.Alive()
 	addr := make(map[string]string, len(alive))
 	workerIDs := make([]string, 0, len(alive))
@@ -162,4 +187,30 @@ func (j *Janitor) RunOnce(ctx context.Context) (Result, error) {
 		j.log.Info("janitor_round", "deleted", res.Deleted, "failed", res.Failed, "finalized", len(res.Finalized))
 	}
 	return res, nil
+}
+
+func (j *Janitor) sweepInventories(ctx context.Context) error {
+	lister, ok := j.deleter.(InventoryLister)
+	if !ok {
+		return nil
+	}
+	for _, w := range j.reg.Alive() {
+		inv, err := lister.Inventory(ctx, w.Address, w.ID)
+		if err != nil {
+			j.log.Warn("inventory_sweep_failed", "worker_id", w.ID, "error", err)
+			continue
+		}
+		entries := make([]meta.InventoryEntry, len(inv.Chunks))
+		for i, c := range inv.Chunks {
+			entries[i] = meta.InventoryEntry{ChunkID: c.ChunkID, Size: c.Size}
+		}
+		result, err := j.meta.ReconcileInventory(ctx, w.ID, entries)
+		if err != nil {
+			return err
+		}
+		if result.OrphansQueued > 0 {
+			j.log.Warn("inventory_orphans_queued", "worker_id", w.ID, "count", result.OrphansQueued)
+		}
+	}
+	return nil
 }

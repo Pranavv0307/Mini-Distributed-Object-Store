@@ -39,6 +39,7 @@ x-worker-env: &worker-env
   CHUNK_SIZE: ${CHUNK_SIZE:-1000000}
   FSYNC_ON_WRITE: ${FSYNC_ON_WRITE:-true}
   MAX_CONCURRENT_READS: ${MAX_CONCURRENT_READS:-16}
+  SCRUB_INTERVAL: ${SCRUB_INTERVAL:-10m}
 
 services:
   controller:
@@ -72,6 +73,8 @@ services:
       JANITOR_INTERVAL: ${JANITOR_INTERVAL:-10s}
       RECONCILER_INTERVAL: ${RECONCILER_INTERVAL:-5s}
       MAX_CONCURRENT_REPAIRS: ${MAX_CONCURRENT_REPAIRS:-4}
+      UPLOAD_STALE_AFTER: ${UPLOAD_STALE_AFTER:-10m}
+      INVENTORY_SWEEP_INTERVAL: ${INVENTORY_SWEEP_INTERVAL:-5m}
     volumes:
       - controller-data:/data # metadata database (DB_PATH)
     healthcheck:

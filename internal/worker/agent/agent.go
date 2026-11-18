@@ -58,6 +58,8 @@ type Config struct {
 	BackoffMin, BackoffMax time.Duration
 	Client                 *http.Client
 	Logger                 *slog.Logger
+	// Suspects supplies the latest worker-side scrubber findings.
+	Suspects func() []string
 }
 
 // Agent runs the membership protocol for one worker.
@@ -208,6 +210,9 @@ func (a *Agent) heartbeatOnce(ctx context.Context, epoch uint64) (string, error)
 		UsedBytes:     st.UsedBytes,
 		ChunkCount:    st.ChunkCount,
 		SuspectChunks: []string{},
+	}
+	if a.cfg.Suspects != nil {
+		req.SuspectChunks = a.cfg.Suspects()
 	}
 	var resp wire.HeartbeatResponse
 	if err := a.postJSON(ctx, a.cfg.HeartbeatTimeout, "/internal/workers/heartbeat", req, &resp); err != nil {

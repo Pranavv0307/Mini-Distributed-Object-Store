@@ -31,13 +31,14 @@ const MaxConfigurableChunkSize int64 = 64 << 20
 
 // Worker is the configuration of a worker process.
 type Worker struct {
-	WorkerID           string     // WORKER_ID (required): stable identity
-	ListenAddr         string     // LISTEN_ADDR
-	DataDir            string     // DATA_DIR: root of the persistent volume
-	ChunkSize          int64      // CHUNK_SIZE: maximum accepted chunk payload
-	FsyncOnWrite       bool       // FSYNC_ON_WRITE
-	MaxConcurrentReads int        // MAX_CONCURRENT_READS: bounds GET memory
-	LogLevel           slog.Level // LOG_LEVEL: debug|info|warn|error
+	WorkerID           string        // WORKER_ID (required): stable identity
+	ListenAddr         string        // LISTEN_ADDR
+	DataDir            string        // DATA_DIR: root of the persistent volume
+	ChunkSize          int64         // CHUNK_SIZE: maximum accepted chunk payload
+	FsyncOnWrite       bool          // FSYNC_ON_WRITE
+	MaxConcurrentReads int           // MAX_CONCURRENT_READS: bounds GET memory
+	ScrubInterval      time.Duration // SCRUB_INTERVAL: worker verification pass
+	LogLevel           slog.Level    // LOG_LEVEL: debug|info|warn|error
 	// ControllerURL (CONTROLLER_URL) is the controller's base URL. Empty
 	// means standalone mode: no registration, writes accepted immediately
 	// (DEC-026). Compose always sets it.
@@ -59,8 +60,11 @@ func LoadWorker(getenv func(string) string) (Worker, error) {
 		ChunkSize:          l.int64("CHUNK_SIZE", DefaultChunkSize, 1, MaxConfigurableChunkSize),
 		FsyncOnWrite:       l.bool("FSYNC_ON_WRITE", true),
 		MaxConcurrentReads: int(l.int64("MAX_CONCURRENT_READS", 16, 1, 1024)),
-		LogLevel:           l.level("LOG_LEVEL", slog.LevelInfo),
-		ControllerURL:      l.url("CONTROLLER_URL", ""),
+		// Zero means the scrubber's documented ten-minute default; keeping the
+		// zero here preserves the compact worker config's existing default shape.
+		ScrubInterval: l.duration("SCRUB_INTERVAL", 0, time.Second, 24*time.Hour),
+		LogLevel:      l.level("LOG_LEVEL", slog.LevelInfo),
+		ControllerURL: l.url("CONTROLLER_URL", ""),
 	}
 	switch {
 	case c.WorkerID == "":
@@ -123,7 +127,9 @@ type Controller struct {
 	// ReconcilerInterval (RECONCILER_INTERVAL): repair round period.
 	ReconcilerInterval time.Duration
 	// MaxConcurrentRepairs (MAX_CONCURRENT_REPAIRS): copies in flight at once.
-	MaxConcurrentRepairs int
+	MaxConcurrentRepairs   int
+	UploadStaleAfter       time.Duration
+	InventorySweepInterval time.Duration
 }
 
 // LoadController reads controller configuration through getenv.
@@ -150,6 +156,8 @@ func LoadController(getenv func(string) string) (Controller, error) {
 		JanitorInterval:        l.duration("JANITOR_INTERVAL", 10*time.Second, 5*time.Millisecond, time.Hour),
 		ReconcilerInterval:     l.duration("RECONCILER_INTERVAL", 5*time.Second, 5*time.Millisecond, time.Hour),
 		MaxConcurrentRepairs:   int(l.int64("MAX_CONCURRENT_REPAIRS", 4, 1, 256)),
+		UploadStaleAfter:       l.duration("UPLOAD_STALE_AFTER", 0, time.Second, 24*time.Hour),
+		InventorySweepInterval: l.duration("INVENTORY_SWEEP_INTERVAL", 0, time.Second, 24*time.Hour),
 	}
 	if c.DBPath == "" {
 		l.fail("DB_PATH", "must not be empty")

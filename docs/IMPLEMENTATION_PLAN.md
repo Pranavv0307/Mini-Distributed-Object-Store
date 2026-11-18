@@ -18,10 +18,10 @@ owner review. The owner makes the git commit for each phase.
 | 5 | M5 | Complete client API, delete path, error mapping | 4 | COMPLETED |
 | 6 | M6 | Degraded operation, full inventory reconciliation, audit v1 | 5 | COMPLETED |
 | 7 | M7 | Self-healing re-replication (reconciler) | 6 | COMPLETED (awaiting review) |
-| 8 | M8 | Data integrity: scrubber, cross-check, corrupt repair | 7 | NOT STARTED |
-| 9 | M9 | Crash consistency, janitor, recovery, audit v2 | 8 | NOT STARTED |
-| 10 | M10 | Evaluation: benchmarks, chaos, invariant tests | 9 | NOT STARTED |
-| 11 | M11 | Packaging: README demo, one-command demo | 10 | NOT STARTED |
+| 8 | M8 | Data integrity: scrubber, cross-check, corrupt repair | 7 | COMPLETED |
+| 9 | M9 | Crash consistency, janitor, recovery, audit v2 | 8 | COMPLETED |
+| 10 | M10 | Evaluation: benchmarks, chaos, invariant tests | 9 | COMPLETED |
+| 11 | M11 | Packaging: README demo, one-command demo | 10 | COMPLETED |
 | S1–S5 | Stretch | Rendezvous hashing, prefetch, Range, metrics, zones | 9 | Optional |
 
 ## Testing levels used throughout

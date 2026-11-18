@@ -6,7 +6,7 @@ Practical, step-by-step instructions to set up, run, and verify the project.
 > observed at the phase noted. Sections for later phases are marked
 > *not yet available* until those phases are implemented.
 
-**Current state (end of Phase 7):** the cluster runs under Docker Compose:
+**Current state (Phase 11 complete):** the cluster runs under Docker Compose:
 one controller and four workers. **Every client API endpoint of the
 specification works:** upload (1 MB chunks, two copies on distinct workers,
 atomic commit), verified download with replica fallback, metadata GET and
@@ -14,8 +14,9 @@ PATCH, list with pagination, and delete; `objctl` natively and as a Compose
 `client` container. Returning workers are reconciled against the metadata;
 `/cluster` shows replication health and `/admin/audit` checks the invariants.
 **Lost and corrupt copies are re-replicated automatically** after
-`REPAIR_GRACE`. The worker scrubber and full crash recovery come in Phases
-8–9.
+`REPAIR_GRACE`. The worker scrubber, crash recovery, inventory sweep, and
+evaluation scripts are implemented in Phases 8–10. The packaged one-command
+demo and viva matrix are in `../scripts/demo.sh` and `VIVA_GUIDE.md`.
 
 > ⚠️ **Docker name collisions.** Container names are global on a Docker host.
 > The Compose file uses the spec's names `controller` and `worker1`…`worker4`.
@@ -115,6 +116,9 @@ All variables are optional (defaults shown). Set them in the shell or in a
 | `JANITOR_INTERVAL` | controller | `10s` | Cleanup round period (also runs right after an aborted upload) |
 | `RECONCILER_INTERVAL` | controller | `5s` | Repair round period |
 | `MAX_CONCURRENT_REPAIRS` | controller | `4` | Repair copies in flight at once |
+| `SCRUB_INTERVAL` | workers | `10m` | Worker integrity verification pass |
+| `UPLOAD_STALE_AFTER` | controller | `10m` | Inactive upload cleanup threshold |
+| `INVENTORY_SWEEP_INTERVAL` | controller | `5m` | Periodic full inventory reconciliation |
 
 Fixed per service in `docker-compose.yml`: `WORKER_ID=workerN`,
 `ADVERTISE_ADDR=http://workerN:9000`, `CONTROLLER_URL=http://controller:8080`,
@@ -616,14 +620,17 @@ and nothing is deleted (`TestNoRepairWithinGrace`).
 
 ### 5.10 Crash consistency
 
-Crash mid-write on a worker: covered by automated tests (§6). Controller
-crash recovery and the orphan sweep: *not yet available* (Phase 9).
+Crash mid-write on a worker is covered by `TestWorkerKilledMidWriteLeavesNoPartialChunk`.
+Controller startup recovery converts unfinished uploads and pending claims into
+durable janitor work. Periodic inventory sweeps reconcile missing files and
+orphans. See [`VIVA_GUIDE.md`](VIVA_GUIDE.md) for the manual controller-crash
+walkthrough.
 
 ---
 
 ## 6. Automated testing and static analysis
 
-Run from the repository root. All verified at Phase 7.
+Run from the repository root. The normal checks are verified through Phase 11.
 
 ### Unit and integration tests
 

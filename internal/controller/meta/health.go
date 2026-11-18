@@ -100,6 +100,71 @@ type AuditReport struct {
 	Checks      []AuditCheck `json:"checks"`
 }
 
+// AuditInventory checks I4 against metadata and worker inventory snapshots.
+// A file is valid when it has a replica row or a pending-delete intent; a
+// replica is valid when the worker still reports its file or deletion is
+// already queued. The caller supplies snapshots so this method performs no
+// network I/O while holding a database transaction.
+func (s *Store) AuditInventory(ctx context.Context, inventories map[string][]InventoryEntry) (AuditCheck, error) {
+	check := AuditCheck{ID: "I4", Description: "worker inventories match replica rows and pending-delete intents", Kind: "safety", Examples: []string{}}
+	onDisk := map[string]map[string]bool{}
+	for worker, entries := range inventories {
+		onDisk[worker] = map[string]bool{}
+		for _, entry := range entries {
+			onDisk[worker][entry.ChunkID] = true
+		}
+	}
+	rows, err := s.db.QueryContext(ctx, `SELECT chunk_id, worker_id FROM replicas`)
+	if err != nil {
+		return check, err
+	}
+	for rows.Next() {
+		var chunkID, workerID string
+		if err := rows.Scan(&chunkID, &workerID); err != nil {
+			rows.Close()
+			return check, err
+		}
+		if _, known := inventories[workerID]; !known {
+			continue
+		}
+		if !onDisk[workerID][chunkID] {
+			var pending int
+			if err := s.db.QueryRowContext(ctx, `SELECT COUNT(*) FROM pending_deletes WHERE chunk_id = ? AND worker_id = ?`, chunkID, workerID).Scan(&pending); err != nil {
+				rows.Close()
+				return check, err
+			}
+			if pending == 0 {
+				checkViolation(&check, chunkID+" missing on "+workerID)
+			}
+		}
+	}
+	if err := rows.Close(); err != nil {
+		return check, err
+	}
+	if err := rows.Err(); err != nil {
+		return check, err
+	}
+	for worker, entries := range inventories {
+		for _, entry := range entries {
+			var rows int
+			if err := s.db.QueryRowContext(ctx, `SELECT (SELECT COUNT(*) FROM replicas WHERE chunk_id = ? AND worker_id = ?) + (SELECT COUNT(*) FROM pending_deletes WHERE chunk_id = ? AND worker_id = ?)`, entry.ChunkID, worker, entry.ChunkID, worker).Scan(&rows); err != nil {
+				return check, err
+			}
+			if rows == 0 {
+				checkViolation(&check, entry.ChunkID+" orphan on "+worker)
+			}
+		}
+	}
+	return check, nil
+}
+
+func checkViolation(c *AuditCheck, example string) {
+	c.Violations++
+	if len(c.Examples) < maxExamples {
+		c.Examples = append(c.Examples, example)
+	}
+}
+
 const maxExamples = 10
 
 // Audit evaluates the invariants that can be checked from metadata alone

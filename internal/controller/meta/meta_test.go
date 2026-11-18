@@ -88,12 +88,76 @@ func TestUploadLifecycle(t *testing.T) {
 	}
 }
 
+func TestMarkSuspectCorruptCrossChecksReadyMetadata(t *testing.T) {
+	s, _ := openTest(t)
+	obj, cs := upload(t, s, 1, 10)
+	if _, err := commit(s, obj, 1, 10); err != nil {
+		t.Fatal(err)
+	}
+	if changed, err := s.MarkSuspectCorrupt(ctx, cs[0].ID, "unknown"); err != nil || changed {
+		t.Fatalf("unknown suspect = changed %v err %v", changed, err)
+	}
+	if changed, err := s.MarkSuspectCorrupt(ctx, cs[0].ID, "w1"); err != nil || !changed {
+		t.Fatalf("known suspect = changed %v err %v", changed, err)
+	}
+	if changed, err := s.MarkSuspectCorrupt(ctx, cs[0].ID, "w1"); err != nil || changed {
+		t.Fatalf("repeat suspect = changed %v err %v", changed, err)
+	}
+	obj2, cs2 := upload(t, s, 1, 10)
+	if changed, err := s.MarkSuspectCorrupt(ctx, cs2[0].ID, "w1"); err != nil || changed {
+		t.Fatalf("uploading suspect = changed %v err %v", changed, err)
+	}
+	_ = obj2
+}
+
 func TestEmptyObjectCommits(t *testing.T) {
 	s, _ := openTest(t)
 	obj, _ := upload(t, s, 0, 0)
 	o, err := s.CommitObject(ctx, CommitInput{ObjectID: obj, ReplicationFactor: 2, ChecksumSHA256: "e3b0"})
 	if err != nil || o.Status != StatusReady || o.NumChunks != 0 || o.Size != 0 {
 		t.Fatalf("empty commit = %+v, %v", o, err)
+	}
+}
+
+func TestRecoverUploadingAndAbortStaleUploads(t *testing.T) {
+	s, _ := openTest(t)
+	obj, _ := upload(t, s, 1, 10)
+	if n, err := s.RecoverUploading(ctx); err != nil || n != 1 {
+		t.Fatalf("RecoverUploading = %d, %v", n, err)
+	}
+	o, err := s.GetObject(ctx, obj)
+	if err != nil || o.Status != StatusDeleting {
+		t.Fatalf("recovered object = %+v, %v", o, err)
+	}
+	if p, _ := s.PendingDeletesFor(ctx, obj); len(p) != 2 {
+		t.Fatalf("recovered pending deletes = %+v", p)
+	}
+	obj2, _ := s.CreateObject(ctx, ids.NewObjectID(), "stale", "x")
+	_ = obj2
+	// The test store clock is real; a zero duration is explicitly a no-op.
+	if n, err := s.AbortStaleUploads(ctx, 0); err != nil || n != 0 {
+		t.Fatalf("disabled stale cleanup = %d, %v", n, err)
+	}
+}
+
+func TestAuditInventory(t *testing.T) {
+	s, _ := openTest(t)
+	obj, cs := upload(t, s, 1, 10)
+	if _, err := commit(s, obj, 1, 10); err != nil {
+		t.Fatal(err)
+	}
+	check, err := s.AuditInventory(ctx, map[string][]InventoryEntry{
+		"w1": {{ChunkID: cs[0].ID, Size: 10}}, "w2": {{ChunkID: cs[0].ID, Size: 10}},
+	})
+	if err != nil || check.Violations != 0 {
+		t.Fatalf("healthy I4 = %+v, %v", check, err)
+	}
+	check, err = s.AuditInventory(ctx, map[string][]InventoryEntry{
+		"w1": {{ChunkID: cs[0].ID, Size: 10}, {ChunkID: "3f2b8c1e-9a4d-4e2f-8b7a-1c2d3e4f5a6b_000001", Size: 1}},
+		"w2": {{ChunkID: cs[0].ID, Size: 10}},
+	})
+	if err != nil || check.Violations != 1 {
+		t.Fatalf("orphan I4 = %+v, %v", check, err)
 	}
 }
 

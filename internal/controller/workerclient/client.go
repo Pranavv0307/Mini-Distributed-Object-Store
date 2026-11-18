@@ -45,6 +45,30 @@ type Client struct {
 	requestTimeout time.Duration
 }
 
+// Inventory fetches the worker's metadata-only inventory for the periodic
+// controller orphan/missing-file sweep.
+func (c *Client) Inventory(ctx context.Context, baseURL, workerID string) (wire.InventoryResponse, error) {
+	ctx, cancel := context.WithTimeout(ctx, c.requestTimeout)
+	defer cancel()
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, baseURL+"/internal/workers/"+workerID+"/chunks", nil)
+	if err != nil {
+		return wire.InventoryResponse{}, err
+	}
+	resp, err := c.http.Do(req)
+	if err != nil {
+		return wire.InventoryResponse{}, fmt.Errorf("worker inventory: %w", err)
+	}
+	defer drainClose(resp.Body)
+	if resp.StatusCode != http.StatusOK {
+		return wire.InventoryResponse{}, responseError("inventory", resp)
+	}
+	var out wire.InventoryResponse
+	if err := json.NewDecoder(resp.Body).Decode(&out); err != nil {
+		return out, fmt.Errorf("worker inventory: decode: %w", err)
+	}
+	return out, nil
+}
+
 // New creates a Client. connectTimeout bounds TCP connection setup
 // (WORKER_CONNECT_TIMEOUT), requestTimeout bounds each whole request
 // (WORKER_REQUEST_TIMEOUT).

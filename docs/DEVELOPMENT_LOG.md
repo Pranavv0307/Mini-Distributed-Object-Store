@@ -751,3 +751,124 @@ Phase 8 adds the scrubber and the cross-check.
 Phase 8: worker scrubber reporting suspects via heartbeat, controller
 cross-check, end-to-end corruption scenarios (one corrupt copy repaired,
 deleted file repaired, both copies corrupt refused).
+
+## Phase 8 — Data integrity (2026-11-18)
+
+### What was implemented
+
+- Added `internal/worker/scrub`: periodic full-pass verification of every
+  committed chunk's length and SHA-256 against its atomic on-disk header.
+  Suspects remain latched until a later clean pass and are sent on the next
+  membership heartbeat.
+- Wired `SCRUB_INTERVAL` through worker configuration and the worker process;
+  standalone workers scrub too, while cluster workers report findings through
+  the existing heartbeat field.
+- Added `meta.MarkSuspectCorrupt`, which cross-checks a scrubber report against
+  a `READY` object and an `OK` replica row before changing metadata to
+  `CORRUPT`. The existing Phase 7 repair loop then rewrites the copy in place
+  without grace.
+- Added tests for detection/clearing and metadata ownership/state
+  cross-checking. Existing read-path corruption and repair tests remain the
+  end-to-end coverage for fallback, refusal, and repair.
+
+### Tests performed and results (2026-11-18)
+
+- `gofmt -w` on changed Go files: pass.
+- `go test ./...`: pass.
+
+### Known limitations
+
+- A scrubber cannot name a deleted file that is absent from the worker's
+  inventory; periodic controller inventory reconciliation in Phase 9 detects
+  that case. The worker scrubber covers payload, length, and header damage
+  without requiring a client read.
+
+### Work remaining
+
+Phase 9: startup recovery, stale upload cleanup, pending-delete recovery, and
+periodic inventory orphan sweeps.
+
+## Phase 9 — Crash consistency and janitor (2026-11-18)
+
+### What was implemented
+
+- Added metadata startup recovery: unfinished `UPLOADING` objects become
+  `DELETING`, all their replica claims become durable pending deletes, and
+  dangling `PENDING` claims from a controller crash are also converted to
+  deletion work before HTTP traffic starts.
+- Extended the janitor with stale-upload expiry and periodic full worker
+  inventory sweeps. Sweeps reuse the conditional Phase 6 reconciliation table,
+  so missing files, size damage, and orphans are handled idempotently.
+- Added worker-client inventory retrieval and configuration for
+  `UPLOAD_STALE_AFTER` and `INVENTORY_SWEEP_INTERVAL`.
+
+### Tests performed and results (2026-11-18)
+
+- `go test ./...`: pass.
+- `go vet ./...`: pass.
+- Added metadata coverage for startup recovery and disabled stale cleanup;
+  existing janitor, resync, delete, and crash-path tests remain green.
+
+### Known limitations
+
+- The inventory sweep is best-effort when a worker is unavailable; the next
+  successful sweep or registration retries the reconciliation.
+- Audit v2's I4 inventory invariant is checked on `/admin/audit` for workers
+  that are currently ALIVE; unavailable workers are intentionally omitted from
+  that snapshot and handled by liveness/resync.
+
+## Phase 10 — Evaluation (2026-11-18)
+
+### What was implemented
+
+- Added [`docs/EVALUATION.md`](EVALUATION.md), a reproducible results table,
+  benchmark instructions, and the Compose worker-loss smoke test.
+- Added `scripts/phase10-benchmark.sh` for sequential/windowed upload
+  measurements and `scripts/phase10-chaos.sh` for upload, worker stop/start,
+  repair, and audit observation.
+
+### Status
+
+The evaluation harness is ready. The results table is intentionally blank
+until it is run on the owner's target host; no hardware-dependent throughput
+or latency numbers are being asserted here.
+
+### Evaluation run (2026-11-18)
+
+`BENCH_ARGS='-benchtime=1x' ./scripts/phase10-benchmark.sh` passed on the
+development host (Linux amd64, Intel Core Ultra 5 125H): window 1 31.11 MB/s,
+window 2 46.83 MB/s, window 4 32.82 MB/s, and window 8 28.89 MB/s. This is a
+single sample, not a median/p99 result; the owner should run the documented
+repeated benchmark and Compose chaos script for the final evaluation table.
+
+`gofmt -l .`, `go vet ./...`, and `go tool staticcheck ./...` passed.
+
+## Phase 11 — Packaging and viva demonstration (2026-11-18)
+
+### What was implemented
+
+- Updated the README and project status through Phase 11.
+- Added `scripts/demo.sh`, a safe one-command Compose walkthrough covering
+  startup, membership, upload, replication metadata, PATCH, list, verified
+  download, worker loss/fallback, worker return, audit, and delete. It keeps
+  volumes unless the operator explicitly runs `docker compose down -v`.
+- Added `docs/VIVA_GUIDE.md`, which maps each feature and failure scenario to
+  an existing automated test or a reproducible manual demonstration. It
+  includes scrubber corruption, both-copy data loss, insufficient workers,
+  wiped volumes, controller restart, and crash recovery.
+- Updated Compose to pass scrubber and Phase 9 janitor settings, and refreshed
+  `RUN_AND_TEST.md` with the packaged entry points.
+
+### Tests performed and results (2026-11-18)
+
+- `bash -n scripts/*.sh`: pass.
+- `docker compose config`: pass.
+- `go test ./...`: pass.
+- `git diff --check`: pass.
+
+### Phase 11 handoff
+
+From a fresh checkout, after `docker compose down -v`, run
+`./scripts/demo.sh`. For a viva, use `docs/VIVA_GUIDE.md` to choose the
+normal API or failure-handling demonstration and show `/cluster`,
+`/admin/audit`, replica metadata, and controller logs as evidence.

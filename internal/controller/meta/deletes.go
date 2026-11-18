@@ -7,6 +7,115 @@ import (
 	"time"
 )
 
+// RecoverUploading moves every upload left unfinished by a controller crash
+// to DELETING and creates durable physical-delete intents for its replicas.
+// It is idempotent and is run before the controller accepts client traffic.
+func (s *Store) RecoverUploading(ctx context.Context) (int, error) {
+	rows, err := s.db.QueryContext(ctx, `SELECT object_id FROM objects WHERE status = 'UPLOADING' ORDER BY object_id`)
+	if err != nil {
+		return 0, err
+	}
+	var ids []string
+	for rows.Next() {
+		var id string
+		if err := rows.Scan(&id); err != nil {
+			rows.Close()
+			return 0, err
+		}
+		ids = append(ids, id)
+	}
+	if err := rows.Close(); err != nil {
+		return 0, err
+	}
+	if err := rows.Err(); err != nil {
+		return 0, err
+	}
+	for _, id := range ids {
+		if _, err := s.MarkDeleting(ctx, id, "controller_crash_recovery", StatusUploading); err != nil {
+			return 0, err
+		}
+	}
+	pending, err := s.RecoverPendingReplicas(ctx)
+	if err != nil {
+		return 0, err
+	}
+	return len(ids) + pending, nil
+}
+
+// RecoverPendingReplicas turns claims left by a controller crash into durable
+// deletes. A PENDING write may have reached a worker before the crash, so it
+// must never simply be forgotten.
+func (s *Store) RecoverPendingReplicas(ctx context.Context) (int, error) {
+	count := 0
+	err := s.tx(ctx, func(tx *sql.Tx) error {
+		rows, err := tx.QueryContext(ctx, `
+			SELECT r.chunk_id, r.worker_id, c.object_id
+			FROM replicas r JOIN chunks c ON c.chunk_id = r.chunk_id
+			WHERE r.state = 'PENDING'`)
+		if err != nil {
+			return err
+		}
+		var claims [][3]string
+		for rows.Next() {
+			var c [3]string
+			if err := rows.Scan(&c[0], &c[1], &c[2]); err != nil {
+				rows.Close()
+				return err
+			}
+			claims = append(claims, c)
+		}
+		if err := rows.Close(); err != nil {
+			return err
+		}
+		if err := rows.Err(); err != nil {
+			return err
+		}
+		now := s.nowNanos()
+		for _, c := range claims {
+			if _, err := moveToPendingDelete(ctx, tx, c[2], c[0], c[1], ReplicaPending, "controller_crash_recovery", now); err != nil {
+				return err
+			}
+			count++
+		}
+		return nil
+	})
+	return count, err
+}
+
+// AbortStaleUploads moves uploads with no activity for older than maxAge to
+// DELETING. It is the periodic counterpart to RecoverUploading.
+func (s *Store) AbortStaleUploads(ctx context.Context, maxAge time.Duration) (int, error) {
+	if maxAge <= 0 {
+		return 0, nil
+	}
+	cutoff := s.now().Add(-maxAge).UnixNano()
+	rows, err := s.db.QueryContext(ctx, `SELECT object_id FROM objects WHERE status = 'UPLOADING' AND last_activity < ?`, cutoff)
+	if err != nil {
+		return 0, err
+	}
+	var ids []string
+	for rows.Next() {
+		var id string
+		if err := rows.Scan(&id); err != nil {
+			rows.Close()
+			return 0, err
+		}
+		ids = append(ids, id)
+	}
+	if err := rows.Close(); err != nil {
+		return 0, err
+	}
+	if err := rows.Err(); err != nil {
+		return 0, err
+	}
+	for _, id := range ids {
+		if _, err := s.MarkDeleting(ctx, id, "stale_upload", StatusUploading); err != nil {
+			return 0, err
+		}
+	}
+	return len(ids), nil
+}
+
 // PendingDelete is a durable request to delete one chunk file from one
 // worker (DEC-007).
 type PendingDelete struct {

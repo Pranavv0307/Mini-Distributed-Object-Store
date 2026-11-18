@@ -6,13 +6,14 @@ a single controller keeps the metadata, detects failed workers, and repairs
 lost or corrupted data automatically. The whole system runs on one machine
 with Docker Compose.
 
-> **Implementation status: Phase 7 of 11 complete.** The cluster (1
+> **Implementation status: Phases 0–11 complete.** The cluster (1
 > controller + 4 workers) runs under Docker Compose and **every client API
 > endpoint of the specification works** (upload, verified download, metadata
 > GET/PATCH, list, delete, `objctl`). The system **heals itself**: after a
 > worker has been gone for `REPAIR_GRACE` (30 s), its chunks are copied to the
 > remaining workers until every chunk has two copies again; corrupt copies are
-> rewritten. The worker scrubber and full crash recovery come next. See
+> rewritten. The worker scrubber, crash recovery, and packaged viva demo are
+> included. See
 > [Current status](#current-status).
 
 ## The problem
@@ -98,12 +99,14 @@ internal/
   worker/store/      on-disk chunk store (atomic, checksummed)
   worker/server/     worker HTTP API and write gate
   worker/agent/      worker membership: register, heartbeat, re-register
+  worker/scrub/      periodic worker-side integrity verification
   version/           build version string
 test/
   integration/       in-process cluster tests; kill worker mid-write
   e2e/               Docker and Compose tests (build tag `e2e`)
 Dockerfile           one image for all binaries
 docker-compose.yml   controller + worker1..worker4, one volume each
+scripts/              packaged demo, benchmark, and chaos entry points
 docs/
   ARCHITECTURE.md        system as implemented, deviations from the design
   IMPLEMENTATION_PLAN.md phase roadmap and status
@@ -111,6 +114,8 @@ docs/
   DECISIONS.md           implementation decision log (DEC-nnn)
   RUN_AND_TEST.md        how to build, run, and verify everything
   API.md                 every external and internal endpoint
+  EVALUATION.md          benchmark and chaos evaluation instructions
+  VIVA_GUIDE.md          feature and failure demonstrations
   reference/             original design document and project specification
 .env.example         configuration contract (all variables and defaults)
 ```
@@ -151,6 +156,16 @@ docker start worker2                  # ALIVE again; its superseded copies are d
 docker compose down                   # stop; data volumes are kept (-v deletes them)
 ```
 
+For the complete packaged demo:
+
+```bash
+./scripts/demo.sh
+```
+
+It covers the normal API, replica placement, verified download, worker loss
+and fallback, worker return, audit, and deletion. The full feature/failure
+matrix is in [`docs/VIVA_GUIDE.md`](docs/VIVA_GUIDE.md).
+
 > If containers named `controller` or `worker1`…`worker4` already exist on
 > your machine (another project), first run
 > `export OBJSTORE_CONTAINER_PREFIX=objstore-` and use `objstore-worker2` etc.
@@ -173,6 +188,8 @@ implemented.
 - [Run and test guide](docs/RUN_AND_TEST.md)
 - [Implementation plan](docs/IMPLEMENTATION_PLAN.md)
 - [Development log](docs/DEVELOPMENT_LOG.md)
+- [Evaluation](docs/EVALUATION.md)
+- [Viva guide](docs/VIVA_GUIDE.md)
 - [Decision log](docs/DECISIONS.md)
 - [Project specification](docs/reference/Mini_Distributed_Cloud_Object_Store.pdf)
   (text version: [`.txt`](docs/reference/Mini_Distributed_Cloud_Object_Store.txt))
@@ -188,8 +205,11 @@ implemented.
 | 4 | Read path: verified, in-order download with replica fallback | COMPLETED |
 | 5 | Complete client API: metadata, PATCH, list, delete; `objctl` | COMPLETED |
 | 6 | Degraded operation, inventory reconciliation, `/cluster` totals, audit | COMPLETED |
-| 7 | Self-healing re-replication | COMPLETED (awaiting review) |
-| 8–11 | See [implementation plan](docs/IMPLEMENTATION_PLAN.md) | NOT STARTED |
+| 7 | Self-healing re-replication | COMPLETED |
+| 8 | Data integrity, scrubber, corrupt repair | COMPLETED |
+| 9 | Crash consistency and janitor recovery | COMPLETED |
+| 10 | Evaluation harness and chaos checks | COMPLETED |
+| 11 | Packaging and viva demonstration | COMPLETED |
 
 Open item awaiting owner confirmation: string-only custom metadata values
 (DEC-013). The chunk size is confirmed as 1 MB = 1,000,000 bytes (DEC-005).

@@ -29,6 +29,7 @@ import (
 	"objstore/internal/config"
 	"objstore/internal/version"
 	"objstore/internal/worker/agent"
+	"objstore/internal/worker/scrub"
 	"objstore/internal/worker/server"
 	"objstore/internal/worker/store"
 )
@@ -114,6 +115,8 @@ func serve(cfg config.Worker, logger *slog.Logger) error {
 	// opened immediately (DEC-026).
 	agentCtx, stopAgent := context.WithCancel(ctx)
 	defer stopAgent()
+	scrubber := scrub.New(st, cfg.ScrubInterval, logger)
+	go scrubber.Run(agentCtx)
 	agentDone := make(chan struct{})
 	if cfg.ControllerURL == "" {
 		srv.OpenWrites()
@@ -124,6 +127,7 @@ func serve(cfg config.Worker, logger *slog.Logger) error {
 			AdvertiseAddr: cfg.AdvertiseAddr,
 			ControllerURL: cfg.ControllerURL,
 			Logger:        logger,
+			Suspects:      scrubber.Suspects,
 		}, st, srv)
 		go func() {
 			defer close(agentDone)
