@@ -872,3 +872,132 @@ From a fresh checkout, after `docker compose down -v`, run
 `./scripts/demo.sh`. For a viva, use `docs/VIVA_GUIDE.md` to choose the
 normal API or failure-handling demonstration and show `/cluster`,
 `/admin/audit`, replica metadata, and controller logs as evidence.
+
+## Review of Phases 8–10 and fixes (2026-11-22)
+
+Phases 8–11 were committed together (`4310342`, "phase 8 9 10") by another
+developer. This entry records the review of that commit, the problems found,
+and the fixes. Phase 11 (packaging) was drafted in the same commit and is
+**not** treated as complete.
+
+### What was verified before any change
+
+- `go build`, `gofmt -l`, `go vet` (also `-tags e2e`), `staticcheck`,
+  `bash -n scripts/*.sh`: pass.
+- Unit tests (all `internal/...`): pass.
+- **Integration tests: failed on every run** (3 of 3; 9–12 tests each, mostly
+  uploads answering `500 INTERNAL`, plus `TestSpecConformance`). The commit's
+  log said "`go test ./...`: pass".
+- Race detector (Docker): no data race; `TestConcurrentUploads` failed.
+- Docker e2e: 6 of 7 passed; `TestComposeSelfHealing` failed on
+  `I4 Violations:2` in the middle of a repair.
+- `scripts/demo.sh` on a prefixed stack: passed.
+- Manual scrubber check (`SCRUB_INTERVAL=5s`): detected, but the same chunk
+  was marked CORRUPT and repaired 5 times in 5 s.
+
+### Problems found and fixes
+
+1. **Live inventory sweep deleted rows of copies being written** (cause of
+   every integration failure; confirmed by disabling the sweep, after which
+   the suite passed twice). It reused the registration-time reconciliation
+   on ALIVE workers. Fixed with a metadata snapshot taken *before* the
+   inventory and conditional actions (DEC-057, `meta/sweep.go`); lost or
+   wrong-size copies are now marked CORRUPT (repaired in place) instead of
+   having their rows deleted.
+2. **Scrubber repair churn and no real cross-check.** Suspects stayed latched
+   until the next full pass and the controller marked them CORRUPT on the
+   worker's word. Fixed on both sides (DEC-058): the worker re-verifies
+   suspects before each heartbeat (and ignores chunks deleted mid-pass); the
+   controller queues suspects and a new `internal/controller/integrity`
+   verifier reads the copy and compares it with the metadata checksum before
+   marking it, conditionally on the row being unchanged. The scrubber is
+   throttled (`SCRUB_BYTES_PER_SEC`, default 20 MB/s).
+3. **Audit I4 false positives and fragility.** I4 compared inventories with
+   the metadata as it was afterwards (copies in flight looked missing), was a
+   safety check (failing `ok`), and one unreachable worker made the audit
+   return 500. Now: same before/after rule, `steady_state` kind (the design
+   says "after the janitor has run"), unreachable workers listed as
+   `unchecked_workers` (DEC-060).
+4. **Audit I7 false positive under load** (pre-existing since Phase 6, found
+   by the new `TestAuditInventoryDuringWrites`): the listing was compared
+   with a separate count. Now every object READY both before and after the
+   listing must be listed (DEC-060).
+5. **Committed test binaries** `big.bin`, `got.bin` (5.5 MB each) removed;
+   `/*.bin` ignored.
+6. **Missing decisions and tests.** DEC-057..060 added. New tests below.
+7. **Evaluation incomplete** (Phase 10 acceptance: a results table reproducible
+   from scripts; the table was empty). The chaos script restarted the worker
+   immediately (no repair could happen). Added
+   `scripts/phase10-bench-compose.sh`; rewrote `scripts/phase10-chaos.sh` to
+   measure detection and time to full RF; filled `EVALUATION.md` from runs.
+8. **Docs claimed more than was true** ("Phases 0–11 complete", "tests pass").
+   Status corrected everywhere; the viva guide no longer writes or deletes a
+   `.env` file and no longer refers to the removed `big.bin`.
+
+Smaller changes: config defaults for `SCRUB_INTERVAL`, `UPLOAD_STALE_AFTER`,
+`INVENTORY_SWEEP_INTERVAL` are explicit (previously 0 = "package default");
+the replica-error classification moved to `workerclient.ProvesBadReplica`
+(shared by download and the verifier); `startup_recovery` logs `recovered`
+(objects plus claims).
+
+### Tests added
+
+- Unit: `TestSweepInventory`, `TestSweepInventoryRaces` (copies acked and
+  rewritten after the snapshot; claims made after it), `TestAuditInventory`
+  (orphan, missing, unchecked, resolved by a later pending delete),
+  `TestMarkSuspectCorruptIsConditional`, `TestRecoverUploading` (also a
+  dangling claim, READY untouched, idempotent), `TestAbortStaleUploads` (fake
+  clock); scrubber: same-size damage, suspect dropped once rewritten, deleted
+  chunk not a suspect, throttling, cancellation; `internal/controller/integrity`:
+  healthy report not trusted, five kinds of confirmed damage, inconclusive and
+  skipped cases, deduplicated reports.
+- Integration (`test/integration/integrity_test.go`; every integration test
+  now also runs with the sweep every 25 ms and a scrubber on each worker):
+  `TestScrubberDetectsAndRepairsWithoutClientRead` (one repair, no re-marking
+  over further heartbeats), `TestScrubberReportIsCrossChecked`,
+  `TestScrubberBothCopiesCorrupt`, `TestDeletedChunkFileRepairedBySweep`,
+  `TestOrphanFileRemovedBySweep`, `TestControllerCrashMidUploadRecovered`,
+  `TestAuditInventoryDuringWrites`, `TestInvariantsUnderChurn`.
+- E2E: `TestComposeIntegrity` (scrubber without a read, exactly one repair;
+  deleted file found by the sweep), `TestComposeControllerKilledMidUpload`
+  (`docker kill` mid-upload).
+
+### Results after the fixes
+
+See the verification summary below and [`EVALUATION.md`](EVALUATION.md).
+
+### Known limitations
+
+- The cross-check reads the whole chunk from the worker for each new suspect
+  (bounded: 2 at a time, queue of 1024).
+- A worker that cannot be listed is skipped by the sweep and the audit until
+  it can be; its copies are still covered by reads and its scrubber.
+- `scripts/phase10-chaos.sh` uses GNU `date +%s%3N` (Linux, Git Bash).
+
+### Verification after the fixes (2026-11-22)
+
+- `go build`, `gofmt -l`, `go vet` (also `-tags e2e`), `staticcheck` (also
+  `-tags e2e`), `bash -n scripts/*.sh`, `git diff --check`: pass.
+- `go test -count=1 ./...`: pass, **3 of 3 runs** (integration ≈ 50 s, with
+  the sweep every 25 ms in every test).
+- Race detector (Docker, `golang:1.27.3`): all packages `ok`, no data race.
+- Docker e2e (`go test -tags e2e`): **9 of 9 pass**, including the new
+  `TestComposeIntegrity` (scrubber detection + repair in 3 s, exactly one
+  repair) and `TestComposeControllerKilledMidUpload`, and the previously
+  failing `TestComposeSelfHealing` (worker3 held 7 copies; DEAD after 4.7 s,
+  full RF after 12 s). One run had a one-off 593 s stall in
+  `TestWorkerContainer`'s re-creation step (1.8 s in three reruns); its health
+  check now uses a 2 s per-request timeout so a stalled port forward cannot
+  hang it.
+- Manual walkthrough on a prefixed stack: `scripts/demo.sh` passed; scrubber
+  (5 s interval): one `corruption_detected`, one `repair_completed`; deleted
+  chunk file rewritten after 4 s; controller `SIGKILL` during a 300 MB upload:
+  no object listed, no files left, 8 s after the restart; audit ok and steady
+  after each step.
+- Evaluation scripts run end to end; results in [`EVALUATION.md`](EVALUATION.md).
+
+### Work remaining
+
+Phase 11 (packaging): a final README pass, an architecture diagram, and a
+fresh-clone run of the README demo. Open owner question: string-only custom
+metadata values (DEC-013, provisional).

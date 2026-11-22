@@ -38,6 +38,7 @@ type Worker struct {
 	FsyncOnWrite       bool          // FSYNC_ON_WRITE
 	MaxConcurrentReads int           // MAX_CONCURRENT_READS: bounds GET memory
 	ScrubInterval      time.Duration // SCRUB_INTERVAL: worker verification pass
+	ScrubBytesPerSec   int64         // SCRUB_BYTES_PER_SEC: scrub throttle (0 = unthrottled)
 	LogLevel           slog.Level    // LOG_LEVEL: debug|info|warn|error
 	// ControllerURL (CONTROLLER_URL) is the controller's base URL. Empty
 	// means standalone mode: no registration, writes accepted immediately
@@ -60,11 +61,10 @@ func LoadWorker(getenv func(string) string) (Worker, error) {
 		ChunkSize:          l.int64("CHUNK_SIZE", DefaultChunkSize, 1, MaxConfigurableChunkSize),
 		FsyncOnWrite:       l.bool("FSYNC_ON_WRITE", true),
 		MaxConcurrentReads: int(l.int64("MAX_CONCURRENT_READS", 16, 1, 1024)),
-		// Zero means the scrubber's documented ten-minute default; keeping the
-		// zero here preserves the compact worker config's existing default shape.
-		ScrubInterval: l.duration("SCRUB_INTERVAL", 0, time.Second, 24*time.Hour),
-		LogLevel:      l.level("LOG_LEVEL", slog.LevelInfo),
-		ControllerURL: l.url("CONTROLLER_URL", ""),
+		ScrubInterval:      l.duration("SCRUB_INTERVAL", 10*time.Minute, time.Second, 24*time.Hour),
+		ScrubBytesPerSec:   l.int64("SCRUB_BYTES_PER_SEC", 20_000_000, 0, 1<<40),
+		LogLevel:           l.level("LOG_LEVEL", slog.LevelInfo),
+		ControllerURL:      l.url("CONTROLLER_URL", ""),
 	}
 	switch {
 	case c.WorkerID == "":
@@ -127,8 +127,12 @@ type Controller struct {
 	// ReconcilerInterval (RECONCILER_INTERVAL): repair round period.
 	ReconcilerInterval time.Duration
 	// MaxConcurrentRepairs (MAX_CONCURRENT_REPAIRS): copies in flight at once.
-	MaxConcurrentRepairs   int
-	UploadStaleAfter       time.Duration
+	MaxConcurrentRepairs int
+	// UploadStaleAfter (UPLOAD_STALE_AFTER): an upload idle this long is
+	// aborted by the janitor.
+	UploadStaleAfter time.Duration
+	// InventorySweepInterval (INVENTORY_SWEEP_INTERVAL): period of the
+	// live-worker inventory sweep (orphans, lost or damaged copies).
 	InventorySweepInterval time.Duration
 }
 
@@ -156,8 +160,8 @@ func LoadController(getenv func(string) string) (Controller, error) {
 		JanitorInterval:        l.duration("JANITOR_INTERVAL", 10*time.Second, 5*time.Millisecond, time.Hour),
 		ReconcilerInterval:     l.duration("RECONCILER_INTERVAL", 5*time.Second, 5*time.Millisecond, time.Hour),
 		MaxConcurrentRepairs:   int(l.int64("MAX_CONCURRENT_REPAIRS", 4, 1, 256)),
-		UploadStaleAfter:       l.duration("UPLOAD_STALE_AFTER", 0, time.Second, 24*time.Hour),
-		InventorySweepInterval: l.duration("INVENTORY_SWEEP_INTERVAL", 0, time.Second, 24*time.Hour),
+		UploadStaleAfter:       l.duration("UPLOAD_STALE_AFTER", 10*time.Minute, time.Second, 24*time.Hour),
+		InventorySweepInterval: l.duration("INVENTORY_SWEEP_INTERVAL", 5*time.Minute, time.Second, 24*time.Hour),
 	}
 	if c.DBPath == "" {
 		l.fail("DB_PATH", "must not be empty")

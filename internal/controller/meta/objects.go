@@ -393,19 +393,49 @@ func (s *Store) MarkReplicaCorrupt(ctx context.Context, chunkID, workerID string
 	return changed, err
 }
 
-// MarkSuspectCorrupt cross-checks a scrubber report against the controller's
-// metadata before changing state. The worker report is only a trigger; the
-// controller's chunk and object records remain authoritative.
-func (s *Store) MarkSuspectCorrupt(ctx context.Context, chunkID, workerID string) (bool, error) {
+// VerifyTarget is what the controller needs to cross-check one replica
+// against its own record.
+type VerifyTarget struct {
+	ObjectID       string
+	Size           int64
+	ChecksumSHA256 string
+	UpdatedAt      int64 // of the OK replica row, for a conditional verdict
+}
+
+// ReplicaToVerify returns the controller's record for chunkID if workerID
+// holds an OK replica of it and its object is READY; otherwise ErrNotFound
+// (nothing to cross-check: the copy is already CORRUPT, being written, or the
+// object is not READY).
+func (s *Store) ReplicaToVerify(ctx context.Context, chunkID, workerID string) (VerifyTarget, error) {
+	var t VerifyTarget
+	err := s.db.QueryRowContext(ctx, `
+		SELECT c.object_id, c.size, c.checksum_sha256, r.updated_at
+		FROM replicas r
+		JOIN chunks c ON c.chunk_id = r.chunk_id
+		JOIN objects o ON o.object_id = c.object_id
+		WHERE r.chunk_id = ? AND r.worker_id = ? AND r.state = 'OK' AND o.status = 'READY'`,
+		chunkID, workerID).Scan(&t.ObjectID, &t.Size, &t.ChecksumSHA256, &t.UpdatedAt)
+	if errors.Is(err, sql.ErrNoRows) {
+		return t, ErrNotFound
+	}
+	return t, err
+}
+
+// MarkSuspectCorrupt records a confirmed scrubber finding: the controller
+// has read the replica and it does not match the controller's checksum
+// (architecture §3.6, §4.9 detection path 2). The row changes only if it is
+// still the same OK row that was verified (updatedAt) and its object is still
+// READY, so a copy rewritten by repair meanwhile is never marked.
+func (s *Store) MarkSuspectCorrupt(ctx context.Context, chunkID, workerID string, updatedAt int64) (bool, error) {
 	now := s.nowNanos()
 	changed := false
 	err := s.tx(ctx, func(tx *sql.Tx) error {
 		res, err := tx.ExecContext(ctx, `
 			UPDATE replicas SET state = 'CORRUPT', updated_at = ?
-			WHERE chunk_id = ? AND worker_id = ? AND state = 'OK'
+			WHERE chunk_id = ? AND worker_id = ? AND state = 'OK' AND updated_at = ?
 			  AND EXISTS (SELECT 1 FROM chunks c JOIN objects o ON o.object_id = c.object_id
 			              WHERE c.chunk_id = replicas.chunk_id AND o.status = 'READY')`,
-			now, chunkID, workerID)
+			now, chunkID, workerID, updatedAt)
 		if err != nil {
 			return err
 		}

@@ -6,15 +6,16 @@ a single controller keeps the metadata, detects failed workers, and repairs
 lost or corrupted data automatically. The whole system runs on one machine
 with Docker Compose.
 
-> **Implementation status: Phases 0–11 complete.** The cluster (1
-> controller + 4 workers) runs under Docker Compose and **every client API
-> endpoint of the specification works** (upload, verified download, metadata
-> GET/PATCH, list, delete, `objctl`). The system **heals itself**: after a
-> worker has been gone for `REPAIR_GRACE` (30 s), its chunks are copied to the
-> remaining workers until every chunk has two copies again; corrupt copies are
-> rewritten. The worker scrubber, crash recovery, and packaged viva demo are
-> included. See
-> [Current status](#current-status).
+> **Implementation status: Phases 0–10 complete; Phase 11 (packaging) in
+> progress.** The cluster (1 controller + 4 workers) runs under Docker Compose
+> and **every client API endpoint of the specification works** (upload,
+> verified download, metadata GET/PATCH, list, delete, `objctl`). The system
+> **heals itself**: after a worker has been gone for `REPAIR_GRACE` (30 s), its
+> chunks are copied to the remaining workers until every chunk has two copies
+> again. Corrupt copies are found by reads, by a background **scrubber** on
+> each worker (confirmed by the controller), and by a periodic inventory
+> sweep, and are rewritten in place. A controller crash mid-upload leaves
+> nothing behind. See [Current status](#current-status).
 
 ## The problem
 
@@ -206,10 +207,10 @@ implemented.
 | 5 | Complete client API: metadata, PATCH, list, delete; `objctl` | COMPLETED |
 | 6 | Degraded operation, inventory reconciliation, `/cluster` totals, audit | COMPLETED |
 | 7 | Self-healing re-replication | COMPLETED |
-| 8 | Data integrity, scrubber, corrupt repair | COMPLETED |
-| 9 | Crash consistency and janitor recovery | COMPLETED |
-| 10 | Evaluation harness and chaos checks | COMPLETED |
-| 11 | Packaging and viva demonstration | COMPLETED |
+| 8 | Data integrity: scrubber, controller cross-check, corrupt repair | COMPLETED (review fixes applied, awaiting review) |
+| 9 | Crash consistency: recovery, stale uploads, live inventory sweep, audit v2 | COMPLETED (review fixes applied, awaiting review) |
+| 10 | Evaluation: benchmarks, chaos, invariant tests | COMPLETED (awaiting review) |
+| 11 | Packaging and viva demonstration | IN PROGRESS (demo script and viva guide drafted) |
 
 Open item awaiting owner confirmation: string-only custom metadata values
 (DEC-013). The chunk size is confirmed as 1 MB = 1,000,000 bytes (DEC-005).

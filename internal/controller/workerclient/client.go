@@ -14,6 +14,7 @@ import (
 	"crypto/sha256"
 	"encoding/hex"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"net"
@@ -156,6 +157,26 @@ func (c *Client) GetChunk(ctx context.Context, baseURL, chunkID string, maxBytes
 		return Chunk{}, fmt.Errorf("worker get %s: read body: %w", chunkID, err)
 	}
 	return Chunk{Data: data, StoredSHA256: resp.Header.Get(wire.HeaderChunkSHA256)}, nil
+}
+
+// ProvesBadReplica decides whether an error from GetChunk proves the stored
+// replica is bad. A 404 means the file is gone (counted as CORRUPT so repair
+// rewrites it, DEC-040); CHUNK_CORRUPT means the worker cannot parse its own
+// header. Everything else (timeouts, refused connections, 5xx) says nothing
+// about the data.
+func ProvesBadReplica(err error) (reason string, bad bool) {
+	var we *Error
+	if !errors.As(err, &we) {
+		return "", false
+	}
+	switch {
+	case we.Status == http.StatusNotFound:
+		return "missing", true
+	case we.Code == wire.CodeChunkCorrupt:
+		return "header_corrupt", true
+	default:
+		return "", false
+	}
 }
 
 func responseError(op string, resp *http.Response) error {

@@ -20,6 +20,7 @@ func TestLoadWorkerDefaults(t *testing.T) {
 		WorkerID: "worker1", ListenAddr: ":9000", DataDir: "/data",
 		ChunkSize: 1_000_000, FsyncOnWrite: true, MaxConcurrentReads: 16, LogLevel: slog.LevelInfo,
 		ControllerURL: "", AdvertiseAddr: "http://worker1:9000",
+		ScrubInterval: 10 * time.Minute, ScrubBytesPerSec: 20_000_000,
 	}
 	if c != want {
 		t.Fatalf("defaults = %+v, want %+v", c, want)
@@ -99,7 +100,8 @@ func TestLoadController(t *testing.T) {
 		MaxObjectSize: 5 << 30, MaxConcurrentUploads: 16, MaxConcurrentDownloads: 32, MinFreeBytes: 100_000_000,
 		WorkerConnectTimeout: 2 * time.Second, WorkerRequestTimeout: 10 * time.Second,
 		ClientReadTimeout: time.Minute, JanitorInterval: 10 * time.Second,
-		ReconcilerInterval: 5 * time.Second, MaxConcurrentRepairs: 4}
+		ReconcilerInterval: 5 * time.Second, MaxConcurrentRepairs: 4,
+		UploadStaleAfter: 10 * time.Minute, InventorySweepInterval: 5 * time.Minute}
 	if c != want {
 		t.Fatalf("defaults = %+v, want %+v", c, want)
 	}

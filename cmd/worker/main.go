@@ -115,7 +115,7 @@ func serve(cfg config.Worker, logger *slog.Logger) error {
 	// opened immediately (DEC-026).
 	agentCtx, stopAgent := context.WithCancel(ctx)
 	defer stopAgent()
-	scrubber := scrub.New(st, cfg.ScrubInterval, logger)
+	scrubber := scrub.New(st, scrub.Options{Interval: cfg.ScrubInterval, BytesPerSec: cfg.ScrubBytesPerSec, Logger: logger})
 	go scrubber.Run(agentCtx)
 	agentDone := make(chan struct{})
 	if cfg.ControllerURL == "" {

@@ -31,94 +31,97 @@ you explicitly run `docker compose down -v`.
 | Worker failure / fallback | `TestComposeDownload` | Stop a chunk holder; download remains byte-identical |
 | Degraded cluster | `TestComposeResync` | Stop one worker; `/cluster` shows under-replication but audit safety remains true |
 | Self-healing | `TestComposeSelfHealing` | Stop worker beyond grace; show repair counters return to full RF |
-| Corrupt one copy | `TestComposeDownload` | Append bytes to one holder; download remains correct; show `CORRUPT`, repair, and valid file |
+| Corrupt one copy (read path) | `TestComposeDownload` | Append bytes to one holder; download remains correct; show `CORRUPT`, repair, and valid file |
+| Corrupt one copy (scrubber, no read) | `TestComposeIntegrity` | Overwrite bytes in place; within `SCRUB_INTERVAL` the controller logs `"detected_by":"scrubber"`; repaired once |
+| Chunk file deleted from a volume | `TestComposeIntegrity` | `rm` one chunk file; the inventory sweep logs `"detected_by":"inventory_sweep"`; the file is rewritten |
 | Both copies corrupt | `TestComposeDownload` | Corrupt both holders of chunk 0; expect clean `503 STORAGE_UNAVAILABLE` |
 | Wiped worker volume | `TestComposeResync` | Empty `/data/chunks`; restart worker; show missing rows, then repair |
 | Upload with insufficient workers | `TestComposeUpload` | Stop 3 workers; upload returns `503 INSUFFICIENT_WORKERS` |
 | Controller restart | `TestComposeClusterMembership` | `docker compose restart controller`; workers re-register with new epochs |
 | Crash-mid-write atomicity | `TestWorkerKilledMidWriteLeavesNoPartialChunk` | `go test -run TestWorkerKilledMidWriteLeavesNoPartialChunk ./test/integration`; no committed partial file |
-| Controller crash recovery | Manual procedure below | Kill controller during upload, restart; janitor removes invisible upload state |
+| Controller crash recovery | `TestComposeControllerKilledMidUpload` | Kill controller during upload, restart; `startup_recovery` logged; nothing listed, no files left |
+| Invariants under mixed load | `TestInvariantsUnderChurn` | `go test -run TestInvariantsUnderChurn -v ./test/integration` |
 
 ## Failure demonstrations
 
-Set a short scrubber interval before starting the stack so corruption is
-visible during a viva:
+Start the stack with short intervals so background detection is visible
+during a viva (exported in the shell, so no `.env` file is created or
+overwritten):
 
 ```bash
-cat > .env <<'EOF'
-SCRUB_INTERVAL=5s
-HEARTBEAT_INTERVAL=1s
-DEAD_AFTER=4s
-REPAIR_GRACE=6s
-RECONCILER_INTERVAL=1s
-EOF
+export SCRUB_INTERVAL=5s INVENTORY_SWEEP_INTERVAL=5s HEARTBEAT_INTERVAL=1s \
+       DEAD_AFTER=4s REPAIR_GRACE=6s RECONCILER_INTERVAL=1s JANITOR_INTERVAL=1s
 docker compose up -d --build
-```
-
-First upload an object and save its ID as `ID`. Show its replica map:
-
-```bash
 URL=http://127.0.0.1:${CONTROLLER_PORT:-8080}
+head -c 5500000 /dev/urandom > /tmp/demo.bin
+ID=$(curl -s -F file=@/tmp/demo.bin "$URL/api/v1/objects" | sed -n 's/.*"object_id":"\([^"]*\)".*/\1/p')
 curl -s "$URL/api/v1/objects/$ID/metadata"
 ```
 
-Find a holder of chunk 0 from that response, then append bytes to the actual
-chunk file:
+Pick a holder of chunk 0 from the metadata (below: `worker3`; with
+`OBJSTORE_CONTAINER_PREFIX` set, prefix the container name).
+
+**Scrubber, no client read.** Overwrite 4 bytes in place (same size: only a
+checksum can tell), then watch, without downloading:
 
 ```bash
 C0=${ID}_000000
-docker compose exec worker2 sh -c "test -f /data/chunks/$C0 && printf CORRUPTION >> /data/chunks/$C0"
-sleep 7
-curl -s "$URL/api/v1/objects/$ID" -o /tmp/recovered.bin
-docker compose logs controller | grep -E 'corruption_detected|repair_completed|scrub'
-curl -s "$URL/api/v1/objects/$ID/metadata"
+docker exec worker3 sh -c "printf ZZZZ | dd of=/data/chunks/$C0 bs=1 seek=1000 conv=notrunc 2>/dev/null"
+docker compose logs -f controller | grep -E 'corruption_detected|repair_completed'
 ```
 
-If worker2 is not a holder, repeat with the worker named in the metadata.
-Expected: the download is correct, the suspect is reported by heartbeat, the
-matching replica becomes `CORRUPT`, and repair rewrites it in place without
-waiting for `REPAIR_GRACE`.
+Expected within about one scrub interval: `corruption_detected` with
+`"detected_by":"scrubber"`, then one `repair_completed`; `/metadata` shows the
+copy `OK` again (rewritten in place, no `REPAIR_GRACE` wait). It is repaired
+once: later heartbeats do not report it again.
 
-For both copies corrupt, append bytes to chunk 0 on every worker that has it:
+**Corruption on the read path.** Append bytes to a copy and download:
+
+```bash
+docker exec worker3 sh -c "printf CORRUPTION >> /data/chunks/$C0"
+curl -s "$URL/api/v1/objects/$ID" -o /tmp/recovered.bin && cmp /tmp/demo.bin /tmp/recovered.bin && echo IDENTICAL
+```
+
+**Deleted chunk file.** `docker exec worker3 rm /data/chunks/$C0`; the next
+sweep logs `"detected_by":"inventory_sweep"` and repair rewrites the file.
+
+**Both copies corrupt.** Append bytes to chunk 0 on every worker that has it:
 
 ```bash
 for w in worker1 worker2 worker3 worker4; do
-  docker compose exec "$w" sh -c "test -f /data/chunks/$C0 && printf BAD >> /data/chunks/$C0 || true"
+  docker exec "$w" sh -c "test -f /data/chunks/$C0 && printf BAD >> /data/chunks/$C0 || true"
 done
 curl -s -w '\nHTTP %{http_code}\n' "$URL/api/v1/objects/$ID"
 ```
 
-Expected: HTTP 503 with `STORAGE_UNAVAILABLE`, no incorrect bytes, and a
-`data_unrecoverable` controller log. Restore with a new upload or
-`docker compose down -v && docker compose up -d --build`.
+Expected: HTTP 503 `STORAGE_UNAVAILABLE`, no incorrect bytes, and a
+`data_unrecoverable` controller log. Only a new upload fixes the object.
 
-For insufficient placement:
+**Insufficient workers.**
 
 ```bash
 docker compose stop worker2 worker3 worker4
-curl -s -w '\nHTTP %{http_code}\n' -F 'file=@big.bin' "$URL/api/v1/objects"
+curl -s -w '\nHTTP %{http_code}\n' -F file=@/tmp/demo.bin "$URL/api/v1/objects"
 docker compose start worker2 worker3 worker4
 ```
 
 Expected: HTTP 503 `INSUFFICIENT_WORKERS`; no READY object is created.
 
-For controller crash recovery, use a large upload and two terminals. Start an
-upload in terminal 1, kill the controller in terminal 2 while it is running,
-restart it, and inspect the cleanup:
+**Controller crash mid-upload.** Start a large upload in the background,
+kill the controller while it streams, restart it:
 
 ```bash
-curl -s -F 'file=@large.bin' "$URL/api/v1/objects" &
+head -c 300000000 /dev/urandom > /tmp/large.bin
+curl -s -F file=@/tmp/large.bin "$URL/api/v1/objects" & sleep 2
 docker compose kill -s SIGKILL controller
 docker compose start controller
-sleep 12
-curl -s "$URL/api/v1/objects?limit=100"
-docker compose exec controller sh -c 'ls -la /data'
 docker compose logs controller | grep -E 'startup_recovery|object_purged'
+curl -s "$URL/cluster"
 ```
 
-Expected: the interrupted upload is not listed, and its chunk files are
-removed after startup recovery and the janitor pass. The deterministic worker
-crash case is covered by the ready-made test above.
+Expected: `startup_recovery` in the log; within a few janitor rounds
+`objects_by_status` is empty, `pending_deletes` is 0, and no chunk file of
+the upload remains on any volume. The interrupted upload is never listed.
 
 ## Useful viva evidence
 
@@ -136,6 +139,7 @@ and repairs a known-bad copy only after a verified source is available.
 ## Cleanup
 
 ```bash
-docker compose down -v
-rm -f .env
+docker compose down -v      # deletes this project's volumes
+unset SCRUB_INTERVAL INVENTORY_SWEEP_INTERVAL HEARTBEAT_INTERVAL DEAD_AFTER REPAIR_GRACE RECONCILER_INTERVAL JANITOR_INTERVAL
+rm -f /tmp/demo.bin /tmp/large.bin /tmp/recovered.bin
 ```

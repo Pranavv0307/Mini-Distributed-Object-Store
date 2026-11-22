@@ -21,6 +21,7 @@ import (
 	"objstore/internal/config"
 	"objstore/internal/controller/api"
 	"objstore/internal/controller/download"
+	"objstore/internal/controller/integrity"
 	"objstore/internal/controller/janitor"
 	"objstore/internal/controller/meta"
 	"objstore/internal/controller/placement"
@@ -36,6 +37,7 @@ import (
 // coordinator, janitor, and N real workers (each behind a fault injector).
 type uploadCluster struct {
 	repairer *repair.Repairer // nil unless clusterOpts.repair
+	ver      *integrity.Verifier
 	gate     *gatedReconciler
 	t        testing.TB
 	url      string
@@ -58,6 +60,9 @@ type clusterOpts struct {
 	repairGrace  time.Duration // default: repairGrace (1 s)
 	maxRepairs   int           // default 4
 	repairClient func(repair.Client) repair.Client
+	// sweepEvery is the live inventory sweep period (default 25 ms, so every
+	// test exercises it; benchmarks set it high to keep it out of the numbers).
+	sweepEvery time.Duration
 }
 
 func newUploadCluster(t testing.TB, o clusterOpts) *uploadCluster {
@@ -77,13 +82,19 @@ func newUploadCluster(t testing.TB, o clusterOpts) *uploadCluster {
 	if o.requestTimeout == 0 {
 		o.requestTimeout = 5 * time.Second
 	}
+	if o.sweepEvery == 0 {
+		o.sweepEvery = 25 * time.Millisecond
+	}
 	m, err := meta.Open(filepath.Join(t.TempDir(), "meta.db"), meta.Options{})
 	if err != nil {
 		t.Fatal(err)
 	}
 	reg := registry.New(registry.Options{DeadAfter: deadAfter})
 	wc := workerclient.New(time.Second, o.requestTimeout)
-	jan := janitor.New(m, reg, wc, janitor.Config{Interval: 20 * time.Millisecond})
+	// The live inventory sweep runs every 25 ms by default, so every
+	// integration test exercises it against concurrent uploads, repairs, deletes.
+	jan := janitor.New(m, reg, wc, janitor.Config{Interval: 20 * time.Millisecond, InventorySweepInterval: o.sweepEvery})
+	verifier := integrity.New(m, reg, wc, integrity.Config{})
 	up := upload.New(m, reg, wc, placement.Random{}, upload.Config{
 		ChunkSize: o.chunkSize, ReplicationFactor: 2, Window: o.window, MaxObjectSize: o.maxObjectSize,
 		ClientReadTimeout: 5 * time.Second,
@@ -111,6 +122,18 @@ func newUploadCluster(t testing.TB, o clusterOpts) *uploadCluster {
 		Meta: m, ReplicationFactor: 2, OnDelete: jan.Kick,
 		Uploader: up, MaxConcurrentUploads: o.maxUploads,
 		Downloader: download.New(m, reg, wc, nil), MaxConcurrentDownloads: 32,
+		Suspects: verifier,
+		Inventory: func(ctx context.Context, w registry.Worker) ([]meta.InventoryEntry, error) {
+			inv, err := wc.Inventory(ctx, w.Address, w.ID)
+			if err != nil {
+				return nil, err
+			}
+			out := make([]meta.InventoryEntry, len(inv.Chunks))
+			for i, ch := range inv.Chunks {
+				out[i] = meta.InventoryEntry{ChunkID: ch.ChunkID, Size: ch.Size}
+			}
+			return out, nil
+		},
 	}
 	if rp != nil { // set only when non-nil: a nil *Repairer in the interface would not be nil
 		acfg.Repair, acfg.RepairGrace = rp, o.repairGrace
@@ -121,12 +144,13 @@ func newUploadCluster(t testing.TB, o clusterOpts) *uploadCluster {
 	var bg sync.WaitGroup
 	bg.Go(func() { registry.RunFailureDetector(ctx, reg, checkEvery) })
 	bg.Go(func() { jan.Run(ctx) })
+	bg.Go(func() { verifier.Run(ctx) })
 	if rp != nil {
 		bg.Go(func() { rp.Run(ctx) })
 	}
 	t.Cleanup(func() { cancel(); bg.Wait(); ts.Close(); m.Close() })
 
-	c := &uploadCluster{t: t, url: ts.URL, meta: m, reg: reg, jan: jan, gate: gate, repairer: rp, byID: map[string]*testWorker{}}
+	c := &uploadCluster{t: t, url: ts.URL, meta: m, reg: reg, jan: jan, gate: gate, repairer: rp, ver: verifier, byID: map[string]*testWorker{}}
 	for i := range o.workers {
 		w := newTestWorker(t, fmt.Sprintf("worker%d", i+1), ts.URL)
 		c.workers = append(c.workers, w)
@@ -135,6 +159,8 @@ func newUploadCluster(t testing.TB, o clusterOpts) *uploadCluster {
 	waitFor(t, clusterLimit, "all workers ALIVE", func() bool { return len(reg.Alive()) == o.workers })
 	return c
 }
+
+func (c *uploadCluster) verifier() *integrity.Verifier { return c.ver }
 
 type uploadResult struct {
 	status int

@@ -215,7 +215,7 @@ func (c *Coordinator) fetchVerified(ctx context.Context, objectID string, ch met
 			if ctx.Err() != nil {
 				return nil, ctx.Err()
 			}
-			if reason, corrupt := classify(err); corrupt {
+			if reason, corrupt := workerclient.ProvesBadReplica(err); corrupt {
 				c.markCorrupt(ctx, objectID, ch, cand.workerID, reason)
 			} else {
 				c.log.Warn("replica_read_failed", "object_id", objectID, "chunk_id", ch.ID,
@@ -247,25 +247,6 @@ func verify(data []byte, ch meta.ChunkWithReplicas) string {
 		return "checksum_mismatch"
 	}
 	return ""
-}
-
-// classify decides whether a worker error proves the replica is bad. A 404
-// means the file is gone (counted as CORRUPT so repair rewrites it, DEC-040);
-// CHUNK_CORRUPT means the worker cannot parse its own header. Everything else
-// (timeouts, refused connections, 5xx) says nothing about the data.
-func classify(err error) (reason string, corrupt bool) {
-	var we *workerclient.Error
-	if !errors.As(err, &we) {
-		return "", false
-	}
-	switch {
-	case we.Status == http.StatusNotFound:
-		return "missing", true
-	case we.Code == wire.CodeChunkCorrupt:
-		return "header_corrupt", true
-	default:
-		return "", false
-	}
 }
 
 // markCorrupt records the verdict on a context detached from the request, so

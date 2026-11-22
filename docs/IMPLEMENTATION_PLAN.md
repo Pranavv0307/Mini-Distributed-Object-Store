@@ -17,11 +17,11 @@ owner review. The owner makes the git commit for each phase.
 | 4 | M4 | Read path: verify, fall back, stream in order | 3 | COMPLETED |
 | 5 | M5 | Complete client API, delete path, error mapping | 4 | COMPLETED |
 | 6 | M6 | Degraded operation, full inventory reconciliation, audit v1 | 5 | COMPLETED |
-| 7 | M7 | Self-healing re-replication (reconciler) | 6 | COMPLETED (awaiting review) |
-| 8 | M8 | Data integrity: scrubber, cross-check, corrupt repair | 7 | COMPLETED |
-| 9 | M9 | Crash consistency, janitor, recovery, audit v2 | 8 | COMPLETED |
-| 10 | M10 | Evaluation: benchmarks, chaos, invariant tests | 9 | COMPLETED |
-| 11 | M11 | Packaging: README demo, one-command demo | 10 | COMPLETED |
+| 7 | M7 | Self-healing re-replication (reconciler) | 6 | COMPLETED |
+| 8 | M8 | Data integrity: scrubber, cross-check, corrupt repair | 7 | COMPLETED (review fixes applied, awaiting review) |
+| 9 | M9 | Crash consistency, janitor, recovery, audit v2 | 8 | COMPLETED (review fixes applied, awaiting review) |
+| 10 | M10 | Evaluation: benchmarks, chaos, invariant tests | 9 | COMPLETED (awaiting review) |
+| 11 | M11 | Packaging: README demo, one-command demo | 10 | IN PROGRESS (drafted) |
 | S1–S5 | Stretch | Rendezvous hashing, prefetch, Range, metrics, zones | 9 | Optional |
 
 ## Testing levels used throughout
@@ -272,7 +272,7 @@ owner review. The owner makes the git commit for each phase.
   under-replicated → 0 on remaining workers after grace, audit passes, restart
   → resync and trimming, audit passes; detection time and time-to-full-RF
   recorded.
-- **Status.** COMPLETED (awaiting review). As built: `internal/controller/repair`
+- **Status.** COMPLETED. As built: `internal/controller/repair`
   (DEC-054), the repair transactions in `meta/repair.go` (DEC-055), the
   warm-up and unknown-worker rule pulled forward from Phase 9 (DEC-056), the
   `/cluster` repair section. In-place repair of CORRUPT copies (planned for
@@ -295,6 +295,17 @@ owner review. The owner makes the git commit for each phase.
   replica marked `CORRUPT` then repaired, file valid again; deleted chunk file
   → detected and repaired; both corrupt → refused, logged; scrubber detects
   without any client read.
+- **Status.** COMPLETED (review fixes applied, awaiting review). As built:
+  `internal/worker/scrub` (throttled passes, suspects re-verified before
+  each heartbeat) and `internal/controller/integrity` (asynchronous
+  cross-check that reads the copy and compares it with the controller's
+  checksum), DEC-058. A deleted chunk file is found by the Phase 9 inventory
+  sweep (DEC-057). Acceptance: `TestScrubberDetectsAndRepairsWithoutClientRead`
+  (detected without a client read, repaired once, no re-marking),
+  `TestScrubberReportIsCrossChecked`, `TestScrubberBothCopiesCorrupt`,
+  `TestDeletedChunkFileRepairedBySweep`, `TestDownloadSkipsAndMarksCorruptReplica`,
+  `TestCorruptReplicaRepairedInPlace`, and against Compose `TestComposeIntegrity`
+  and `TestComposeDownload`.
 
 ## Phase 9 — Crash consistency and janitor (M9)
 
@@ -308,6 +319,17 @@ owner review. The owner makes the git commit for each phase.
   visible object and no leftover files after janitor; kill worker mid-write →
   no half-chunk; client Ctrl-C → cleaned up; delete during worker downtime →
   stale chunks removed on return; audit v2 passes.
+- **Status.** COMPLETED (review fixes applied, awaiting review). As built:
+  startup recovery and stale-upload expiry through the abort path (DEC-059);
+  the live inventory sweep with the before/after rule (DEC-057); audit v2 with
+  I4 as a steady_state check and a race-free I7 (DEC-060). The first version of
+  the sweep deleted rows of copies written during the sweep and failed the
+  integration suite; see the development log. Acceptance:
+  `TestControllerCrashMidUploadRecovered` and `TestComposeControllerKilledMidUpload`
+  (SIGKILL mid-upload → nothing visible, no files left), `TestWorkerKilledMidWriteLeavesNoPartialChunk`,
+  `TestClientDisconnectMidUpload` (client Ctrl-C), `TestDeleteWithWorkerDown`,
+  `TestOrphanFileRemovedBySweep`, `TestAuditInventoryDuringWrites`,
+  `TestSweepInventoryRaces`, `TestAbortStaleUploads`, `TestRecoverUploading`.
 
 ## Phase 10 — Evaluation (M10)
 
@@ -317,6 +339,12 @@ owner review. The owner makes the git commit for each phase.
   repair times; scrubber detection time) with medians and p99; chaos script
   with audit; invariant tests for every §7 scenario.
 - **Acceptance criteria.** Results table in docs, reproducible from scripts.
+- **Status.** COMPLETED (awaiting review). Scripts: `scripts/phase10-bench-compose.sh`
+  (sizes × clients, uploads and downloads, degraded downloads; median, p99,
+  MB/s), `scripts/phase10-benchmark.sh` (in-process upload window),
+  `scripts/phase10-chaos.sh` (worker loss: detection and time to full RF).
+  Invariant test under mixed load with a worker loss: `TestInvariantsUnderChurn`.
+  Results and host in [`EVALUATION.md`](EVALUATION.md).
 
 ## Phase 11 — Packaging (M11)
 
@@ -327,3 +355,6 @@ owner review. The owner makes the git commit for each phase.
   trade-offs.
 - **Acceptance criteria.** From a fresh clone plus `docker compose down -v`,
   the README alone gets through the full demo.
+- **Status.** IN PROGRESS. Drafted: `scripts/demo.sh` (verified end to end on
+  a prefixed stack) and `docs/VIVA_GUIDE.md`. Still to do in this phase: a
+  final README pass, an architecture diagram, and a full fresh-clone run.

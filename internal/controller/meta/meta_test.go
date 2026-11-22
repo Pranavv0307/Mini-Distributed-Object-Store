@@ -88,26 +88,37 @@ func TestUploadLifecycle(t *testing.T) {
 	}
 }
 
-func TestMarkSuspectCorruptCrossChecksReadyMetadata(t *testing.T) {
+func TestMarkSuspectCorruptIsConditional(t *testing.T) {
 	s, _ := openTest(t)
 	obj, cs := upload(t, s, 1, 10)
 	if _, err := commit(s, obj, 1, 10); err != nil {
 		t.Fatal(err)
 	}
-	if changed, err := s.MarkSuspectCorrupt(ctx, cs[0].ID, "unknown"); err != nil || changed {
-		t.Fatalf("unknown suspect = changed %v err %v", changed, err)
+	if _, err := s.ReplicaToVerify(ctx, cs[0].ID, "unknown"); !errors.Is(err, ErrNotFound) {
+		t.Fatalf("unknown worker: err = %v, want ErrNotFound", err)
 	}
-	if changed, err := s.MarkSuspectCorrupt(ctx, cs[0].ID, "w1"); err != nil || !changed {
-		t.Fatalf("known suspect = changed %v err %v", changed, err)
+	target, err := s.ReplicaToVerify(ctx, cs[0].ID, "w1")
+	if err != nil || target.ObjectID != obj || target.Size != 10 || target.ChecksumSHA256 != cs[0].ChecksumSHA256 {
+		t.Fatalf("ReplicaToVerify = %+v, %v", target, err)
 	}
-	if changed, err := s.MarkSuspectCorrupt(ctx, cs[0].ID, "w1"); err != nil || changed {
-		t.Fatalf("repeat suspect = changed %v err %v", changed, err)
+	// A stale verification (the row changed since it was read) never marks.
+	if changed, err := s.MarkSuspectCorrupt(ctx, cs[0].ID, "w1", target.UpdatedAt-1); err != nil || changed {
+		t.Fatalf("stale verdict = changed %v err %v", changed, err)
 	}
-	obj2, cs2 := upload(t, s, 1, 10)
-	if changed, err := s.MarkSuspectCorrupt(ctx, cs2[0].ID, "w1"); err != nil || changed {
-		t.Fatalf("uploading suspect = changed %v err %v", changed, err)
+	if changed, err := s.MarkSuspectCorrupt(ctx, cs[0].ID, "w1", target.UpdatedAt); err != nil || !changed {
+		t.Fatalf("confirmed verdict = changed %v err %v", changed, err)
 	}
-	_ = obj2
+	if changed, err := s.MarkSuspectCorrupt(ctx, cs[0].ID, "w1", target.UpdatedAt); err != nil || changed {
+		t.Fatalf("repeat verdict = changed %v err %v", changed, err)
+	}
+	if _, err := s.ReplicaToVerify(ctx, cs[0].ID, "w1"); !errors.Is(err, ErrNotFound) {
+		t.Fatalf("CORRUPT row still offered for verification: %v", err)
+	}
+	// Copies of an object that is still uploading are not judged.
+	_, cs2 := upload(t, s, 1, 10)
+	if _, err := s.ReplicaToVerify(ctx, cs2[0].ID, "w1"); !errors.Is(err, ErrNotFound) {
+		t.Fatalf("uploading object offered for verification: %v", err)
+	}
 }
 
 func TestEmptyObjectCommits(t *testing.T) {
@@ -119,45 +130,226 @@ func TestEmptyObjectCommits(t *testing.T) {
 	}
 }
 
-func TestRecoverUploadingAndAbortStaleUploads(t *testing.T) {
+func TestRecoverUploading(t *testing.T) {
 	s, _ := openTest(t)
 	obj, _ := upload(t, s, 1, 10)
-	if n, err := s.RecoverUploading(ctx); err != nil || n != 1 {
+	// A second upload with a claim that never got its ack (crash between the
+	// worker's rename and MarkReplicaOK).
+	obj2 := ids.NewObjectID()
+	if _, err := s.CreateObject(ctx, obj2, "g.bin", "x"); err != nil {
+		t.Fatal(err)
+	}
+	if err := s.ClaimChunk(ctx, chunk(t, obj2, 0, 10), []string{"w3", "w4"}); err != nil {
+		t.Fatal(err)
+	}
+	// A READY object is untouched by recovery.
+	ready, _ := upload(t, s, 1, 10)
+	if _, err := commit(s, ready, 1, 10); err != nil {
+		t.Fatal(err)
+	}
+	if n, err := s.RecoverUploading(ctx); err != nil || n != 2 {
 		t.Fatalf("RecoverUploading = %d, %v", n, err)
 	}
-	o, err := s.GetObject(ctx, obj)
-	if err != nil || o.Status != StatusDeleting {
-		t.Fatalf("recovered object = %+v, %v", o, err)
+	for _, id := range []string{obj, obj2} {
+		o, err := s.GetObject(ctx, id)
+		if err != nil || o.Status != StatusDeleting {
+			t.Fatalf("recovered object = %+v, %v", o, err)
+		}
+		if p, _ := s.PendingDeletesFor(ctx, id); len(p) != 2 {
+			t.Fatalf("recovered pending deletes for %s = %+v", id, p)
+		}
 	}
-	if p, _ := s.PendingDeletesFor(ctx, obj); len(p) != 2 {
-		t.Fatalf("recovered pending deletes = %+v", p)
+	if o, err := s.GetObject(ctx, ready); err != nil || o.Status != StatusReady {
+		t.Fatalf("READY object after recovery = %+v, %v", o, err)
 	}
-	obj2, _ := s.CreateObject(ctx, ids.NewObjectID(), "stale", "x")
-	_ = obj2
-	// The test store clock is real; a zero duration is explicitly a no-op.
+	// Idempotent.
+	if n, err := s.RecoverUploading(ctx); err != nil || n != 0 {
+		t.Fatalf("second RecoverUploading = %d, %v", n, err)
+	}
+}
+
+func TestAbortStaleUploads(t *testing.T) {
+	var mu sync.Mutex
+	now := time.Unix(1_800_000_000, 0)
+	clock := func() time.Time { mu.Lock(); defer mu.Unlock(); return now }
+	advance := func(d time.Duration) { mu.Lock(); now = now.Add(d); mu.Unlock() }
+	s, err := Open(filepath.Join(t.TempDir(), "meta.db"), Options{Now: clock})
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { s.Close() })
+
+	idle, _ := upload(t, s, 1, 10)
+	advance(5 * time.Minute)
+	active, _ := upload(t, s, 1, 10) // activity at +5m
+	advance(6 * time.Minute)         // idle for 11m, active for 6m
+
 	if n, err := s.AbortStaleUploads(ctx, 0); err != nil || n != 0 {
 		t.Fatalf("disabled stale cleanup = %d, %v", n, err)
+	}
+	if n, err := s.AbortStaleUploads(ctx, 10*time.Minute); err != nil || n != 1 {
+		t.Fatalf("AbortStaleUploads = %d, %v", n, err)
+	}
+	if o, _ := s.GetObject(ctx, idle); o.Status != StatusDeleting {
+		t.Fatalf("idle upload status = %s", o.Status)
+	}
+	if p, _ := s.PendingDeletesFor(ctx, idle); len(p) != 2 {
+		t.Fatalf("idle upload pending deletes = %+v", p)
+	}
+	if o, _ := s.GetObject(ctx, active); o.Status != StatusUploading {
+		t.Fatalf("active upload status = %s", o.Status)
+	}
+	// The aborted upload's handler finds out at its next step.
+	if err := s.ClaimChunk(ctx, chunk(t, idle, 1, 10), []string{"w3", "w4"}); !errors.Is(err, ErrNotUploading) {
+		t.Fatalf("claim on aborted upload: err = %v", err)
+	}
+}
+
+const orphanID = "3f2b8c1e-9a4d-4e2f-8b7a-1c2d3e4f5a6b_000001"
+
+func readyChunks(t *testing.T, s *Store) []Chunk {
+	t.Helper()
+	obj, cs := upload(t, s, 1, 10)
+	if _, err := commit(s, obj, 1, 10); err != nil {
+		t.Fatal(err)
+	}
+	return cs
+}
+
+func snapshot(t *testing.T, s *Store, w string) WorkerSnapshot {
+	t.Helper()
+	b, err := s.SnapshotWorker(ctx, w)
+	if err != nil {
+		t.Fatal(err)
+	}
+	return b
+}
+
+func TestSweepInventory(t *testing.T) {
+	s, _ := openTest(t)
+	cs := readyChunks(t, s)
+	lost := readyChunks(t, s)
+	damaged := readyChunks(t, s)
+	inv := []InventoryEntry{
+		{ChunkID: cs[0].ID, Size: 10},
+		{ChunkID: damaged[0].ID, Size: 7},
+		{ChunkID: orphanID, Size: 1},
+		{ChunkID: "not-a-chunk-id", Size: 1}, // never queued
+	}
+	res, err := s.SweepInventory(ctx, snapshot(t, s, "w1"), inv)
+	if err != nil || res != (SweepResult{MissingMarked: 1, SizeMismatch: 1, OrphansQueued: 1}) {
+		t.Fatalf("SweepInventory = %+v, %v", res, err)
+	}
+	for _, c := range []Chunk{lost[0], damaged[0]} {
+		cm, _ := s.ChunkMap(ctx, c.ObjectID)
+		if cm[0].Replicas[0] != (Replica{c.ID, "w1", ReplicaCorrupt}) {
+			t.Fatalf("%s replicas = %+v", c.ID, cm[0].Replicas)
+		}
+	}
+	if rep, err := s.Audit(ctx, []string{"w1", "w2"}, 2); err != nil || !rep.OK {
+		t.Fatalf("audit after sweep = %+v, %v", rep, err)
+	}
+	// Idempotent: a second sweep with the same view changes nothing.
+	if res, err := s.SweepInventory(ctx, snapshot(t, s, "w1"), inv); err != nil || res != (SweepResult{}) {
+		t.Fatalf("second sweep = %+v, %v", res, err)
+	}
+}
+
+// TestSweepInventoryRaces covers the Phase 9 bug where the live sweep
+// removed copies written after the worker's inventory was taken.
+func TestSweepInventoryRaces(t *testing.T) {
+	s, _ := openTest(t)
+	// An upload claimed before the snapshot and acked after it: its file is
+	// not in the (older) inventory, but it must not be judged missing.
+	obj := ids.NewObjectID()
+	if _, err := s.CreateObject(ctx, obj, "f", "x"); err != nil {
+		t.Fatal(err)
+	}
+	c := chunk(t, obj, 0, 10)
+	if err := s.ClaimChunk(ctx, c, []string{"w1", "w2"}); err != nil {
+		t.Fatal(err)
+	}
+	// A READY copy rewritten in place by repair after the snapshot.
+	rewritten := readyChunks(t, s)
+
+	before := snapshot(t, s, "w1")
+	inv := []InventoryEntry{} // taken after the snapshot: neither file listed yet
+
+	for _, w := range []string{"w1", "w2"} {
+		if err := s.MarkReplicaOK(ctx, obj, c.ID, w); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if _, err := commit(s, obj, 1, 10); err != nil {
+		t.Fatal(err)
+	}
+	if ok, err := s.MarkReplicaCorrupt(ctx, rewritten[0].ID, "w1"); err != nil || !ok {
+		t.Fatal(err)
+	}
+	if err := s.ClaimRepair(ctx, rewritten[0].ObjectID, rewritten[0].ID, "w1", true); err != nil {
+		t.Fatal(err)
+	}
+	if err := s.CompleteRepair(ctx, rewritten[0].ObjectID, rewritten[0].ID, "w1", nil); err != nil {
+		t.Fatal(err)
+	}
+	// A file whose claim (a repair) was made after the snapshot is no orphan.
+	claimedLater := readyChunks(t, s)
+	before3 := snapshot(t, s, "w3")
+	if err := s.ClaimRepair(ctx, claimedLater[0].ObjectID, claimedLater[0].ID, "w3", false); err != nil {
+		t.Fatal(err)
+	}
+
+	if res, err := s.SweepInventory(ctx, before, inv); err != nil || res != (SweepResult{}) {
+		t.Fatalf("sweep over racing writes = %+v, %v", res, err)
+	}
+	if res, err := s.SweepInventory(ctx, before3, []InventoryEntry{{ChunkID: claimedLater[0].ID, Size: 10}}); err != nil || res != (SweepResult{}) {
+		t.Fatalf("sweep over a later claim = %+v, %v", res, err)
+	}
+	for _, id := range []string{obj, rewritten[0].ObjectID} {
+		cm, _ := s.ChunkMap(ctx, id)
+		for _, r := range cm[0].Replicas {
+			if r.State != ReplicaOK {
+				t.Fatalf("%s replica changed by sweep: %+v", id, cm[0].Replicas)
+			}
+		}
+	}
+	// The same views produce no I4 violations either.
+	check, err := s.AuditInventory(ctx, []WorkerInventory{{Before: before, Inventory: inv},
+		{Before: before3, Inventory: []InventoryEntry{{ChunkID: claimedLater[0].ID, Size: 10}}}})
+	if err != nil || check.Violations != 0 {
+		t.Fatalf("I4 over racing writes = %+v, %v", check, err)
 	}
 }
 
 func TestAuditInventory(t *testing.T) {
 	s, _ := openTest(t)
-	obj, cs := upload(t, s, 1, 10)
-	if _, err := commit(s, obj, 1, 10); err != nil {
-		t.Fatal(err)
+	cs := readyChunks(t, s)
+	healthy := []WorkerInventory{
+		{Before: snapshot(t, s, "w1"), Inventory: []InventoryEntry{{ChunkID: cs[0].ID, Size: 10}}},
+		{Before: snapshot(t, s, "w2"), Inventory: []InventoryEntry{{ChunkID: cs[0].ID, Size: 10}}},
 	}
-	check, err := s.AuditInventory(ctx, map[string][]InventoryEntry{
-		"w1": {{ChunkID: cs[0].ID, Size: 10}}, "w2": {{ChunkID: cs[0].ID, Size: 10}},
-	})
-	if err != nil || check.Violations != 0 {
+	check, err := s.AuditInventory(ctx, healthy)
+	if err != nil || check.Violations != 0 || check.Kind != "steady_state" {
 		t.Fatalf("healthy I4 = %+v, %v", check, err)
 	}
-	check, err = s.AuditInventory(ctx, map[string][]InventoryEntry{
-		"w1": {{ChunkID: cs[0].ID, Size: 10}, {ChunkID: "3f2b8c1e-9a4d-4e2f-8b7a-1c2d3e4f5a6b_000001", Size: 1}},
-		"w2": {{ChunkID: cs[0].ID, Size: 10}},
-	})
-	if err != nil || check.Violations != 1 {
-		t.Fatalf("orphan I4 = %+v, %v", check, err)
+	bad := []WorkerInventory{
+		{Before: snapshot(t, s, "w1"), Inventory: []InventoryEntry{{ChunkID: cs[0].ID, Size: 10}, {ChunkID: orphanID, Size: 1}}},
+		{Before: snapshot(t, s, "w2"), Inventory: nil},
+		{Before: snapshot(t, s, "w3"), Err: errors.New("unreachable")},
+	}
+	check, err = s.AuditInventory(ctx, bad)
+	if err != nil || check.Violations != 2 || len(check.UncheckedWorkers) != 1 || check.UncheckedWorkers[0] != "w3" {
+		t.Fatalf("orphan + missing I4 = %+v, %v", check, err)
+	}
+	// A pending delete created after the snapshot (a delete in progress)
+	// accounts for the file: no violation.
+	if err := s.tx(ctx, func(tx *sqlTx) error {
+		return insertPendingDelete(ctx, tx, orphanID, "w1", orphanID[:36], "test", 1)
+	}); err != nil {
+		t.Fatal(err)
+	}
+	if check, err = s.AuditInventory(ctx, bad[:1]); err != nil || check.Violations != 0 {
+		t.Fatalf("I4 after pending delete = %+v, %v", check, err)
 	}
 }
 

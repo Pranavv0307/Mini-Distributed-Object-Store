@@ -9,13 +9,16 @@ clarifies the design doc, the difference is listed in
 [§15 Deviations](#15-deviations-and-clarifications-vs-the-design-doc) with a link
 to [`DECISIONS.md`](DECISIONS.md).
 
-> **Current status (Phase 11):** implemented: the worker's chunk store
-> and chunk API (§3.1); cluster membership with the `SYNCING` protocol (§7);
-> the metadata database, the upload path, and a minimal janitor (§8); the
-> verified download path (§9); metadata, list, delete, and `objctl` (§10);
-> inventory reconciliation, `/cluster` storage totals, and audit v1 (§11);
-> **self-healing re-replication** (§12), worker scrubber, crash recovery,
-> inventory audit v2, and packaged demo.
+> **Current status (end of Phase 10, review fixes applied):** implemented:
+> the worker's chunk store and chunk API (§3.1); cluster membership with the
+> `SYNCING` protocol (§7); the metadata database, the upload path, and the
+> janitor (§8); the verified download path (§9); metadata, list, delete, and
+> `objctl` (§10); inventory reconciliation, `/cluster` storage totals, and
+> audit v1 (§11); **self-healing re-replication** (§12); the worker
+> scrubber with the controller cross-check, the live inventory sweep, crash
+> recovery, stale-upload expiry, and audit v2 (§12a); evaluation scripts
+> (Phase 10). Phase 11 (packaging) is drafted (`scripts/demo.sh`,
+> `docs/VIVA_GUIDE.md`) but not yet reviewed as a phase.
 
 ---
 
@@ -47,18 +50,19 @@ observed state reconciled in loops; trust nothing you didn't verify.
 | Worker | Chunk store | Header-format chunk files, atomic durable writes, temp cleanup, inventory | `internal/worker/store` | **Implemented (Phase 1)** |
 | Worker | Chunk API | PUT/GET/DELETE chunk, list inventory, healthz, write gate | `internal/worker/server`, `cmd/worker` | **Implemented (Phase 1)** |
 | Worker | Membership agent | Register (with inventory, retried), heartbeat, write gate | `internal/worker/agent` | **Implemented (Phase 2)** |
-| Worker | Scrubber | Throttled re-verification; suspects reported via heartbeat | `internal/worker/scrub` | Phase 8 |
-| Controller | API front end | Membership endpoints (Phase 2, implemented); client REST API, validation, error mapping (Phases 3–5) | `internal/controller/api`, `cmd/controller` | Partly (Phase 2) |
+| Worker | Scrubber | Throttled re-verification; suspects re-checked and reported via heartbeat | `internal/worker/scrub` | **Implemented (Phase 8)** |
+| Controller | API front end | Membership endpoints; client REST API, validation, error mapping; `/cluster`; audit | `internal/controller/api`, `cmd/controller` | **Implemented (Phases 2–6, 9)** |
 | Controller | Metadata store | SQLite schema, migrations, short conditional transactions | `internal/controller/meta` | **Implemented (Phase 3)** |
 | Controller | Worker registry | In-memory worker states, epochs, controller-clock liveness | `internal/controller/registry` | **Implemented (Phase 2)** |
 | Controller | Failure detector | `ALIVE`/`SYNCING` → `DEAD` on heartbeat silence | `internal/controller/registry` | **Implemented (Phase 2)** |
 | Controller | Placement engine | Distinct ALIVE workers with free space; pluggable (random) | `internal/controller/placement` | **Implemented (Phase 3)** |
 | Controller | Worker client | The only code calling workers: timeouts, checksum headers | `internal/controller/workerclient` | **Implemented (Phase 3)** |
 | Controller | Upload / download coordinators | Streaming write and read paths | `internal/controller/upload`, `.../download` | **Implemented (Phases 3, 4)** |
+| Controller | Integrity verifier | Cross-checks scrubber suspects against the controller's checksum before marking `CORRUPT` | `internal/controller/integrity` | **Implemented (Phase 8)** |
 | Controller | Reconciler (repair loop) | Level-triggered repair of under-replicated/corrupt chunks; trimming | `internal/controller/repair` | **Implemented (Phase 7)** |
-| Controller | Janitor | `pending_deletes` drain, stale-upload cleanup, purge of `DELETING` objects, and periodic inventory/orphan sweep | `internal/controller/janitor` | Implemented (Phases 3, 5, 9) |
-| Controller | Recovery | Startup recovery of `UPLOADING` objects and dangling `PENDING` claims; repair warm-up and unknown-worker rule | `internal/controller/meta`, `.../repair` | Implemented (Phase 9; repair pieces in Phase 7) |
-| Controller | Observability | `/healthz`, `/cluster`, audit, structured event log | `internal/controller/api`, `.../audit` | `/healthz`, `/cluster` (workers), event log: implemented; audit Phases 6, 9 |
+| Controller | Janitor | `pending_deletes` drain, stale-upload expiry, purge of `DELETING` objects, live inventory sweep (orphans, lost copies) | `internal/controller/janitor` | **Implemented (Phases 3, 5, 9)** |
+| Controller | Recovery | Startup recovery of `UPLOADING` objects and dangling `PENDING` claims; repair warm-up and unknown-worker rule | `internal/controller/meta`, `.../repair` | **Implemented (Phase 9; repair pieces in Phase 7)** |
+| Controller | Observability | `/healthz`, `/cluster`, audit v2, structured event log | `internal/controller/api`, `.../meta` | **Implemented (Phases 2, 6, 9)** |
 | Client | `objctl` | CLI for the REST API with local download verification; Compose `client` service | `cmd/objctl` | **Implemented (Phase 5)** |
 
 Shared packages (implemented in Phase 1): `internal/ids` (object/chunk/worker
@@ -183,7 +187,7 @@ heartbeat from an unknown or `DEAD` worker is answered with `reregister`.
   its inventory while writes are gated, registers; controller assigns an epoch,
   marks `SYNCING`, reconciles (§4.5 table) in short DB transactions, marks
   `ALIVE` if the epoch is still current.
-- **Repair (Phase 7–8):** reconciler round finds chunks of `READY` objects with
+- **Repair (Phases 7–8, implemented):** reconciler round finds chunks of `READY` objects with
   fewer than RF effective replicas (counting replicas on repair-eligible
   `DEAD` workers and `CORRUPT` replicas as lost), sorts by risk, and with
   bounded concurrency claims a target, copies from a verified source through
@@ -191,8 +195,8 @@ heartbeat from an unknown or `DEAD` worker is answered with `reregister`.
 
 ## 6. Invariants
 
-I1–I7 from the design doc §3.4 are the correctness contract and will be checked
-by the audit (Phases 6, 9):
+I1–I7 from the design doc §3.4 are the correctness contract. The audit
+checks I1–I5, I7 and I8 (DEC-053, DEC-060); I6 is checked by every download:
 
 | # | Invariant |
 | --- | --- |
@@ -341,22 +345,25 @@ transaction re-checks its precondition (`status = 'UPLOADING'`, the expected
 6. **Any failure:** `MarkDeleting` on a detached context, kick the janitor,
    respond with the mapped error.
 
-### 8.3 Janitor (minimal, `internal/controller/janitor`)
+### 8.3 Janitor (`internal/controller/janitor`)
 
-Every `JANITOR_INTERVAL` or on kick: DELETE due pending deletes on ALIVE
-workers (bounded concurrency, idempotent; failures back off exponentially),
-then purge `DELETING` objects with nothing left (DEC-037).
+Every `JANITOR_INTERVAL` or on kick: abort uploads idle for
+`UPLOAD_STALE_AFTER` (Phase 9); every `INVENTORY_SWEEP_INTERVAL`, the live
+inventory sweep (§12a); DELETE due pending deletes on ALIVE workers (bounded
+concurrency, idempotent; failures back off exponentially); then purge
+`DELETING` objects with nothing left (DEC-037).
 
-### 8.4 Crash windows (Phase 3 status)
+### 8.4 Crash windows (status at Phase 9)
 
 | Crash or failure | What is left | Who cleans it |
 | --- | --- | --- |
 | Client disconnects mid-upload | `UPLOADING` object, claims | Handler aborts → janitor (tested) |
 | Worker fails or times out on a PUT | Possibly bytes on that worker | Claim → pending delete → janitor (tested) |
 | Worker stops mid-upload | As above, deleted when it returns | Janitor (tested) |
-| Controller crashes mid-upload | `UPLOADING` object, `PENDING`/`OK` rows | Startup recovery changes it to `DELETING`; janitor removes files |
-| Controller crashes between a worker's rename and `MarkReplicaOK` | Claimed file; row still `PENDING` | Recovery changes the claim to pending delete |
-| PUT lands after the janitor's DELETE for an aborted upload | Orphan file | Periodic inventory sweep queues and removes the orphan |
+| Controller crashes mid-upload | `UPLOADING` object, `PENDING`/`OK` rows | Startup recovery changes it to `DELETING`; janitor removes files (tested, incl. `SIGKILL` in Compose) |
+| Controller crashes between a worker's rename and `MarkReplicaOK` | Claimed file; row still `PENDING` | Recovery changes the claim to pending delete (tested) |
+| Upload handler stalls (client stops sending) | `UPLOADING` object | Janitor aborts it after `UPLOAD_STALE_AFTER` (tested) |
+| PUT lands after the janitor's DELETE for an aborted upload | Orphan file | Live inventory sweep queues and removes the orphan (tested) |
 
 ### 8.5 Measured (Phase 3)
 
@@ -514,6 +521,49 @@ of `DEAD_AFTER` + `HEARTBEAT_INTERVAL`, a round every `RECONCILER_INTERVAL`:
 Window of vulnerability ≈ `DEAD_AFTER` + `REPAIR_GRACE` + one round + copy
 time (§4.7); with the defaults, about 45 s for a small data set.
 
+## 12a. Data integrity, crash recovery, audit v2 (implemented, Phases 8–9)
+
+**Scrubber (worker, `internal/worker/scrub`, DEC-058).** Every
+`SCRUB_INTERVAL` (default 10 min) the worker re-reads each committed chunk,
+throttled to `SCRUB_BYTES_PER_SEC` (default 20 MB/s), and checks the payload
+against the size and SHA-256 in the chunk header (layer 2, §3.6). Damaged
+chunks become suspects. Before each heartbeat the suspects are re-verified:
+one that now verifies (repair rewrote it) or no longer exists is dropped.
+
+**Cross-check (controller, `internal/controller/integrity`).** Heartbeat
+suspects are queued, deduplicated, and verified by two background workers:
+the copy is read from the worker and compared with the metadata size and
+checksum (layer 3, the authority). Only a confirmed mismatch (or a 404,
+`CHUNK_CORRUPT`, or a header checksum that differs from the controller's)
+marks the copy `CORRUPT`, conditionally on the row being unchanged; the
+repair loop then rewrites it in place without grace (§12). A false report
+costs one read and changes nothing.
+
+**Live inventory sweep (janitor, DEC-057).** Every `INVENTORY_SWEEP_INTERVAL`
+(default 5 min) the janitor, for each ALIVE worker, reads that worker's
+replica rows and pending deletes, *then* fetches its inventory, and acts only
+on findings that still hold: an OK copy (of a READY object) whose file is
+gone or has the wrong size becomes `CORRUPT` (repaired in place); a file
+with no row and no pending delete becomes a pending delete (`orphan`). The
+order makes it safe against concurrent uploads, repairs, and deletes.
+
+**Crash recovery (DEC-059).** Before serving HTTP, the controller moves
+every `UPLOADING` object to `DELETING` (all its copies become pending
+deletes) and turns leftover `PENDING` claims into pending deletes. The
+janitor aborts uploads idle for `UPLOAD_STALE_AFTER` the same way.
+
+**Audit v2 (DEC-060).** Adds I4 for ALIVE workers with the same before/after
+rule, as a `steady_state` check; unreachable workers are listed as
+unchecked. I7 tolerates objects committed or deleted while it pages the
+listing.
+
+**Measured (Compose e2e; `SCRUB_INTERVAL` 2 s, heartbeat 1 s, reconciler
+1 s):** a same-size corruption was detected and rewritten 3 s after it was
+made, with exactly one repair; a deleted chunk file was rewritten within one
+sweep interval; after `docker kill` of the controller mid-upload, every file
+of the unfinished upload was removed after the restart
+(`TestComposeIntegrity`, `TestComposeControllerKilledMidUpload`).
+
 ## 13. Failure handling (summary)
 
 See the design doc §5.2 (failure model) and §7 (failure scenario matrix).
@@ -522,8 +572,16 @@ Implemented so far: worker stop/start and controller restart for membership
 `TestControllerRestartTriggersReregistration`,
 `TestComposeClusterMembership`); worker crash mid-write leaves no partial
 chunk (`TestWorkerKilledMidWriteLeavesNoPartialChunk`, e2e). Data-path
-scenarios are implemented in Phases 4–9 and will be listed here with their
-tests.
+scenarios and their tests are mapped in [`VIVA_GUIDE.md`](VIVA_GUIDE.md).
+Phase 8–9 scenarios: scrubber corruption
+(`TestScrubberDetectsAndRepairsWithoutClientRead`, `TestComposeIntegrity`),
+both copies corrupt (`TestScrubberBothCopiesCorrupt`,
+`TestDownloadBothReplicasCorrupt`), deleted file
+(`TestDeletedChunkFileRepairedBySweep`), orphan
+(`TestOrphanFileRemovedBySweep`), controller crash mid-upload
+(`TestControllerCrashMidUploadRecovered`,
+`TestComposeControllerKilledMidUpload`), and mixed load with a worker loss
+(`TestInvariantsUnderChurn`).
 
 ## 14. Trade-offs and limitations
 
@@ -539,7 +597,7 @@ grace period (longer vulnerability window); single-file metadata DB.
 | Worker `SYNCING` state | §4.5 uses it; §3.3 diagram omits it; §2.2 says it derives from heartbeat age | Registration-driven state with epochs; excluded from placement, reads, and repair; workers gate writes until registered | DEC-006 |
 | Physical cleanup | Failed claims removed; orphans "scheduled for deletion" | Durable `pending_deletes` table, mutually exclusive with claims | DEC-007 |
 | Repair target | "No replica of this chunk" but "prefer the CORRUPT holder" | No `OK`/`PENDING` replica and no pending delete; `CORRUPT → PENDING` in place | DEC-008 |
-| Orphan sweep | Inventories only at registration | Janitor also pulls inventories periodically | DEC-009 |
+| Orphan sweep | Inventories only at registration | Janitor also pulls inventories periodically, metadata snapshot first; lost copies marked `CORRUPT` | DEC-009, DEC-057 |
 | `GET /internal/workers/{id}/chunks` | Host unspecified | Served by the worker | DEC-010 |
 | Stale-upload abort vs. live handler | Not addressed | Claims and commit conditional on status | DEC-011 |
 | New parameters | — | `JANITOR_INTERVAL`, `INVENTORY_SWEEP_INTERVAL` | DEC-009 |
@@ -549,7 +607,9 @@ grace period (longer vulnerability window); single-file metadata DB.
 | Missing chunk file on read | "Unreachable → try other replica" | Treated as `CORRUPT` (repairable in place) | DEC-040 |
 | 409 | "If adopted" (§9.4) | Adopted: optional `If-Match` on PATCH | DEC-014 |
 | Janitor for client deletes | Phase 5 scope | Built in Phase 3 (needed for aborts), reused | DEC-037, DEC-048 |
-| Audit result | Pass/fail on I1–I5 | `ok` = safety invariants (I1, I2, I3, I7, I8); I5 reported as `steady_state` | DEC-053 |
+| Audit result | Pass/fail on I1–I5 | `ok` = safety invariants (I1, I2, I3, I7, I8); I5 and I4 reported as `steady_state` | DEC-053, DEC-060 |
+| Scrubber cross-check | "Controller cross-checks against its own record" | Asynchronous: the copy is read and compared with the metadata checksum; suspects re-verified on the worker before each report | DEC-058 |
+| New parameters (Phases 8–9) | `SCRUB_INTERVAL` only | Also `SCRUB_BYTES_PER_SEC`, `UPLOAD_STALE_AFTER` | DEC-058, DEC-059 |
 | Repair in-flight set | Track chunks being repaired across rounds | Rounds never overlap; one copy per chunk per round | DEC-054 |
 | Superseded lost row | "Drop" it | Moved to pending deletes (file deleted when its worker returns) | DEC-055 |
 | Repair warm-up | Phase 9 (§4.10) | Built with the repair loop in Phase 7 | DEC-056 |

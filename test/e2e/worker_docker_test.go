@@ -87,7 +87,9 @@ func (c *container) waitHealthy() string {
 			return false
 		}
 		base = "http://" + strings.TrimSpace(strings.Split(string(out), "\n")[0])
-		resp, err := http.Get(base + "/healthz")
+		// Bounded per attempt: a stale port forward can accept the
+		// connection and never answer, which would hang an untimed Get.
+		resp, err := healthClient.Get(base + "/healthz")
 		if err != nil {
 			return false
 		}
@@ -96,6 +98,8 @@ func (c *container) waitHealthy() string {
 	})
 	return base
 }
+
+var healthClient = &http.Client{Timeout: 2 * time.Second}
 
 func runWorker(t *testing.T, img, name, volume string) *container {
 	t.Helper()

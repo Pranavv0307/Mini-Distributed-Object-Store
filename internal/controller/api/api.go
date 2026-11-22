@@ -42,6 +42,11 @@ type InventoryReconciler interface {
 	ReconcileInventory(ctx context.Context, workerID string, epoch uint64, inventory []wire.ChunkInfo) error
 }
 
+// SuspectReporter accepts scrubber suspects for asynchronous cross-checking.
+type SuspectReporter interface {
+	Report(workerID string, chunkIDs []string)
+}
+
 // NoopReconciler accepts every inventory unchanged (Phase 2).
 type NoopReconciler struct{ Logger *slog.Logger }
 
@@ -80,8 +85,12 @@ type Config struct {
 	// MaxConcurrentUploads × UPLOAD_WINDOW × CHUNK_SIZE.
 	MaxConcurrentUploads int
 	Logger               *slog.Logger
-	// Inventories supplies metadata-only worker snapshots for audit v2.
-	Inventories func(context.Context, []registry.Worker) (map[string][]meta.InventoryEntry, error)
+	// Suspects, if set, receives the scrubber suspects reported in
+	// heartbeats for cross-checking (integrity.Verifier).
+	Suspects SuspectReporter
+	// Inventory, if set, fetches one worker's metadata-only inventory for
+	// audit v2 (I4).
+	Inventory func(context.Context, registry.Worker) ([]meta.InventoryEntry, error)
 }
 
 // Server serves the controller's HTTP API.
@@ -208,21 +217,18 @@ func (s *Server) heartbeat(w http.ResponseWriter, r *http.Request) {
 	reregister := s.reg.Heartbeat(req.WorkerID, req.Epoch, registry.Capacity{
 		FreeBytes: req.FreeBytes, UsedBytes: req.UsedBytes, ChunkCount: req.ChunkCount,
 	})
-	if !reregister && s.cfg.Meta != nil {
+	if !reregister && s.cfg.Suspects != nil && len(req.SuspectChunks) > 0 {
+		valid := make([]string, 0, len(req.SuspectChunks))
 		for _, chunkID := range req.SuspectChunks {
 			if !ids.ValidChunkID(chunkID) {
 				s.log.Warn("scrub_suspect_rejected", "worker_id", req.WorkerID, "chunk_id", chunkID, "reason", "invalid_id")
 				continue
 			}
-			changed, err := s.cfg.Meta.MarkSuspectCorrupt(r.Context(), chunkID, req.WorkerID)
-			if err != nil {
-				s.log.Error("scrub_crosscheck_failed", "worker_id", req.WorkerID, "chunk_id", chunkID, "error", err)
-				continue
-			}
-			if changed {
-				s.log.Warn("corruption_detected", "worker_id", req.WorkerID, "chunk_id", chunkID, "detected_by", "scrubber")
-			}
+			valid = append(valid, chunkID)
 		}
+		// Queued for the controller's cross-check (DEC-058); never verified
+		// inside the heartbeat.
+		s.cfg.Suspects.Report(req.WorkerID, valid)
 	}
 	action := wire.ActionOK
 	if reregister {
@@ -376,22 +382,33 @@ func (s *Server) audit(w http.ResponseWriter, r *http.Request) {
 		httpx.WriteError(w, http.StatusInternalServerError, wire.CodeInternal, "internal error")
 		return
 	}
-	if s.cfg.Inventories != nil {
-		invs, err := s.cfg.Inventories(r.Context(), s.reg.Alive())
-		if err != nil {
-			s.log.Error("audit_inventory_failed", "error", err)
-			httpx.WriteError(w, http.StatusInternalServerError, wire.CodeInternal, "internal error")
-			return
+	if s.cfg.Inventory != nil {
+		// I4: snapshot each live worker's metadata, then fetch its inventory
+		// (before/after rule, DEC-057). A worker that cannot be listed is
+		// reported as unchecked, not as a violation or a failed audit.
+		var workers []meta.WorkerInventory
+		for _, wk := range s.reg.Alive() {
+			before, err := s.cfg.Meta.SnapshotWorker(r.Context(), wk.ID)
+			if err != nil {
+				s.log.Error("audit_failed", "error", err)
+				httpx.WriteError(w, http.StatusInternalServerError, wire.CodeInternal, "internal error")
+				return
+			}
+			inv, err := s.cfg.Inventory(r.Context(), wk)
+			if err != nil {
+				s.log.Warn("audit_inventory_unavailable", "worker_id", wk.ID, "error", err)
+			}
+			workers = append(workers, meta.WorkerInventory{Before: before, Inventory: inv, Err: err})
 		}
-		check, err := s.cfg.Meta.AuditInventory(r.Context(), invs)
+		check, err := s.cfg.Meta.AuditInventory(r.Context(), workers)
 		if err != nil {
-			s.log.Error("audit_inventory_failed", "error", err)
+			s.log.Error("audit_failed", "error", err)
 			httpx.WriteError(w, http.StatusInternalServerError, wire.CodeInternal, "internal error")
 			return
 		}
 		rep.Checks = append(rep.Checks, check)
 		if check.Violations > 0 {
-			rep.OK = false
+			rep.SteadyState = false
 		}
 	}
 	if !rep.OK {

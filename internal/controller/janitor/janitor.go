@@ -28,6 +28,8 @@ type Deleter interface {
 	DeleteChunk(ctx context.Context, baseURL, chunkID string) error
 }
 
+// InventoryLister fetches a worker's inventory for the periodic sweep
+// (workerclient.Client implements it).
 type InventoryLister interface {
 	Inventory(ctx context.Context, baseURL, workerID string) (wire.InventoryResponse, error)
 }
@@ -38,8 +40,13 @@ type Config struct {
 	BatchSize   int           // pending deletes handled per round (default 256)
 	Concurrency int           // parallel DELETE calls (default 8)
 	// MaxBackoff caps the retry delay after failed deletes (default 5m).
-	MaxBackoff             time.Duration
-	UploadStaleAfter       time.Duration
+	MaxBackoff time.Duration
+	// UploadStaleAfter: an UPLOADING object with no activity for this long
+	// is aborted (UPLOAD_STALE_AFTER, default 10m).
+	UploadStaleAfter time.Duration
+	// InventorySweepInterval: period of the live-worker inventory sweep
+	// (INVENTORY_SWEEP_INTERVAL, default 5m). The first sweep runs in the
+	// first round.
 	InventorySweepInterval time.Duration
 	Logger                 *slog.Logger
 }
@@ -195,6 +202,12 @@ func (j *Janitor) sweepInventories(ctx context.Context) error {
 		return nil
 	}
 	for _, w := range j.reg.Alive() {
+		// Metadata first, inventory second: the before/after rule that makes
+		// the sweep safe while writes land on the worker (DEC-057).
+		before, err := j.meta.SnapshotWorker(ctx, w.ID)
+		if err != nil {
+			return err
+		}
 		inv, err := lister.Inventory(ctx, w.Address, w.ID)
 		if err != nil {
 			j.log.Warn("inventory_sweep_failed", "worker_id", w.ID, "error", err)
@@ -204,12 +217,16 @@ func (j *Janitor) sweepInventories(ctx context.Context) error {
 		for i, c := range inv.Chunks {
 			entries[i] = meta.InventoryEntry{ChunkID: c.ChunkID, Size: c.Size}
 		}
-		result, err := j.meta.ReconcileInventory(ctx, w.ID, entries)
+		result, err := j.meta.SweepInventory(ctx, before, entries)
 		if err != nil {
 			return err
 		}
 		if result.OrphansQueued > 0 {
 			j.log.Warn("inventory_orphans_queued", "worker_id", w.ID, "count", result.OrphansQueued)
+		}
+		if result.MissingMarked > 0 || result.SizeMismatch > 0 {
+			j.log.Warn("corruption_detected", "worker_id", w.ID, "detected_by", "inventory_sweep",
+				"missing", result.MissingMarked, "size_mismatch", result.SizeMismatch)
 		}
 	}
 	return nil

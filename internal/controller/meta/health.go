@@ -87,6 +87,9 @@ type AuditCheck struct {
 	Kind        string   `json:"kind"` // "safety" (must always hold) or "steady_state"
 	Violations  int      `json:"violations"`
 	Examples    []string `json:"examples"` // at most maxExamples
+	// UncheckedWorkers lists workers a check could not examine (I4: the
+	// worker's inventory could not be fetched). Not violations.
+	UncheckedWorkers []string `json:"unchecked_workers,omitempty"`
 }
 
 // AuditReport is the result of Audit.
@@ -94,68 +97,29 @@ type AuditReport struct {
 	CheckedAt string `json:"checked_at"`
 	// OK: every safety invariant holds. These must hold at all times.
 	OK bool `json:"ok"`
-	// SteadyState: I5 holds (every chunk has exactly RF effective replicas).
+	// SteadyState: every steady_state check holds: I5 (every chunk has
+	// exactly RF effective replicas) and, when inventories are checked, I4.
 	// Expected to be false while a failure or repair is in progress.
 	SteadyState bool         `json:"steady_state"`
 	Checks      []AuditCheck `json:"checks"`
 }
 
-// AuditInventory checks I4 against metadata and worker inventory snapshots.
-// A file is valid when it has a replica row or a pending-delete intent; a
-// replica is valid when the worker still reports its file or deletion is
-// already queued. The caller supplies snapshots so this method performs no
-// network I/O while holding a database transaction.
-func (s *Store) AuditInventory(ctx context.Context, inventories map[string][]InventoryEntry) (AuditCheck, error) {
-	check := AuditCheck{ID: "I4", Description: "worker inventories match replica rows and pending-delete intents", Kind: "safety", Examples: []string{}}
-	onDisk := map[string]map[string]bool{}
-	for worker, entries := range inventories {
-		onDisk[worker] = map[string]bool{}
-		for _, entry := range entries {
-			onDisk[worker][entry.ChunkID] = true
-		}
-	}
-	rows, err := s.db.QueryContext(ctx, `SELECT chunk_id, worker_id FROM replicas`)
+// readyIDs returns the IDs of all READY objects.
+func (s *Store) readyIDs(ctx context.Context) (map[string]bool, error) {
+	rows, err := s.db.QueryContext(ctx, `SELECT object_id FROM objects WHERE status = 'READY'`)
 	if err != nil {
-		return check, err
+		return nil, err
 	}
+	defer rows.Close()
+	out := map[string]bool{}
 	for rows.Next() {
-		var chunkID, workerID string
-		if err := rows.Scan(&chunkID, &workerID); err != nil {
-			rows.Close()
-			return check, err
+		var id string
+		if err := rows.Scan(&id); err != nil {
+			return nil, err
 		}
-		if _, known := inventories[workerID]; !known {
-			continue
-		}
-		if !onDisk[workerID][chunkID] {
-			var pending int
-			if err := s.db.QueryRowContext(ctx, `SELECT COUNT(*) FROM pending_deletes WHERE chunk_id = ? AND worker_id = ?`, chunkID, workerID).Scan(&pending); err != nil {
-				rows.Close()
-				return check, err
-			}
-			if pending == 0 {
-				checkViolation(&check, chunkID+" missing on "+workerID)
-			}
-		}
+		out[id] = true
 	}
-	if err := rows.Close(); err != nil {
-		return check, err
-	}
-	if err := rows.Err(); err != nil {
-		return check, err
-	}
-	for worker, entries := range inventories {
-		for _, entry := range entries {
-			var rows int
-			if err := s.db.QueryRowContext(ctx, `SELECT (SELECT COUNT(*) FROM replicas WHERE chunk_id = ? AND worker_id = ?) + (SELECT COUNT(*) FROM pending_deletes WHERE chunk_id = ? AND worker_id = ?)`, entry.ChunkID, worker, entry.ChunkID, worker).Scan(&rows); err != nil {
-				return check, err
-			}
-			if rows == 0 {
-				checkViolation(&check, entry.ChunkID+" orphan on "+worker)
-			}
-		}
-	}
-	return check, nil
+	return out, rows.Err()
 }
 
 func checkViolation(c *AuditCheck, example string) {
@@ -169,10 +133,12 @@ const maxExamples = 10
 
 // Audit evaluates the invariants that can be checked from metadata alone
 // (architecture §3.4, §5.9): I1, I2, I3, I7, I8 (safety) and I5 (steady
-// state). I4 needs worker inventories (Phase 9); I6 is checked by every
-// download. The checks are independent reads, not one snapshot, so a check
-// racing a concurrent operation can at worst report a transient I5 change;
-// the safety checks only examine READY objects, whose chunk rows never change.
+// state). I4 needs worker inventories (AuditInventory, run by the API on
+// top of this report); I6 is checked by every download. The checks are
+// independent reads, not one snapshot, so a check racing a concurrent
+// operation can at worst report a transient I5 change; the safety checks
+// only examine READY objects, whose chunk rows never change, and I7 is
+// written to tolerate objects committed or deleted during the listing.
 func (s *Store) Audit(ctx context.Context, alive []string, rf int) (AuditReport, error) {
 	rep := AuditReport{CheckedAt: s.now().UTC().Format(time.RFC3339Nano)}
 	type check struct {
@@ -229,8 +195,16 @@ func (s *Store) Audit(ctx context.Context, alive []string, rf int) (AuditReport,
 	}
 
 	// I7: the listing (the client's view) contains exactly the READY objects.
+	// The listing is paged and objects are committed and deleted meanwhile,
+	// so comparing it with a count is racy (a false violation under load).
+	// Instead: every listed object must be READY in its own row, and every
+	// object that was READY both before and after the listing must be in it.
 	i7 := AuditCheck{ID: "I7", Description: "only READY objects are listed, and every READY object is", Kind: "safety", Examples: []string{}}
-	listed := 0
+	readyBefore, err := s.readyIDs(ctx)
+	if err != nil {
+		return rep, fmt.Errorf("audit I7: %w", err)
+	}
+	listed := map[string]bool{}
 	var cur *ListCursor
 	for {
 		objs, next, err := s.ListObjects(ctx, 1000, cur)
@@ -238,12 +212,9 @@ func (s *Store) Audit(ctx context.Context, alive []string, rf int) (AuditReport,
 			return rep, fmt.Errorf("audit I7: %w", err)
 		}
 		for _, o := range objs {
-			listed++
+			listed[o.ID] = true
 			if o.Status != StatusReady {
-				i7.Violations++
-				if len(i7.Examples) < maxExamples {
-					i7.Examples = append(i7.Examples, o.ID+" listed with status "+o.Status)
-				}
+				checkViolation(&i7, o.ID+" listed with status "+o.Status)
 			}
 		}
 		if next == nil {
@@ -251,13 +222,14 @@ func (s *Store) Audit(ctx context.Context, alive []string, rf int) (AuditReport,
 		}
 		cur = next
 	}
-	var ready int
-	if err := s.db.QueryRowContext(ctx, `SELECT COUNT(*) FROM objects WHERE status = 'READY'`).Scan(&ready); err != nil {
-		return rep, err
+	readyAfter, err := s.readyIDs(ctx)
+	if err != nil {
+		return rep, fmt.Errorf("audit I7: %w", err)
 	}
-	if ready != listed {
-		i7.Violations++
-		i7.Examples = append(i7.Examples, fmt.Sprintf("%d READY objects but %d listed", ready, listed))
+	for id := range readyBefore {
+		if readyAfter[id] && !listed[id] {
+			checkViolation(&i7, id+" is READY but not listed")
+		}
 	}
 	rep.Checks = append(rep.Checks, i7)
 

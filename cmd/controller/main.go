@@ -27,6 +27,7 @@ import (
 	"objstore/internal/config"
 	"objstore/internal/controller/api"
 	"objstore/internal/controller/download"
+	"objstore/internal/controller/integrity"
 	"objstore/internal/controller/janitor"
 	"objstore/internal/controller/meta"
 	"objstore/internal/controller/placement"
@@ -77,7 +78,7 @@ func serve(cfg config.Controller, logger *slog.Logger) error {
 	if recovered, err := store.RecoverUploading(context.Background()); err != nil {
 		return fmt.Errorf("startup recovery: %w", err)
 	} else if recovered > 0 {
-		logger.Warn("startup_recovery", "uploads_aborted", recovered)
+		logger.Warn("startup_recovery", "recovered", recovered)
 	}
 
 	reg := registry.New(registry.Options{DeadAfter: cfg.DeadAfter, Logger: logger})
@@ -104,6 +105,7 @@ func serve(cfg config.Controller, logger *slog.Logger) error {
 		MinFreeBytes:      cfg.MinFreeBytes,
 		Logger:            logger,
 	})
+	verifier := integrity.New(store, reg, workers, integrity.Config{Logger: logger})
 	srv := api.New(reg, resync.New(store, logger, jan.Kick), api.Config{
 		HeartbeatInterval:      cfg.HeartbeatInterval,
 		DeadAfter:              cfg.DeadAfter,
@@ -115,22 +117,19 @@ func serve(cfg config.Controller, logger *slog.Logger) error {
 		MaxConcurrentUploads:   cfg.MaxConcurrentUploads,
 		Downloader:             downloader,
 		OnDelete:               jan.Kick,
+		Suspects:               verifier,
 		MaxConcurrentDownloads: cfg.MaxConcurrentDownloads,
 		Logger:                 logger,
-		Inventories: func(ctx context.Context, workersIn []registry.Worker) (map[string][]meta.InventoryEntry, error) {
-			out := make(map[string][]meta.InventoryEntry, len(workersIn))
-			for _, w := range workersIn {
-				inv, err := workers.Inventory(ctx, w.Address, w.ID)
-				if err != nil {
-					return nil, err
-				}
-				entries := make([]meta.InventoryEntry, len(inv.Chunks))
-				for i, c := range inv.Chunks {
-					entries[i] = meta.InventoryEntry{ChunkID: c.ChunkID, Size: c.Size}
-				}
-				out[w.ID] = entries
+		Inventory: func(ctx context.Context, w registry.Worker) ([]meta.InventoryEntry, error) {
+			inv, err := workers.Inventory(ctx, w.Address, w.ID)
+			if err != nil {
+				return nil, err
 			}
-			return out, nil
+			entries := make([]meta.InventoryEntry, len(inv.Chunks))
+			for i, c := range inv.Chunks {
+				entries[i] = meta.InventoryEntry{ChunkID: c.ChunkID, Size: c.Size}
+			}
+			return entries, nil
 		},
 	})
 
@@ -155,6 +154,7 @@ func serve(cfg config.Controller, logger *slog.Logger) error {
 	bg.Go(func() { registry.RunFailureDetector(bgCtx, reg, cfg.FailureCheckInterval) })
 	bg.Go(func() { jan.Run(bgCtx) })
 	bg.Go(func() { repairer.Run(bgCtx) })
+	bg.Go(func() { verifier.Run(bgCtx) })
 
 	errc := make(chan error, 1)
 	go func() { errc <- httpSrv.Serve(ln) }()

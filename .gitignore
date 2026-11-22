@@ -23,6 +23,8 @@ coverage.*
 # Benchmark/demo artifacts generated locally (results that matter are copied into docs/)
 /bench-results/
 /demo-output/
+# Test payloads created by hand at the repository root (e.g. big.bin, got.bin)
+/*.bin
 
 # Local configuration and secrets (commit .env.example instead)
 .env

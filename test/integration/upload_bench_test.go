@@ -16,7 +16,7 @@ import (
 func BenchmarkUploadWindow(b *testing.B) {
 	for _, window := range []int{1, 2, 4, 8} {
 		b.Run(fmt.Sprintf("window=%d", window), func(b *testing.B) {
-			c := newUploadCluster(b, clusterOpts{workers: 4, window: window})
+			c := newUploadCluster(b, clusterOpts{workers: 4, window: window, sweepEvery: time.Hour})
 			for _, w := range c.workers {
 				w.faults.putLatency.Store(int64(5 * time.Millisecond))
 			}

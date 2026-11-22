@@ -6,7 +6,8 @@ Practical, step-by-step instructions to set up, run, and verify the project.
 > observed at the phase noted. Sections for later phases are marked
 > *not yet available* until those phases are implemented.
 
-**Current state (Phase 11 complete):** the cluster runs under Docker Compose:
+**Current state (end of Phase 10, review fixes applied; Phase 11 in
+progress):** the cluster runs under Docker Compose:
 one controller and four workers. **Every client API endpoint of the
 specification works:** upload (1 MB chunks, two copies on distinct workers,
 atomic commit), verified download with replica fallback, metadata GET and
@@ -14,9 +15,12 @@ PATCH, list with pagination, and delete; `objctl` natively and as a Compose
 `client` container. Returning workers are reconciled against the metadata;
 `/cluster` shows replication health and `/admin/audit` checks the invariants.
 **Lost and corrupt copies are re-replicated automatically** after
-`REPAIR_GRACE`. The worker scrubber, crash recovery, inventory sweep, and
-evaluation scripts are implemented in Phases 8–10. The packaged one-command
-demo and viva matrix are in `../scripts/demo.sh` and `VIVA_GUIDE.md`.
+`REPAIR_GRACE`. Corruption is also found without any client read, by the
+worker scrubber (confirmed by the controller) and the periodic inventory
+sweep; a controller crash mid-upload leaves nothing behind (Phases 8–9).
+Evaluation scripts and results: `EVALUATION.md` (Phase 10). The draft
+one-command demo and viva matrix (Phase 11) are `../scripts/demo.sh` and
+`VIVA_GUIDE.md`.
 
 > ⚠️ **Docker name collisions.** Container names are global on a Docker host.
 > The Compose file uses the spec's names `controller` and `worker1`…`worker4`.
@@ -116,9 +120,10 @@ All variables are optional (defaults shown). Set them in the shell or in a
 | `JANITOR_INTERVAL` | controller | `10s` | Cleanup round period (also runs right after an aborted upload) |
 | `RECONCILER_INTERVAL` | controller | `5s` | Repair round period |
 | `MAX_CONCURRENT_REPAIRS` | controller | `4` | Repair copies in flight at once |
-| `SCRUB_INTERVAL` | workers | `10m` | Worker integrity verification pass |
-| `UPLOAD_STALE_AFTER` | controller | `10m` | Inactive upload cleanup threshold |
-| `INVENTORY_SWEEP_INTERVAL` | controller | `5m` | Periodic full inventory reconciliation |
+| `SCRUB_INTERVAL` | workers | `10m` | Time between full scrubber passes (demo: `30s`) |
+| `SCRUB_BYTES_PER_SEC` | workers | `20000000` | Scrubber read throttle; `0` = unthrottled |
+| `UPLOAD_STALE_AFTER` | controller | `10m` | An upload with no progress for this long is aborted |
+| `INVENTORY_SWEEP_INTERVAL` | controller | `5m` | Live inventory sweep: orphans deleted, lost or wrong-size copies repaired |
 
 Fixed per service in `docker-compose.yml`: `WORKER_ID=workerN`,
 `ADVERTISE_ADDR=http://workerN:9000`, `CONTROLLER_URL=http://controller:8080`,
@@ -618,19 +623,53 @@ is steady. (`$IDS` holds the three object IDs.)
 If worker3 returns **before** `REPAIR_GRACE` has passed, nothing is copied
 and nothing is deleted (`TestNoRepairWithinGrace`).
 
-### 5.10 Crash consistency
+### 5.10 Scrubber, inventory sweep, crash recovery (verified at Phase 9 review)
 
-Crash mid-write on a worker is covered by `TestWorkerKilledMidWriteLeavesNoPartialChunk`.
-Controller startup recovery converts unfinished uploads and pending claims into
-durable janitor work. Periodic inventory sweeps reconcile missing files and
-orphans. See [`VIVA_GUIDE.md`](VIVA_GUIDE.md) for the manual controller-crash
-walkthrough.
+Start the stack with short intervals so the background checks are visible
+(the defaults are 10 min / 5 min):
+
+```bash
+export SCRUB_INTERVAL=5s INVENTORY_SWEEP_INTERVAL=5s HEARTBEAT_INTERVAL=1s RECONCILER_INTERVAL=1s
+docker compose up -d
+```
+
+**Scrubber (no client read).** Upload an object, pick a holder of chunk 0
+from `/metadata`, and overwrite 4 bytes of that copy in place (same size, so
+only a checksum can tell):
+
+```bash
+docker exec worker3 sh -c "printf ZZZZ | dd of=/data/chunks/${ID}_000000 bs=1 seek=1000 conv=notrunc 2>/dev/null"
+```
+
+Within one scrub interval the controller logs `corruption_detected` with
+`"detected_by":"scrubber"`, then `repair_started` / `repair_completed`, and
+the replica is `OK` again (rewritten in place). Observed (verified run,
+`SCRUB_INTERVAL=5s`): detected and rewritten within one scrub interval (in
+that run under 1 s, as a pass started right after the damage), with exactly
+one `corruption_detected` and one `repair_completed`: later heartbeats from
+that worker no longer report it.
+
+**Deleted chunk file.** `docker exec worker3 rm /data/chunks/<chunk_id>`: the
+next inventory sweep logs `corruption_detected` with
+`"detected_by":"inventory_sweep"` and repair rewrites the file (verified run:
+file back after 4 s; download identical; audit ok and steady).
+
+**Controller killed mid-upload.** Start a large upload, `docker kill
+controller` while it streams, then `docker start controller`: the controller
+logs `startup_recovery`; within a few `JANITOR_INTERVAL`s the object is gone
+from `/cluster` (`objects_by_status` empty), `pending_deletes` is 0, and no
+chunk files of it remain on any volume (verified run, 300 MB upload killed
+after 4 chunks were stored: clean 8 s after the restart). Automated:
+`TestComposeControllerKilledMidUpload`.
+
+Crash mid-write on a worker: `TestWorkerKilledMidWriteLeavesNoPartialChunk`
+(no partial chunk is ever visible).
 
 ---
 
 ## 6. Automated testing and static analysis
 
-Run from the repository root. The normal checks are verified through Phase 11.
+Run from the repository root. All verified at the Phase 8–10 review.
 
 ### Unit and integration tests
 
@@ -645,6 +684,7 @@ ok  	objstore/internal/config
 ok  	objstore/internal/controller/api
 ok  	objstore/internal/controller/custommeta
 ok  	objstore/internal/controller/download
+ok  	objstore/internal/controller/integrity
 ok  	objstore/internal/controller/janitor
 ok  	objstore/internal/controller/meta
 ok  	objstore/internal/controller/placement
@@ -654,6 +694,7 @@ ok  	objstore/internal/httpx
 ok  	objstore/internal/ids
 ok  	objstore/internal/version
 ok  	objstore/internal/worker/agent
+ok  	objstore/internal/worker/scrub
 ok  	objstore/internal/worker/server
 ok  	objstore/internal/worker/store
 ok  	objstore/test/integration
@@ -661,8 +702,10 @@ ok  	objstore/test/integration
 
 `test/integration` runs in-process clusters (controller with SQLite,
 upload coordinator, janitor, and real workers behind a fault injector that
-can fail, delay, or corrupt PUTs; 50 ms heartbeats, 1 s `DEAD_AFTER`) and
-builds and kills the real worker binary; about 10–45 s. Upload tests cover
+can fail, delay, or corrupt PUTs; 50 ms heartbeats, 1 s `DEAD_AFTER`; the
+live inventory sweep every 25 ms, so every test runs with it; each worker has
+a scrubber the tests trigger explicitly) and builds and kills the real worker
+binary; about 50–60 s. Upload tests cover
 the 5.5 MB checkpoint, edge sizes, window sizes, metadata before/after the
 file, invalid requests, insufficient workers, worker failure/stop/timeout/
 corruption mid-upload, truncated bodies, client disconnect, size limit,
@@ -678,7 +721,13 @@ cover the M7 demo (with logged detection and heal times), no repair within
 grace, in-place repair of a corrupt copy, immediate repair of a wiped worker,
 an unrecoverable chunk rescued by a returning holder, over-replication
 trimming, the concurrency limit, and no mass repair after a controller
-restart. `go test -short ./...` skips the timing-based and
+restart; integrity tests (Phases 8–9) cover scrubber detection without a
+client read and exactly one repair, a false scrubber report (not trusted),
+both copies corrupt (503), a deleted chunk file and an orphan found by the
+sweep, a controller crash mid-upload, I4 during concurrent writes, and
+`TestInvariantsUnderChurn` (uploads, PATCHes, deletes while a worker dies,
+is repaired around, and returns; then steady state and byte-identical
+downloads). `go test -short ./...` skips the timing-based and
 process-spawning tests. Add `-count=1` to bypass the cache, `-v` for detail.
 
 ### End-to-end tests (Docker)
@@ -721,10 +770,28 @@ Builds `objstore:e2e` once, then runs:
   checks 6 chunks stored as 12 files, each chunk on 2 distinct worker volumes;
   then stops 3 workers and checks the next upload gets
   `503 INSUFFICIENT_WORKERS` with nothing stored.
+- `TestComposeIntegrity` (`SCRUB_INTERVAL=2s`, `INVENTORY_SWEEP_INTERVAL=2s`):
+  overwrites 4 bytes of one copy in place; the scrubber finds it with no
+  client read, the controller logs `"detected_by":"scrubber"`, the copy is
+  repaired, and after two more scrub passes there is still exactly one
+  `repair_completed` and one `corruption_detected` (3 s in the verified run).
+  Then removes a chunk file; the sweep logs `"detected_by":"inventory_sweep"`
+  and the file is rewritten.
+- `TestComposeControllerKilledMidUpload`: streams an upload, `docker kill`s
+  the controller after chunks are stored, restarts it: `startup_recovery` is
+  logged, no object is listed, no chunk file is left on any volume, and the
+  audit is ok and steady.
 - `TestWorkerContainer`: the standalone worker container checks from Phase 1.
 
-Expected: all seven `PASS` (about 2–3 minutes including the image build). Set
+Expected: all nine `PASS` (about 3 minutes including the image build). Set
 `E2E_IMAGE=objstore:dev` to reuse an existing image.
+
+### Evaluation scripts (Phase 10)
+
+See [`EVALUATION.md`](EVALUATION.md) for the commands and the measured
+results: `scripts/phase10-bench-compose.sh` (Compose throughput and latency),
+`scripts/phase10-chaos.sh` (worker loss: detection and time to full RF), and
+`scripts/phase10-benchmark.sh` (the in-process benchmark below).
 
 ### Benchmark: sequential vs windowed upload
 

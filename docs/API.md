@@ -408,19 +408,33 @@ Checks the correctness invariants against live metadata (architecture
 | I3 | safety | No two replica rows of one chunk on one worker |
 | I7 | safety | The listing contains exactly the READY objects |
 | I8 | safety | No (chunk, worker) has both a replica row and a pending delete |
-| I4 | safety | ALIVE worker inventories match replica rows and pending-delete intents |
 | I5 | steady_state | Every chunk of every READY object has exactly RF effective replicas |
+| I4 | steady_state | Every chunk file on an ALIVE worker is claimed by a replica row or a pending delete, and every OK copy's file is present with the right size |
 
 `ok` is true when every **safety** invariant holds; these must hold at all
 times, and a false `ok` is a bug (also logged as `audit_violation`).
-`steady_state` reports I5, which the design only promises "in steady state":
-it is expected to be false while a worker is down or until repair (Phase 7)
-has restored the lost copies. `examples` lists up to 10 violations per check.
-I6 is checked by every download. I4 is checked for workers that are currently
-ALIVE; unavailable workers are handled by liveness and inventory resync. The
-checks are independent reads, so a check racing a
-concurrent operation can report a transient I5 change; the safety checks only
-look at READY objects, whose chunk rows never change.
+`steady_state` is true when I5 and I4 hold, which the design only promises
+"in steady state" / "after the janitor has run": it is expected to be false
+while a worker is down, until repair has restored lost copies, or until the
+next inventory sweep has removed an orphan. `examples` lists up to 10
+violations per check. I6 is checked by every download.
+
+I4 (audit v2, DEC-060) is checked on the workers that are ALIVE, with the
+before/after rule of DEC-057: each worker's metadata is read before its
+inventory is fetched, and only findings that still hold afterwards count, so
+uploads, repairs, and deletes in flight are never reported. A worker whose
+inventory cannot be fetched is listed in that check's `unchecked_workers`
+(not a violation, and the audit still answers 200):
+
+```json
+{"id":"I4","description":"every chunk file on an ALIVE worker is claimed …","kind":"steady_state",
+ "violations":0,"examples":[],"unchecked_workers":["worker3"]}
+```
+
+The checks are independent reads, so a check racing a concurrent operation
+can report a transient I5 change; the safety checks only look at READY
+objects, whose chunk rows never change, and I7 compares the listing with the
+objects that were READY both before and after it.
 
 ---
 
@@ -481,7 +495,12 @@ Sent every `heartbeat_interval_ms` after a successful registration.
 worker is unknown (e.g. the controller restarted), marked `DEAD`, or the epoch
 is not its current one (DEC-020). A heartbeat never revives a `DEAD` worker;
 only a new registration does. The controller records its own receive time
-(D11). `suspect_chunks` is accepted and ignored until Phase 8.
+(D11). `suspect_chunks` lists the chunks the worker's scrubber currently
+finds damaged (re-verified just before each heartbeat). The controller never
+trusts the list as such: each entry is queued for a cross-check that reads
+the copy and compares it with the controller's checksum; only a confirmed
+mismatch marks the copy CORRUPT, which the repair loop then rewrites in place
+(Phase 8, DEC-058). Invalid chunk IDs are ignored and logged.
 
 **Errors:** 400 `INVALID_REQUEST`. Body limit 1 MiB.
 

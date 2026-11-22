@@ -20,7 +20,7 @@ explicit owner confirmation; may change) · `SUPERSEDED by DEC-nnn`.
 | DEC-006 | `SYNCING` worker state, registration epochs, worker write gating | ACCEPTED | 0 (built in 2/6) |
 | DEC-007 | `pending_deletes` table for exact physical cleanup | ACCEPTED | 0 (built in 3/5/9) |
 | DEC-008 | Repair target rule and in-place corrupt repair | ACCEPTED | 0 (built in 7/8) |
-| DEC-009 | Periodic inventory pull for the orphan sweep | ACCEPTED | 0 (built in 9) |
+| DEC-009 | Periodic inventory pull for the orphan sweep (mechanics: DEC-057) | ACCEPTED | 0 (built in 9) |
 | DEC-010 | Inventory endpoint is hosted on the worker | ACCEPTED | 0 (built in 1) |
 | DEC-011 | Claims and commit are conditional on object status | ACCEPTED | 0 (built in 3) |
 | DEC-012 | Chunk file format: header carries the checksum | ACCEPTED | 0 (built in 1) |
@@ -68,6 +68,10 @@ explicit owner confirmation; may change) · `SUPERSEDED by DEC-nnn`.
 | DEC-054 | Repair loop: replica classification, one copy per chunk per round, non-overlapping rounds | ACCEPTED | 7 |
 | DEC-055 | Repair claims, superseding, and trimming go through pending deletes | ACCEPTED | 7 |
 | DEC-056 | Repair warm-up and "unknown worker = dead since controller start" pulled forward from Phase 9 | ACCEPTED | 7 |
+| DEC-057 | Live inventory sweep and audit I4 use a metadata snapshot taken *before* the inventory | ACCEPTED | 9 |
+| DEC-058 | Scrubber: throttled passes, suspects re-verified before each report, controller cross-check reads the copy | ACCEPTED | 8 |
+| DEC-059 | Startup recovery and stale-upload expiry reuse the abort path | ACCEPTED | 9 |
+| DEC-060 | Audit v2: I4 is a steady_state check; unreachable workers are "unchecked"; I7 made race-free | ACCEPTED | 9 |
 
 ---
 
@@ -981,3 +985,96 @@ explicit owner confirmation; may change) · `SUPERSEDED by DEC-nnn`.
 - **Consequences.** Phase 9 keeps the rest of recovery (UPLOADING → DELETING,
   stale PENDING rows, orphan sweep). Tested in
   `TestNoMassRepairAfterControllerRestart`.
+
+## DEC-057 — Live inventory sweep: snapshot the metadata before the inventory
+
+- **Context.** DEC-009's periodic sweep runs against workers that are ALIVE
+  and receiving writes. The first Phase 9 implementation reused the
+  registration reconciliation (`ReconcileInventory`, DEC-051), which is only
+  correct while the worker is SYNCING (write gate closed). On a live worker,
+  a copy claimed before the inventory snapshot and acknowledged after it
+  looked "missing", and its OK row was deleted: uploads failed with 500
+  (`ErrIncomplete` at commit) and READY chunks became under-replicated. Every
+  run of the integration suite failed on this.
+- **Choice.** A before/after rule (`meta.SnapshotWorker`, `SweepInventory`):
+  read the worker's replica rows and pending deletes first, then fetch the
+  inventory, then act only on findings that still hold, each re-checked in
+  the same SQL statement that acts on it:
+  - **Missing / wrong size:** a row that was OK, of a READY object, before
+    the inventory was taken had its file written before then. If the file is
+    absent (or has the wrong size) and the row is still the same OK row (same
+    `updated_at`), the copy is marked **CORRUPT**, so repair rewrites it in
+    place without grace (§4.9). The row is not deleted: the worker is alive.
+  - **Orphan:** a file whose (chunk, worker) had no replica row and no
+    pending delete before the inventory, and still has no replica row, gets a
+    pending delete (reason `orphan`). Every write is claimed first (D10), so
+    such a file belongs to no operation; a claim made later is refused by the
+    pending delete (I8) and placed elsewhere.
+  - PENDING rows are never judged.
+- **Consequences.** The sweep is safe at any time and idempotent. It also
+  covers the "chunk file deleted from a volume" scenario (§8 row 9) without a
+  client read. The integration suite runs the sweep every 25 ms in every test;
+  `TestSweepInventoryRaces` and `TestDeletedChunkFileRepairedBySweep` cover it.
+  `ReconcileInventory` remains the registration-time reconciliation.
+
+## DEC-058 — Scrubber and the controller cross-check
+
+- **Context.** The Phase 8 scrubber re-read every chunk at full speed and
+  latched its suspects until the next full pass; the controller marked a
+  suspect CORRUPT on the worker's word alone. After repair rewrote the copy
+  in place, the stale suspect re-marked the fresh copy CORRUPT on every
+  heartbeat until the next pass (observed: 5 repairs of one chunk in 5 s;
+  ~200 per corruption with the 10 min default and 3 s heartbeats). §3.6 asks
+  for a "slow" scrubber and a controller cross-check against its own checksum.
+- **Choice.**
+  - **Worker** (`internal/worker/scrub`): passes are throttled by
+    `SCRUB_BYTES_PER_SEC` (default 20 MB/s; 0 = unthrottled). A chunk that no
+    longer exists when read is not a suspect. `Suspects()` re-verifies each
+    latched suspect before reporting it and drops those that now verify or are
+    gone, so a repaired or deleted copy stops being reported at the next
+    heartbeat.
+  - **Controller** (`internal/controller/integrity`): heartbeat suspects are
+    queued (deduplicated, bounded at 1024), never verified inside the
+    heartbeat. A verifier (2 workers) reads the copy from the worker and
+    compares it with the metadata size and checksum (layer 3). Confirmed: a
+    404, `CHUNK_CORRUPT`, a size or checksum mismatch, or a header checksum
+    that differs from the controller's. Only then is the copy marked CORRUPT,
+    conditionally on the row still being the same OK row of a READY object.
+    Timeouts and 5xx are inconclusive (checked again on the next report).
+- **Consequences.** A false or stale report costs one chunk read and changes
+  nothing (`TestScrubberReportIsCrossChecked`). One corruption is repaired
+  exactly once (`TestScrubberDetectsAndRepairsWithoutClientRead`,
+  `TestComposeIntegrity`).
+
+## DEC-059 — Startup recovery and stale uploads reuse the abort path
+
+- **Choice.** Before the controller serves HTTP, `meta.RecoverUploading`
+  moves every UPLOADING object to DELETING through `MarkDeleting` (all its
+  replica rows, OK or PENDING, become pending deletes) and turns any PENDING
+  claim left by a crash (e.g. a repair) into a pending delete. The janitor
+  aborts UPLOADING objects with no activity for `UPLOAD_STALE_AFTER` (default
+  10 min, measured on `last_activity`, which every claim and ack bumps) the
+  same way. The janitor then deletes the files and purges the objects
+  (DEC-037).
+- **Why.** A crashed upload is indistinguishable from an aborted one, and the
+  abort path is already tested. No upload is resumed across a restart.
+- **Consequences.** Tested in `TestRecoverUploading`, `TestAbortStaleUploads`,
+  `TestControllerCrashMidUploadRecovered`, and against the real stack
+  (`SIGKILL` mid-upload) in `TestComposeControllerKilledMidUpload`.
+
+## DEC-060 — Audit v2
+
+- **Choice.** `/admin/audit` adds I4 for ALIVE workers, using the
+  DEC-057 before/after rule (orphans, missing or wrong-size OK copies), so
+  writes in flight are never reported. I4 is a **steady_state** check (the
+  design states it as holding "after the janitor has run", §3.4); `steady_state`
+  is now I5 and I4. A worker whose inventory cannot be fetched is listed in
+  the check's `unchecked_workers`, not counted as a violation, and does not
+  fail the audit (previously one unreachable worker made the audit return
+  500). I7 compares the listing with the READY objects read before and after
+  it, so objects committed or deleted while the listing is paged are not
+  violations (the v1 count comparison reported false violations under load,
+  found by `TestAuditInventoryDuringWrites`).
+- **Consequences.** A false `ok` is still always a bug; a false
+  `steady_state` during failures, repairs, or before the next sweep is
+  expected.

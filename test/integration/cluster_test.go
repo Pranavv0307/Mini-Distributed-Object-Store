@@ -20,6 +20,7 @@ import (
 	"objstore/internal/httpx"
 	"objstore/internal/wire"
 	"objstore/internal/worker/agent"
+	"objstore/internal/worker/scrub"
 	"objstore/internal/worker/server"
 	"objstore/internal/worker/store"
 )
@@ -157,8 +158,11 @@ type testWorker struct {
 	srv     *server.Server
 	store   *store.Store
 	faults  faults // injected failures (helpers_test.go); zero value = none
-	cancel  context.CancelFunc
-	done    chan struct{}
+	// scrub is the worker's scrubber. Tests run passes explicitly
+	// (scrub.ScrubOnce); its suspects go out with every heartbeat.
+	scrub  *scrub.Scrubber
+	cancel context.CancelFunc
+	done   chan struct{}
 }
 
 func newTestWorker(t testing.TB, id, ctrlURL string) *testWorker {
@@ -176,8 +180,9 @@ func (w *testWorker) start() {
 	w.store = st
 	w.srv = server.New(st, server.Config{WorkerID: w.id, MaxChunkSize: config.DefaultChunkSize, MaxConcurrentReads: 4})
 	w.ts = httptest.NewServer(w.faults.wrap(w.srv.Handler()))
+	w.scrub = scrub.New(st, scrub.Options{})
 	ag := agent.New(agent.Config{
-		WorkerID: w.id, AdvertiseAddr: w.ts.URL, ControllerURL: w.ctrlURL,
+		WorkerID: w.id, AdvertiseAddr: w.ts.URL, ControllerURL: w.ctrlURL, Suspects: w.scrub.Suspects,
 		BackoffMin: 5 * time.Millisecond, BackoffMax: 50 * time.Millisecond,
 		RegisterTimeout: 2 * time.Second, HeartbeatTimeout: time.Second,
 	}, st, w.srv)
