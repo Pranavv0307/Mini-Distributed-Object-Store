@@ -1,8 +1,9 @@
 # Viva Guide
 
-This is the shortest route from a fresh checkout to a convincing
-demonstration. Use a prefixed Compose setup if the host already has containers
-named `controller` or `worker1`–`worker4`:
+Every feature and failure scenario mapped to the test that proves it and a
+command that shows it. For a narrated presentation to someone new, use
+[`DEMO_GUIDE.md`](DEMO_GUIDE.md). Use a prefixed Compose setup if the host
+already has containers named `controller` or `worker1`–`worker4`:
 
 ```bash
 export OBJSTORE_CONTAINER_PREFIX=objstore-
@@ -11,11 +12,11 @@ docker compose down -v 2>/dev/null || true
 ./scripts/demo.sh
 ```
 
-The demo builds the image, starts the cluster, uploads a 5.5 MB object, shows
-metadata and replicas, patches metadata, lists, downloads and compares bytes,
-stops a worker and downloads through a surviving replica, restarts the worker,
-audits invariants, and deletes the object. It does not delete volumes unless
-you explicitly run `docker compose down -v`.
+The demo runs the specification's six required demonstrations against the
+real stack in about two minutes: storage and byte comparison, chunking,
+replication (files on two volumes), metadata PATCH, worker failure with
+re-replication and return, and corruption (read path, scrubber, both copies).
+It does not delete volumes; `docker compose down -v` does.
 
 ## Feature-to-demonstration map
 

@@ -18,10 +18,10 @@ owner review. The owner makes the git commit for each phase.
 | 5 | M5 | Complete client API, delete path, error mapping | 4 | COMPLETED |
 | 6 | M6 | Degraded operation, full inventory reconciliation, audit v1 | 5 | COMPLETED |
 | 7 | M7 | Self-healing re-replication (reconciler) | 6 | COMPLETED |
-| 8 | M8 | Data integrity: scrubber, cross-check, corrupt repair | 7 | COMPLETED (review fixes applied, awaiting review) |
-| 9 | M9 | Crash consistency, janitor, recovery, audit v2 | 8 | COMPLETED (review fixes applied, awaiting review) |
-| 10 | M10 | Evaluation: benchmarks, chaos, invariant tests | 9 | COMPLETED (awaiting review) |
-| 11 | M11 | Packaging: README demo, one-command demo | 10 | IN PROGRESS (drafted) |
+| 8 | M8 | Data integrity: scrubber, cross-check, corrupt repair | 7 | COMPLETED |
+| 9 | M9 | Crash consistency, janitor, recovery, audit v2 | 8 | COMPLETED |
+| 10 | M10 | Evaluation: benchmarks, chaos, invariant tests | 9 | COMPLETED |
+| 11 | M11 | Packaging: README demo, one-command demo | 10 | COMPLETED (awaiting review) |
 | S1–S5 | Stretch | Rendezvous hashing, prefetch, Range, metrics, zones | 9 | Optional |
 
 ## Testing levels used throughout
@@ -57,8 +57,8 @@ owner review. The owner makes the git commit for each phase.
   `go test -race ./...` passes in the `golang:1.27.3` container. Every
   §9 open decision has a DEC entry.
 - **Testing.** Toolchain smoke test (`internal/version`).
-- **Status.** COMPLETED. Two decisions remain PROVISIONAL pending owner
-  confirmation: DEC-005 (chunk size), DEC-013 (string-only metadata).
+- **Status.** COMPLETED. The two decisions left for the owner were later
+  confirmed: DEC-005 (chunk size 1 MB) and DEC-013 (string-only metadata).
 
 ## Phase 1 — Worker as a container (M1)
 
@@ -295,7 +295,7 @@ owner review. The owner makes the git commit for each phase.
   replica marked `CORRUPT` then repaired, file valid again; deleted chunk file
   → detected and repaired; both corrupt → refused, logged; scrubber detects
   without any client read.
-- **Status.** COMPLETED (review fixes applied, awaiting review). As built:
+- **Status.** COMPLETED (review fixes committed in `c87e212`). As built:
   `internal/worker/scrub` (throttled passes, suspects re-verified before
   each heartbeat) and `internal/controller/integrity` (asynchronous
   cross-check that reads the copy and compares it with the controller's
@@ -319,7 +319,7 @@ owner review. The owner makes the git commit for each phase.
   visible object and no leftover files after janitor; kill worker mid-write →
   no half-chunk; client Ctrl-C → cleaned up; delete during worker downtime →
   stale chunks removed on return; audit v2 passes.
-- **Status.** COMPLETED (review fixes applied, awaiting review). As built:
+- **Status.** COMPLETED (review fixes committed in `c87e212`). As built:
   startup recovery and stale-upload expiry through the abort path (DEC-059);
   the live inventory sweep with the before/after rule (DEC-057); audit v2 with
   I4 as a steady_state check and a race-free I7 (DEC-060). The first version of
@@ -339,7 +339,7 @@ owner review. The owner makes the git commit for each phase.
   repair times; scrubber detection time) with medians and p99; chaos script
   with audit; invariant tests for every §7 scenario.
 - **Acceptance criteria.** Results table in docs, reproducible from scripts.
-- **Status.** COMPLETED (awaiting review). Scripts: `scripts/phase10-bench-compose.sh`
+- **Status.** COMPLETED. Scripts: `scripts/phase10-bench-compose.sh`
   (sizes × clients, uploads and downloads, degraded downloads; median, p99,
   MB/s), `scripts/phase10-benchmark.sh` (in-process upload window),
   `scripts/phase10-chaos.sh` (worker loss: detection and time to full RF).
@@ -355,6 +355,13 @@ owner review. The owner makes the git commit for each phase.
   trade-offs.
 - **Acceptance criteria.** From a fresh clone plus `docker compose down -v`,
   the README alone gets through the full demo.
-- **Status.** IN PROGRESS. Drafted: `scripts/demo.sh` (verified end to end on
-  a prefixed stack) and `docs/VIVA_GUIDE.md`. Still to do in this phase: a
-  final README pass, an architecture diagram, and a full fresh-clone run.
+- **Status.** COMPLETED (awaiting review). As built: `scripts/demo.sh` runs
+  all six required demonstrations of the specification (§10) against the
+  real stack, with shortened timings and an optional pause per step;
+  `objctl chunks` (chunk map as a table) and `objctl audit`; a rewritten
+  README (two-minute start, how it works, Mermaid diagram, manual use,
+  limitations); architecture diagrams and a trade-off table in
+  `ARCHITECTURE.md`; `docs/DEMO_GUIDE.md` (presenter's script for a
+  first-time audience); DEC-013 confirmed. Acceptance: a fresh clone run
+  with only the README's commands completes the demo (see the development
+  log).

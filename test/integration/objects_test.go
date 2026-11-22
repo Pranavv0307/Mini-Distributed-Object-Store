@@ -482,6 +482,20 @@ func TestObjctl(t *testing.T) {
 	if out, err := run("stat", info.ObjectID); err != nil || !strings.Contains(out, `"chunks"`) {
 		t.Fatalf("stat: %v\n%s", err, out)
 	}
+	out, err = run("chunks", info.ObjectID)
+	if err != nil || !strings.Contains(out, "CHUNK") || strings.Count(out, "(OK)") != 2*5 {
+		t.Fatalf("chunks: want 5 chunks with 2 OK copies each: %v\n%s", err, out)
+	}
+	for _, ch := range c.chunkMap(info.ObjectID) {
+		for _, r := range ch.Replicas {
+			if !strings.Contains(out, r.WorkerID+" (OK)") {
+				t.Fatalf("chunks output lacks %s:\n%s", r.WorkerID, out)
+			}
+		}
+	}
+	if out, err := run("audit"); err != nil || !strings.Contains(out, `"ok": true`) {
+		t.Fatalf("audit: %v\n%s", err, out)
+	}
 	if out, err := run("list", "-all", "-limit", "1"); err != nil || !strings.Contains(out, info.ObjectID) {
 		t.Fatalf("list: %v\n%s", err, out)
 	}

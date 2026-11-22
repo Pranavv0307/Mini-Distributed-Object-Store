@@ -6,8 +6,7 @@ Practical, step-by-step instructions to set up, run, and verify the project.
 > observed at the phase noted. Sections for later phases are marked
 > *not yet available* until those phases are implemented.
 
-**Current state (end of Phase 10, review fixes applied; Phase 11 in
-progress):** the cluster runs under Docker Compose:
+**Current state (Phase 11 complete):** the cluster runs under Docker Compose:
 one controller and four workers. **Every client API endpoint of the
 specification works:** upload (1 MB chunks, two copies on distinct workers,
 atomic commit), verified download with replica fallback, metadata GET and
@@ -18,9 +17,9 @@ PATCH, list with pagination, and delete; `objctl` natively and as a Compose
 `REPAIR_GRACE`. Corruption is also found without any client read, by the
 worker scrubber (confirmed by the controller) and the periodic inventory
 sweep; a controller crash mid-upload leaves nothing behind (Phases 8–9).
-Evaluation scripts and results: `EVALUATION.md` (Phase 10). The draft
-one-command demo and viva matrix (Phase 11) are `../scripts/demo.sh` and
-`VIVA_GUIDE.md`.
+Evaluation scripts and results: `EVALUATION.md` (Phase 10). The one-command
+demonstration of every required behaviour is `../scripts/demo.sh` (§3.1),
+with a presenter's script in `DEMO_GUIDE.md` (Phase 11).
 
 > ⚠️ **Docker name collisions.** Container names are global on a Docker host.
 > The Compose file uses the spec's names `controller` and `worker1`…`worker4`.
@@ -88,6 +87,36 @@ docker build -t objstore:dev . # the image Compose uses (DEC-023)
 ---
 
 ## 3. Running the cluster (Docker Compose)
+
+### 3.1 One-command demonstration (verified at Phase 11)
+
+```bash
+./scripts/demo.sh                 # or DEMO_PAUSE=1 ./scripts/demo.sh to pause before each step
+```
+
+Builds the image, (re)starts the stack with shortened timings
+(`HEARTBEAT_INTERVAL=1s`, `DEAD_AFTER=5s`, `REPAIR_GRACE=15s`,
+`RECONCILER_INTERVAL=2s`, `JANITOR_INTERVAL=2s`, `SCRUB_INTERVAL=15s`,
+`INVENTORY_SWEEP_INTERVAL=15s`; each can be overridden from the
+environment), and runs the specification's six required demonstrations:
+object storage (upload, download, compare), chunking and distribution
+(`objctl chunks` in the client container, files per worker), replication (the
+same chunk as a file on two volumes; 12 files for 6 chunks), metadata (read,
+PATCH, version 1 → 2, chunks untouched), worker failure (`docker stop
+worker2` → DEAD → downloads still identical → re-replicated while it is down
+→ `docker start worker2` → redundant copies deleted, exactly 2 copies), and
+data integrity (corruption caught on read and repaired; same-size corruption
+found by the scrubber with no read, shown by `worker inspect` before and
+after; both copies corrupt → 503). It finishes with the audit and a delete
+whose files are removed by the janitor.
+
+Expected: every step ends with a green ✔ and the last line is
+`Demo complete: every required demonstration passed.` (verified: about 70 s
+with a built image, three consecutive runs). On failure it prints a red ✘
+with what it was waiting for and stops, leaving the cluster running. It
+deletes only the objects it uploaded (also on failure), never volumes, and
+leaves the stack running with the shortened timings: restart with
+`docker compose up -d` in a shell without them to return to the defaults.
 
 ### Configuration
 
@@ -382,17 +411,31 @@ files; `--no-deps` avoids restarting the cluster):
 mkdir -p work && cp big.bin work/
 docker compose --profile tools run --rm --no-deps -v "$(pwd -W)/work:/work" client upload /work/big.bin -meta owner=alice
 docker compose --profile tools run --rm --no-deps client stat <object_id>
+docker compose --profile tools run --rm --no-deps client chunks <object_id>
 docker compose --profile tools run --rm --no-deps client patch <object_id> owner=bob tmp=
 docker compose --profile tools run --rm --no-deps client list -all
 docker compose --profile tools run --rm --no-deps -v "$(pwd -W)/work:/work" client download <object_id> -o /work/got.bin
 docker compose --profile tools run --rm --no-deps client delete <object_id>
 docker compose --profile tools run --rm --no-deps client cluster
+docker compose --profile tools run --rm --no-deps client audit
 ```
 
 (`$(pwd -W)` is Git Bash; use `$(pwd)` on Linux/macOS.) `download` prints
 `objctl: wrote N bytes to /work/got.bin (sha256 … verified)`; it checks the
 length and the whole-object SHA-256 and writes no file if either is wrong.
-`patch k=` removes `k`; `patch -if-match v3 …` sets `If-Match`.
+`patch k=` removes `k`; `patch -if-match v3 …` sets `If-Match`. `chunks`
+(Phase 11) prints the chunk map as a table, one row per chunk with its size,
+checksum prefix, and every copy's worker and state:
+
+```
+object 7249…  "photo.bin"  5500000 bytes  6 chunks
+CHUNK  SIZE     SHA-256        COPIES
+0      1000000  34d243309d6e…  worker1 (OK), worker4 (OK)
+…
+5      500000   01e576295021…  worker1 (OK), worker3 (OK)
+```
+
+`audit` prints `/admin/audit`.
 
 Natively: `go build -o bin/ ./cmd/...` then
 `OBJSTORE_URL=http://localhost:8080 ./bin/objctl list` (or `-server URL`).

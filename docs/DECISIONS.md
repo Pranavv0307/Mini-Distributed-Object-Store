@@ -24,7 +24,7 @@ explicit owner confirmation; may change) · `SUPERSEDED by DEC-nnn`.
 | DEC-010 | Inventory endpoint is hosted on the worker | ACCEPTED | 0 (built in 1) |
 | DEC-011 | Claims and commit are conditional on object status | ACCEPTED | 0 (built in 3) |
 | DEC-012 | Chunk file format: header carries the checksum | ACCEPTED | 0 (built in 1) |
-| DEC-013 | Custom metadata: string values, size limits | PROVISIONAL | 0 (built in 3/5) |
+| DEC-013 | Custom metadata: string values, size limits | ACCEPTED (owner-confirmed) | 0 (built in 3/5) |
 | DEC-014 | PATCH: `null` removes a key; optional `If-Match` → 409 | ACCEPTED | 0 (built in 5) |
 | DEC-015 | Error body format, error codes, malformed IDs → 400 | ACCEPTED | 0 |
 | DEC-016 | Max object size 5 GiB, over-limit → 400 | ACCEPTED | 0 (built in 3) |
@@ -312,16 +312,16 @@ explicit owner confirmation; may change) · `SUPERSEDED by DEC-nnn`.
   size and checksum, and the file is renamed into place only after the
   received bytes matched both, so a committed header is always truthful.
 
-## DEC-013 — Custom metadata: string values, size limits — PROVISIONAL
+## DEC-013 — Custom metadata: string values, size limits — ACCEPTED
 
 - **Choice.** Custom metadata is a flat JSON object of string → string. Limits
   (from §5.7): at most 50 keys, key ≤ 128 bytes, value ≤ 1 KiB, keys non-empty.
   Non-string values (numbers, booleans, nested objects) are rejected with 400.
   In a PATCH body, `null` is the deletion marker (DEC-014), not a stored value.
 - **Why.** Mirrors S3 user metadata; easy to bound; no type ambiguity.
-- **Consequences.** Clients wanting numbers must stringify them. Awaiting
-  owner confirmation; relaxing to "any JSON scalar" later is backwards
-  compatible.
+- **Consequences.** Clients wanting numbers must stringify them. Confirmed by
+  the owner on 2026-11-22 (string values are sufficient). Relaxing to "any
+  JSON scalar" later would be backwards compatible.
 
 ## DEC-014 — PATCH: `null` removes a key; optional `If-Match` → 409
 

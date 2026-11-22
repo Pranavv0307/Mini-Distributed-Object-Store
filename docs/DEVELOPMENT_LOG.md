@@ -1001,3 +1001,75 @@ See the verification summary below and [`EVALUATION.md`](EVALUATION.md).
 Phase 11 (packaging): a final README pass, an architecture diagram, and a
 fresh-clone run of the README demo. Open owner question: string-only custom
 metadata values (DEC-013, provisional).
+
+## Phase 11 — Packaging and demonstration (2026-11-22)
+
+### What was implemented
+
+- **`scripts/demo.sh` rewritten** around the specification's six required
+  demonstrations (§10), against the real Compose stack: object storage
+  (upload, download, byte comparison); chunking and distribution
+  (`objctl chunks` from the client container, files per worker);
+  replication (the same chunk as a file on two volumes, 12 files for 6
+  chunks); metadata (read, PATCH, version 1 → 2, placement unchanged);
+  worker failure (`docker stop worker2` → DEAD → served → re-replicated while
+  it is down → `docker start worker2` → redundant copies deleted); data
+  integrity (corruption caught on read and repaired; same-size corruption
+  found by the scrubber without a read, shown with `worker inspect` before
+  and after; both copies corrupt → 503). Each step prints the commands it
+  runs and asserts its result (green ✔ / red ✘ and stop). Shortened timings
+  are set for the demo and can be overridden; `DEMO_PAUSE=1` pauses before
+  each step. It deletes only the objects it uploaded (also on failure).
+- **`objctl chunks ID`** (chunk map as a table: size, checksum prefix, each
+  copy's worker and state) and **`objctl audit`**; covered by `TestObjctl`.
+- **README rewritten** for a first-time reader: two-minute start, the six
+  demonstrations, how it works (Mermaid diagram), manual use (curl, objctl,
+  failure by hand), configuration, testing, trade-offs, layout, document map.
+- **`ARCHITECTURE.md`**: component and upload sequence diagrams (Mermaid,
+  render-checked with Mermaid 10.9.1), status updated, §14 turned into a
+  trade-off table with alternatives.
+- **`docs/DEMO_GUIDE.md`**: presenter's script (preparation, pitch, what to
+  say and point at for each demo step, by-hand failures at default timings,
+  evidence, common questions with answers, reset).
+- `RUN_AND_TEST.md` §3.1 (the demo), objctl section; `VIVA_GUIDE.md` intro.
+- **DEC-013 confirmed by the owner** (string-only custom metadata);
+  provisional markers removed from code and docs.
+- `scripts/phase10-bench-compose.sh` marked executable in git (was 100644).
+
+### Problems found while building the demo
+
+- Git Bash rewrites an absolute path inside curl's `-F file=@/tmp/x;filename=y`
+  argument; the demo now runs curl from its work directory with relative
+  names.
+- `worker inspect` exits non-zero for a damaged file, which `pipefail` turned
+  into a script failure; handled explicitly.
+- A read could detect and repair the corruption before the script recorded
+  its "before" repair count; the baseline is now taken before the damage and
+  detection is read from the controller log.
+
+### Tests performed and results (2026-11-22)
+
+- `go build`, `gofmt -l`, `go vet` (also `-tags e2e`), `staticcheck` (also
+  `-tags e2e`), `bash -n scripts/*.sh`, `git diff --check`: pass.
+- `go test -count=1 ./...`: pass, 3 of 3 runs. Race detector (Docker): pass,
+  no data race.
+- `scripts/demo.sh`: passed on three consecutive runs from a clean stack
+  (≈ 65–70 s each).
+- **Fresh-clone acceptance:** a `git clone` of the repository with the Phase
+  11 changes applied, a removed `objstore:dev` image, and only the README's
+  commands (`./scripts/demo.sh` with the documented prefix and port, since
+  this host has other containers named `controller`/`worker*`): demo passed
+  in 76 s including the image build. Then, at default timings, the README's
+  "Using it by hand" commands and the demo guide's part 3: all as documented
+  (identical download; PATCH; list; audit ok/steady; objctl list, chunks,
+  patch, cluster, audit; `docker stop worker2` → DEAD after 10 s, download
+  identical, full RF restored 40 s after the stop, return → steady; 3 workers
+  stopped → `503 INSUFFICIENT_WORKERS`; controller restart → object intact;
+  delete → 204 then 404).
+- Docker e2e (`go test -tags e2e`): 9 of 9 pass (≈ 2 min), no containers left.
+
+### Project complete
+
+All phases (0–11) are implemented. Remaining ideas are the design's stretch
+goals (S1–S5: rendezvous hashing, read prefetch, Range requests, metrics,
+zones), none of which the specification requires.

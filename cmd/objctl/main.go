@@ -5,10 +5,12 @@
 //	objctl [-server URL] upload FILE [-name NAME] [-type CONTENT_TYPE] [-meta k=v]...
 //	objctl [-server URL] download ID [-o FILE]
 //	objctl [-server URL] stat ID
+//	objctl [-server URL] chunks ID      (table: each chunk and where its copies are)
 //	objctl [-server URL] patch ID [-if-match vN] k=v | k= ...   (k= removes k)
 //	objctl [-server URL] list [-limit N] [-all]
 //	objctl [-server URL] delete ID
 //	objctl [-server URL] cluster
+//	objctl [-server URL] audit
 //	objctl version
 //
 // JSON responses are printed indented. Downloads are verified locally: the
@@ -34,6 +36,7 @@ import (
 	"path/filepath"
 	"strconv"
 	"strings"
+	"text/tabwriter"
 
 	"objstore/internal/version"
 	"objstore/internal/wire"
@@ -50,7 +53,7 @@ func main() {
 	case err == nil:
 	case errors.As(err, &ue):
 		fmt.Fprintln(os.Stderr, "objctl:", err)
-		fmt.Fprintln(os.Stderr, "usage: objctl [-server URL] upload|download|stat|patch|list|delete|cluster|version ...")
+		fmt.Fprintln(os.Stderr, "usage: objctl [-server URL] upload|download|stat|chunks|patch|list|delete|cluster|audit|version ...")
 		os.Exit(2)
 	default:
 		fmt.Fprintln(os.Stderr, "objctl:", err)
@@ -77,6 +80,8 @@ func run(args []string, out io.Writer) error {
 		return c.download(cargs)
 	case "stat":
 		return c.stat(cargs)
+	case "chunks":
+		return c.chunks(cargs)
 	case "patch":
 		return c.patch(cargs)
 	case "list":
@@ -85,6 +90,8 @@ func run(args []string, out io.Writer) error {
 		return c.del(cargs)
 	case "cluster":
 		return c.getJSON("/cluster")
+	case "audit":
+		return c.getJSON("/admin/audit")
 	case "version":
 		fmt.Fprintln(out, version.String("objctl"))
 		return nil
@@ -161,6 +168,40 @@ func (c *client) stat(args []string) error {
 		return err
 	}
 	return c.getJSON("/api/v1/objects/" + url.PathEscape(id) + "/metadata")
+}
+
+// chunks prints an object's chunk map as a table: one row per chunk with its
+// size, the start of its checksum, and every copy with its worker and state.
+func (c *client) chunks(args []string) error {
+	id, err := oneID(args, "chunks")
+	if err != nil {
+		return err
+	}
+	req, _ := http.NewRequest(http.MethodGet, c.base+"/api/v1/objects/"+url.PathEscape(id)+"/metadata", nil)
+	resp, err := c.do(req, http.StatusOK)
+	if err != nil {
+		return err
+	}
+	defer resp.Body.Close()
+	var md wire.ObjectMetadata
+	if err := json.NewDecoder(resp.Body).Decode(&md); err != nil {
+		return fmt.Errorf("decode response: %w", err)
+	}
+	fmt.Fprintf(c.out, "object %s  %q  %d bytes  %d chunks\n", md.ObjectID, md.Name, md.Size, md.NumChunks)
+	tw := tabwriter.NewWriter(c.out, 0, 0, 2, ' ', 0)
+	fmt.Fprintln(tw, "CHUNK\tSIZE\tSHA-256\tCOPIES")
+	for _, ch := range md.Chunks {
+		copies := make([]string, len(ch.Replicas))
+		for i, r := range ch.Replicas {
+			copies[i] = r.WorkerID + " (" + r.State + ")"
+		}
+		sum := ch.ChecksumSHA256
+		if len(sum) > 12 {
+			sum = sum[:12] + "…"
+		}
+		fmt.Fprintf(tw, "%d\t%d\t%s\t%s\n", ch.Index, ch.Size, sum, strings.Join(copies, ", "))
+	}
+	return tw.Flush()
 }
 
 // multiFlag collects repeated -meta k=v flags.

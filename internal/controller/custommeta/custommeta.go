@@ -1,6 +1,6 @@
-// Package custommeta validates user-defined object metadata (DEC-013,
-// PROVISIONAL): a flat JSON object of string keys to string values, bounded in
-// size to protect the metadata database (architecture §5.7).
+// Package custommeta validates user-defined object metadata (DEC-013): a
+// flat JSON object of string keys to string values, bounded in size to
+// protect the metadata database (architecture §5.7).
 package custommeta
 
 import (

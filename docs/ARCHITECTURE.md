@@ -1,7 +1,7 @@
 # Architecture
 
-This document describes the system **as implemented** and the target design
-for parts not yet built. Every section carries an implementation status. The
+This document describes the system **as implemented**. Every section
+carries the phase that built it. The
 original design, with full rationale for decisions D1–D22, is in
 [`reference/Object_Store_Architecture.md`](reference/Object_Store_Architecture.md)
 (called "the design doc" below). Where this implementation differs from or
@@ -9,16 +9,16 @@ clarifies the design doc, the difference is listed in
 [§15 Deviations](#15-deviations-and-clarifications-vs-the-design-doc) with a link
 to [`DECISIONS.md`](DECISIONS.md).
 
-> **Current status (end of Phase 10, review fixes applied):** implemented:
-> the worker's chunk store and chunk API (§3.1); cluster membership with the
-> `SYNCING` protocol (§7); the metadata database, the upload path, and the
-> janitor (§8); the verified download path (§9); metadata, list, delete, and
-> `objctl` (§10); inventory reconciliation, `/cluster` storage totals, and
-> audit v1 (§11); **self-healing re-replication** (§12); the worker
-> scrubber with the controller cross-check, the live inventory sweep, crash
-> recovery, stale-upload expiry, and audit v2 (§12a); evaluation scripts
-> (Phase 10). Phase 11 (packaging) is drafted (`scripts/demo.sh`,
-> `docs/VIVA_GUIDE.md`) but not yet reviewed as a phase.
+> **Status: complete (Phase 11).** Implemented: the worker's chunk store
+> and chunk API (§3.1); cluster membership with the `SYNCING` protocol (§7);
+> the metadata database, the upload path, and the janitor (§8); the verified
+> download path (§9); metadata, list, delete, and `objctl` (§10); inventory
+> reconciliation, `/cluster` storage totals, and audit v1 (§11);
+> **self-healing re-replication** (§12); the worker scrubber with the
+> controller cross-check, the live inventory sweep, crash recovery,
+> stale-upload expiry, and audit v2 (§12a); evaluation (Phase 10,
+> [`EVALUATION.md`](EVALUATION.md)); the one-command demo
+> (`scripts/demo.sh`, Phase 11).
 
 ---
 
@@ -31,12 +31,61 @@ distinct workers** (replication factor RF = 2), records all metadata in an
 embedded SQLite database, detects dead workers through heartbeats, and repairs
 lost or corrupt replicas in the background.
 
+```mermaid
+flowchart LR
+    C["Clients<br/>curl · objctl"] -- "REST :8080" --> CTRL
+    subgraph CTRL["Controller (one process)"]
+        direction TB
+        API["HTTP API<br/>client endpoints · membership<br/>/cluster · /admin/audit"]
+        CO["Upload / download coordinators"]
+        BG["Background loops<br/>failure detector · repair<br/>janitor + inventory sweep<br/>integrity verifier"]
+        META[("SQLite metadata<br/>objects · chunks · replicas<br/>pending_deletes")]
+        API --- CO --- BG --- META
+    end
+    CTRL -- "chunk PUT / GET / DELETE<br/>inventory" --> W1 & W2 & W3 & W4
+    W1 & W2 & W3 & W4 -. "register · heartbeat<br/>(+ scrubber suspects)" .-> CTRL
+    W1["worker1<br/>chunk store · scrubber<br/>own volume"]
+    W2["worker2<br/>own volume"]
+    W3["worker3<br/>own volume"]
+    W4["worker4<br/>own volume"]
+```
+
+Text version:
+
 ```
  client ──REST──▶ controller ──chunk PUT/GET/DELETE──▶ worker1..worker4
                     │  ▲                                   │
                     │  └────── register / heartbeat ───────┘
                     └── SQLite metadata (persistent volume)
  Workers never talk to each other. Only the controller decides.
+```
+
+**Upload of one chunk** (§8; the controller keeps a window of 4 chunks in
+flight):
+
+```mermaid
+sequenceDiagram
+    participant Client
+    participant Controller
+    participant DB as Metadata DB
+    participant A as Worker A
+    participant B as Worker B
+    Client->>Controller: POST /api/v1/objects (multipart stream)
+    Controller->>DB: object UPLOADING
+    loop each 1 MB chunk
+        Controller->>Controller: read chunk, SHA-256, pick 2 live workers
+        Controller->>DB: claim chunk + 2 PENDING replicas
+        par
+            Controller->>A: PUT /internal/chunks/{id} (+ checksum)
+            A-->>Controller: 201 (verified, fsync, rename)
+        and
+            Controller->>B: PUT /internal/chunks/{id}
+            B-->>Controller: 201
+        end
+        Controller->>DB: replicas OK
+    end
+    Controller->>DB: commit: READY (one transaction, re-checks every chunk)
+    Controller-->>Client: 201 object info
 ```
 
 Guiding principles (design doc §1.5): one brain, many hands; metadata is the
@@ -585,10 +634,19 @@ both copies corrupt (`TestScrubberBothCopiesCorrupt`,
 
 ## 14. Trade-offs and limitations
 
-Inherited from the design doc §8: single controller (SPOF); controller in the
-data path (throughput ceiling); synchronous 2-way replication (write latency;
-needs ≥ 2 workers); RF = 2 (one failure at a time); immutable objects; repair
-grace period (longer vulnerability window); single-file metadata DB.
+| Choice | Benefit | Cost / limitation | Alternative (not built) |
+| --- | --- | --- | --- |
+| One controller with all metadata | Simple, consistent decisions; one place to reason about | Single point of failure (state survives restarts; workers re-register automatically); no availability while it is down | Replicated controllers (Raft) |
+| Controller in the data path | Clients know one address; every byte verified centrally | Throughput capped by one process (≈ 90 MB/s upload, ≈ 165 MB/s download per client on the evaluation host) | Clients talk to workers with signed URLs |
+| Synchronous writes to both copies | An acknowledged upload is already on 2 disks | Upload latency of the slower worker; needs ≥ 2 live workers | Asynchronous replication |
+| RF = 2 | Half the storage of 3 copies | Survives one failure at a time; two failures on the same chunk before repair lose it (reported, never returned wrong) | RF 3 or erasure coding |
+| Repair grace period (30 s) | A quick restart moves no data | Longer window with one copy | Repair immediately |
+| Random placement | Even spread, no hot spots, trivial | No rack/zone awareness; rebalancing only through repair | Rendezvous hashing, zones (stretch goals S1, S5) |
+| Immutable objects | No partial-update consistency problems | Changing data means re-uploading (metadata is editable) | Versioned objects |
+| SQLite in one file | Durable, transactional, zero setup | Bound to one machine | Distributed metadata store |
+| No authentication | Simple demo | API bound to 127.0.0.1 only | Tokens, TLS |
+
+The full discussion is the design doc §8.
 
 ## 15. Deviations and clarifications vs. the design doc
 

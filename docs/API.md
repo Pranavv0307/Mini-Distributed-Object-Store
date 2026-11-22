@@ -73,7 +73,7 @@
 | Part | Required | Content |
 | --- | --- | --- |
 | `file` | yes, exactly once | Object bytes. Its `filename` becomes the object `name` (≤ 1024 bytes; may be empty; names are not unique). Its `Content-Type` becomes `content_type` (default `application/octet-stream`, must be a valid media type ≤ 256 bytes, DEC-017). |
-| `metadata` | no, at most once | JSON object of string → string custom metadata (DEC-013, provisional): ≤ 50 keys, non-empty keys ≤ 128 bytes, values ≤ 1 KiB, document ≤ 64 KiB. An empty part means no metadata. May appear **before or after** `file`. |
+| `metadata` | no, at most once | JSON object of string → string custom metadata (DEC-013): ≤ 50 keys, non-empty keys ≤ 128 bytes, values ≤ 1 KiB, document ≤ 64 KiB. An empty part means no metadata. May appear **before or after** `file`. |
 | anything else | — | Ignored. |
 
 Example (verified):
