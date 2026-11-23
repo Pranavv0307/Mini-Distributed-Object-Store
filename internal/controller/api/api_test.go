@@ -5,12 +5,16 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"io"
 	"net/http"
 	"net/http/httptest"
+	"path/filepath"
+	"strings"
 	"sync"
 	"testing"
 	"time"
 
+	"objstore/internal/controller/meta"
 	"objstore/internal/controller/registry"
 	"objstore/internal/wire"
 )
@@ -150,6 +154,45 @@ func TestRegisterHeartbeatCluster(t *testing.T) {
 	w = decode[wire.ClusterView](t, mustGet(t, f.ts.URL+"/cluster")).Workers[0]
 	if w.State != "DEAD" || w.DeadSince == nil || !w.RepairEligible {
 		t.Fatalf("dead worker view = %+v", w)
+	}
+}
+
+func TestDashboardPageAndData(t *testing.T) {
+	clk := &clock{t: time.Date(2026, 11, 23, 12, 0, 0, 0, time.UTC)}
+	reg := registry.New(registry.Options{DeadAfter: time.Minute, Now: clk.Now})
+	m, err := meta.Open(filepath.Join(t.TempDir(), "meta.db"), meta.Options{Now: clk.Now})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer m.Close()
+	a := New(reg, NoopReconciler{}, Config{Meta: m, ReplicationFactor: 2,
+		HeartbeatInterval: time.Second, DeadAfter: time.Minute, RepairGrace: time.Minute})
+	ts := httptest.NewServer(a.Handler())
+	defer ts.Close()
+
+	page, err := http.Get(ts.URL + "/dashboard/")
+	if err != nil {
+		t.Fatal(err)
+	}
+	body, _ := io.ReadAll(page.Body)
+	page.Body.Close()
+	if page.StatusCode != http.StatusOK || !strings.Contains(string(body), "Controller &amp; worker dashboard") {
+		t.Fatalf("dashboard page status/body = %d/%q", page.StatusCode, string(body[:min(len(body), 80)]))
+	}
+	data, err := http.Get(ts.URL + "/admin/dashboard")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer data.Body.Close()
+	if data.StatusCode != http.StatusOK {
+		t.Fatalf("dashboard data status = %d", data.StatusCode)
+	}
+	var snapshot dashboardSnapshot
+	if err := json.NewDecoder(data.Body).Decode(&snapshot); err != nil {
+		t.Fatal(err)
+	}
+	if snapshot.Audit.CheckedAt == "" || snapshot.Objects == nil || snapshot.Workers == nil {
+		t.Fatalf("dashboard snapshot = %+v", snapshot)
 	}
 }
 

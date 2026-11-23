@@ -123,6 +123,11 @@ func (s *Server) Handler() http.Handler {
 	mux.HandleFunc("GET /healthz", s.healthz)
 	mux.HandleFunc("GET /cluster", s.cluster)
 	if s.cfg.Meta != nil {
+		mux.HandleFunc("GET /dashboard", s.dashboardPage)
+		mux.HandleFunc("GET /dashboard/", s.dashboardPage)
+		mux.HandleFunc("GET /admin/dashboard", s.dashboardData)
+	}
+	if s.cfg.Meta != nil {
 		mux.HandleFunc("GET /admin/audit", s.audit)
 	}
 	if s.cfg.Uploader != nil {

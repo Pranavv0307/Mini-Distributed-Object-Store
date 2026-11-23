@@ -43,6 +43,13 @@ detection in 5 s, repair after 15 s) so it fits in a few minutes; the
 defaults are 10 s and 30 s. It leaves the cluster running.
 **Presenting to someone new? Follow [`docs/DEMO_GUIDE.md`](docs/DEMO_GUIDE.md).**
 
+For a live visual view while running the demo or viva experiments, open
+[`http://localhost:8080/dashboard/`](http://localhost:8080/dashboard/) (use
+your `CONTROLLER_PORT` if overridden). It refreshes every two seconds and
+shows worker states, physical chunk inventories, controller object/chunk/
+replica mappings, storage health, repair counters, and audit state. The
+refresh can be paused while inspecting a failure.
+
 > **Name or port clash?** Container names are global on a Docker host. If
 > containers named `controller` or `worker1`…`worker4` already exist (another
 > project), or port 8080 is taken, run

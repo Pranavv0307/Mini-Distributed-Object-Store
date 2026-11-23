@@ -1073,3 +1073,26 @@ metadata values (DEC-013, provisional).
 All phases (0–11) are implemented. Remaining ideas are the design's stretch
 goals (S1–S5: rendezvous hashing, read prefetch, Range requests, metrics,
 zones), none of which the specification requires.
+
+## Dashboard — live controller and worker view (2026-11-23)
+
+### What was implemented
+
+- Added an embedded browser dashboard at `/dashboard/` and a read-only
+  aggregation endpoint at `/admin/dashboard`.
+- The endpoint combines the live cluster/repair/storage view, audit state,
+  every controller object and chunk-to-replica mapping, and each worker's
+  current physical inventory. Dead workers remain visible with their last
+  known state and an unavailable-inventory message.
+- Added a two-second auto-refresh UI with pause/resume, worker cards, disk and
+  heartbeat information, physical chunk lists, object mapping tables, replica
+  state badges, repair counters, pending deletes, and audit status.
+- Linked the dashboard from the README, viva guide, demo guide, and API
+  reference so it is available during every failure demonstration.
+
+### Tests performed and results (2026-11-23)
+
+- `go test ./...`: pass.
+- `go vet ./...`: pass.
+- `git diff --check`: pass.
+- Added `TestDashboardPageAndData` for the embedded page and JSON endpoint.

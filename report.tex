@@ -1,0 +1,263 @@
+\documentclass[11pt,a4paper]{article}
+
+\usepackage[margin=1in]{geometry}
+\usepackage[T1]{fontenc}
+\usepackage{lmodern}
+\usepackage{microtype}
+\usepackage{graphicx}
+\usepackage{xcolor}
+\usepackage{booktabs}
+\usepackage{longtable}
+\usepackage{array}
+\usepackage{enumitem}
+\usepackage{listings}
+\usepackage{float}
+\usepackage{hyperref}
+
+\hypersetup{colorlinks=true,linkcolor=blue,urlcolor=blue,citecolor=blue}
+\setlist{nosep,leftmargin=*}
+\setlength{\parindent}{0pt}
+\setlength{\parskip}{5pt}
+
+\definecolor{codegray}{gray}{0.95}
+\lstset{backgroundcolor=\color{codegray},basicstyle=\ttfamily\small,
+  breaklines=true,frame=single,columns=fullflexible}
+
+% Replace the optional filename with an actual screenshot when submitting.
+\newcommand{\screenshot}[3]{%
+\begin{figure}[H]
+\centering
+\IfFileExists{#1}{\includegraphics[width=0.94\linewidth]{#1}}{%
+\fbox{\begin{minipage}[c][2.25in][c]{0.88\linewidth}
+\centering\textbf{SCREENSHOT PLACEHOLDER}\par\smallskip
+Filename: \texttt{#1}\par\smallskip
+\emph{#2}
+\end{minipage}}
+\caption{#3}
+\end{figure}}
+
+\title{Mini Distributed Object Store\\\large Architecture, Fault Tolerance, and Demonstration Report}
+\author{Student Name \\ Roll Number \\ Course / Section}
+\date{\today}
+
+\begin{document}
+\maketitle
+
+\begin{abstract}
+This report presents the design and implementation of a small S3-style distributed object store written in Go. The system consists of one controller, four storage workers, and an optional command-line client deployed with Docker Compose. Objects are split into fixed-size 1,000,000-byte chunks and each chunk is synchronously replicated to two distinct workers. The controller maintains durable SQLite metadata, verifies data using SHA-256 checksums, detects failed workers using heartbeats, and repairs under-replicated or corrupted chunks in the background. The report focuses particularly on the reasoning behind the architectural decisions and on the mechanisms that preserve availability, consistency, and data integrity under worker failures, corruption, interrupted writes, and controller restarts. The supplied demonstration script was used to exercise the complete workflow, including the web dashboard.
+\end{abstract}
+
+\tableofcontents
+\newpage
+
+\section{Introduction}
+
+The project implements a miniature distributed object storage service. A client communicates with a single HTTP controller rather than contacting storage nodes directly. The controller accepts an object as a stream, divides it into chunks, selects storage workers, records placement metadata, and exposes APIs for upload, download, metadata updates, listing, deletion, cluster health, and invariant auditing.
+
+The central design goal is safe and understandable distribution rather than maximum production scale. The implementation therefore uses a single authoritative controller and replicated worker disks. This makes placement and recovery decisions easy to reason about while still demonstrating the essential ideas of distributed storage: replication, failure detection, reconciliation, checksums, crash recovery, and background repair.
+
+\subsection{Objectives}
+The main objectives were:
+\begin{itemize}
+  \item store and retrieve arbitrarily sized objects through a REST API;
+  \item split objects into 1 MB chunks and distribute them across workers;
+  \item maintain two distinct copies of every committed chunk;
+  \item continue serving objects when one worker fails;
+  \item detect and repair missing or corrupted data;
+  \item avoid exposing partially uploaded objects;
+  \item provide observable evidence through cluster status, audit endpoints, logs, and a browser dashboard.
+\end{itemize}
+
+\section{System Overview}
+
+The deployed cluster contains one controller and four workers. Docker Compose gives each worker a separate persistent volume and gives the controller a persistent volume for the SQLite database. Clients use the controller's REST API; workers expose an internal HTTP API for chunk operations and membership communication.
+
+\begin{figure}[H]
+\centering
+\fbox{\begin{minipage}{0.91\linewidth}
+\centering
+Client / objctl $\longrightarrow$ Controller $\longrightarrow$ Worker 1\\
+\hspace{4.0cm}$\searrow$ Worker 2\\
+\hspace{4.0cm}$\searrow$ Worker 3\\
+\hspace{4.0cm}$\searrow$ Worker 4\\[3pt]
+Controller metadata: SQLite objects, chunks, replicas, cleanup intents
+\end{minipage}}
+\caption{Logical architecture of the object store. The controller is the authority for placement, metadata, reads, writes, and repair.}
+\end{figure}
+
+\subsection{Main components}
+\begin{longtable}{p{0.25\linewidth}p{0.67\linewidth}}
+\toprule
+\textbf{Component} & \textbf{Responsibility}\\
+\midrule
+Controller API & REST endpoints for object upload, download, metadata, listing, deletion, cluster status, and auditing.\\
+Metadata store & SQLite database containing object state, chunk order and checksums, replica state, worker-related cleanup intents, and recovery information.\\
+Worker registry & Tracks worker registration, heartbeats, epochs, and states such as \texttt{SYNCING}, \texttt{ALIVE}, and \texttt{DEAD}.\\
+Upload/download coordinators & Stream objects, schedule bounded chunk operations, verify checksums, and select replicas.\\
+Repair loop & Re-replicates under-replicated chunks and rewrites corrupt replicas.\\
+Janitor and inventory sweep & Performs durable cleanup, expires stale uploads, and removes orphaned or missing-file metadata.\\
+Worker chunk store & Stores each chunk in a checksummed file using temporary files, fsync, and atomic rename.\\
+Worker scrubber & Periodically rereads chunk files and reports silent corruption to the controller.\\
+\bottomrule
+\end{longtable}
+
+\section{Data Model and Normal Operation}
+
+\subsection{Chunking and replication}
+The chosen chunk size is 1,000,000 bytes, matching the assignment's interpretation of 1 MB. A 5,500,000-byte object therefore becomes six chunks: five full chunks and one 500,000-byte chunk. The replication factor is two, and the two replicas of a chunk must be placed on different workers.
+
+During upload, the controller creates an object in the \texttt{UPLOADING} state. It reads the multipart stream, computes a SHA-256 checksum for each chunk and for the complete object, claims two live workers, and sends the chunk to both workers in parallel. A worker validates the supplied checksum and atomically commits the chunk file. Only after every chunk has two confirmed replicas does the controller commit the object as \texttt{READY} in one database transaction.
+
+\subsection{Download}
+The controller loads the ordered chunk map and performs a pre-flight check that each chunk has an effective replica on an \texttt{ALIVE} worker. It fetches chunks in order, verifies their size and checksum, and tries the other replica if a selected copy is unavailable or corrupt. The response is not started until the first chunk has been verified. The complete object checksum is checked before the final chunk is sent.
+
+\subsection{Metadata and deletion}
+Custom metadata is stored as string key/value pairs in the controller database. A PATCH changes metadata without re-uploading or moving chunks. An optional ETag-style \texttt{If-Match} check supports safe concurrent edits. Deletion first changes the object state and creates durable pending-delete intents; the janitor then removes physical files and finally purges metadata.
+
+\section{Architectural Decisions and Rationale}
+
+The following decisions were made to balance correctness, implementation complexity, portability, and demonstration value.
+
+\subsection{Single controller as the decision-making authority}
+All placement, metadata, download selection, liveness, and repair decisions are made by one controller. This follows the principle of ``one brain, many hands.'' It avoids split-brain placement and makes the correctness invariants inspectable in one place. The cost is that the controller is a single point of availability failure and all object bytes pass through it. A replicated controller using consensus would improve availability, but would substantially increase the scope of this project.
+
+\subsection{SQLite for durable metadata}
+SQLite was selected through the pure-Go \texttt{modernc.org/sqlite} driver. It provides transactions and SQL queries without requiring a separate database service or a C compiler. WAL mode, foreign keys, full synchronization, and immediate write transactions make short metadata operations durable and predictable. Network calls are deliberately never held inside database transactions: the database records intent, workers perform the operation, and a short transaction records the result.
+
+\subsection{Two replicas per chunk}
+Replication factor two provides a simple and visible fault-tolerance guarantee: one worker can fail while at least one copy remains available. It uses less storage than three replicas and is sufficient for the demonstration. The limitation is explicit: if both copies of the same chunk are lost or corrupted before repair, the object cannot be reconstructed. The system returns an error rather than returning unverified bytes.
+
+\subsection{Immutable object data and mutable metadata}
+Object bytes are immutable after upload, while custom metadata can be changed with PATCH. This simplifies checksum validation, replica repair, and concurrent behavior. Replacing object data is performed as a new upload rather than as an in-place mutation. The trade-off is that updates to a large object require a new upload.
+
+\subsection{Registration-driven \texttt{SYNCING} state}
+A returning worker is not immediately treated as available. It first registers, blocks writes, reports its inventory, and is reconciled with controller metadata. During this period it is \texttt{SYNCING} and is excluded from placement, reads, and repair. This avoids races where a worker receives a new chunk between its inventory snapshot and metadata reconciliation. Registration epochs prevent an older, delayed registration from incorrectly making a newer session live.
+
+\subsection{Checksums at multiple boundaries}
+Checksums are verified when a worker receives a chunk, when the controller reads a chunk, during repair, and during background scrubbing. The checksum is stored in the chunk file header as well as in controller metadata. This layered approach detects both transfer errors and silent disk corruption. It also makes it possible to distinguish a corrupt copy from an unreachable worker.
+
+\subsection{Durable intent before physical cleanup}
+The \texttt{pending\_deletes} table records cleanup work before a file is deleted. This handles timeouts and crashes: a timed-out PUT may have reached a worker even if the controller did not receive its response, and an interrupted controller may leave a physical file behind. The janitor retries idempotent deletion, while inventory sweeps provide a final orphan cleanup mechanism.
+
+\subsection{Bounded concurrency}
+Upload windows, concurrent uploads, downloads, repairs, and worker reads are bounded. Replica PUTs for a chunk are parallel, but the system does not create an unbounded number of goroutines or retain an entire object in memory. This keeps resource use predictable and prevents a large upload from overwhelming the controller or workers.
+
+\section{Fault Tolerance and Recovery}
+
+\subsection{Worker failure detection}
+Workers send heartbeats to the controller. With the normal configuration, heartbeats are sent every 3 seconds and a worker is considered dead after 10 seconds of silence. The demonstration shortens these values to a 1-second heartbeat and 5-second failure threshold. A \texttt{DEAD} worker is excluded from new placement and from reads.
+
+\subsection{Degraded reads}
+If one worker holding a chunk stops, the other effective replica remains usable. The controller selects a surviving copy and verifies it before returning it. Therefore the client can download an object while the cluster is temporarily below its target replication factor.
+
+\subsection{Self-healing re-replication}
+The repair loop is level-triggered: it repeatedly examines the desired state rather than relying on one fragile event. After a dead-worker grace period, each chunk with fewer than two effective replicas is copied to another eligible worker. Repair is performed from a verified source, with bounded concurrency. When a worker returns, inventory reconciliation identifies redundant copies and the repair logic plus janitor restore exactly two replicas per chunk.
+
+\subsection{Corruption handling}
+A bad copy is never trusted merely because the worker is alive. On read, the controller compares the received bytes with the expected chunk checksum. A mismatch marks that replica corrupt and causes a retry from another copy. The worker scrubber independently rereads files at a throttled rate, allowing silent same-size corruption to be detected even when no client downloads the object. The controller confirms scrubber reports against its own checksum before initiating repair.
+
+\subsection{Crash safety}
+Uploads use explicit object and replica states. If a client disconnects, a worker fails during PUT, or the controller crashes during an upload, the object is not made visible as \texttt{READY}. Startup recovery converts incomplete work into cleanup work, and the janitor removes its files. Atomic temporary-file writes prevent partially written chunk files from being mistaken for valid data.
+
+\subsection{Failure matrix}
+\begin{longtable}{p{0.30\linewidth}p{0.29\linewidth}p{0.29\linewidth}}
+\toprule
+\textbf{Failure} & \textbf{Immediate behavior} & \textbf{Recovery behavior}\\
+\midrule
+One worker stops & Reads use the surviving replica; new placement avoids the worker. & After the grace period, chunks are copied to another worker.\\
+Worker restarts & Worker is \texttt{SYNCING}; writes and reads are gated during reconciliation. & Inventory is reconciled, then the worker becomes \texttt{ALIVE}; redundant copies are removed.\\
+One chunk copy is corrupt & Controller rejects it and tries the other copy. & Corrupt copy is rewritten from a verified source.\\
+Both copies are corrupt & Download fails with storage-unavailable behavior; wrong bytes are never returned. & Requires a surviving source or re-upload; the loss is reported explicitly.\\
+Client disconnects during upload & Object remains incomplete and invisible. & Abort path and janitor remove claims and files.\\
+Controller crash during upload & Durable metadata retains incomplete state. & Startup recovery and janitor clean the operation.\\
+\bottomrule
+\end{longtable}
+
+\section{Implementation and Interface}
+
+The implementation uses Go's standard \texttt{net/http} package, structured logging through \texttt{log/slog}, SQLite, Docker, and Docker Compose. The main client endpoints are:
+\begin{itemize}
+  \item \texttt{POST /api/v1/objects} for multipart upload;
+  \item \texttt{GET /api/v1/objects/{id}} and \texttt{HEAD} for verified download access;
+  \item \texttt{GET/PATCH /api/v1/objects/{id}/metadata};
+  \item \texttt{GET /api/v1/objects} for paginated listing;
+  \item \texttt{DELETE /api/v1/objects/{id}} for asynchronous physical cleanup;
+  \item \texttt{GET /cluster} for worker, storage, and repair status;
+  \item \texttt{GET /admin/audit} for safety and steady-state invariants.
+\end{itemize}
+
+The worker API is internal and handles chunk PUT, GET, DELETE, inventory, health, registration, and heartbeat operations. The optional \texttt{objctl} container provides convenient commands for listing objects, inspecting chunk placement, patching metadata, viewing cluster health, and running the audit.
+
+\section{Demonstration and Evidence}
+
+The supplied \texttt{scripts/demo.sh} starts the Compose cluster and runs the required demonstrations. It uses a 5.5 MB randomly generated object, shortened timing values, and cleans up the objects it created while leaving the cluster available for inspection.
+
+\subsection{Demonstrated scenarios}
+\begin{enumerate}
+  \item A 5.5 MB upload is downloaded and compared byte-for-byte with the source.
+  \item The object is shown as six chunks distributed across workers.
+  \item Each chunk is shown on exactly two different worker volumes.
+  \item Custom metadata is read and modified without moving chunk files.
+  \item A worker is stopped; the object remains downloadable; missing replicas are rebuilt; the worker is restarted and the cluster returns to exactly two copies per chunk.
+  \item A corrupted copy is rejected during download and repaired; silent corruption is detected by the scrubber without a client read; when both copies are corrupted, the object is refused rather than served incorrectly.
+\end{enumerate}
+
+\screenshot{screenshots/demo-terminal.png}{Insert a terminal capture showing the completed \texttt{demo.sh} output, including the green success lines for upload/download, replication, worker failure, corruption repair, and the final invariant audit.}{Terminal demonstration output from \texttt{scripts/demo.sh}.}
+
+\screenshot{screenshots/dashboard-normal.png}{Insert a browser capture of \texttt{http://localhost:8080/dashboard/} with all four workers ALIVE, object/chunk/replica counts visible, and the audit or steady-state indicators visible.}{Dashboard showing the healthy cluster before failure injection.}
+
+\screenshot{screenshots/dashboard-failure.png}{Insert a browser capture taken after stopping one worker, showing that worker as DEAD, reduced effective replication, and the object still available for download.}{Dashboard showing degraded operation during a worker failure.}
+
+\screenshot{screenshots/dashboard-repaired.png}{Insert a browser capture after the repair grace period, showing repaired chunk counts, restored steady state, and the repair counter.}{Dashboard showing self-healing after re-replication.}
+
+\screenshot{screenshots/ui-object-metadata.png}{Insert the UI view containing the selected object, its custom metadata, chunk count, and replica/worker mapping.}{UI view of object metadata and placement.}
+
+\screenshot{screenshots/ui-integrity.png}{Insert the UI or terminal view showing a detected corruption event, a checksum/inspection result, and the subsequent VALID or repaired state.}{Integrity verification and repair evidence.}
+
+\section{Evaluation}
+
+The repository records measurements from a Compose evaluation on one host. The exact values depend on hardware and Docker overhead, but they provide useful reference points. The reported 100 MB measurements are approximately 90 MB/s for uploads and 165 MB/s for downloads per client. With default failure timings, worker failure detection was approximately 8.5 seconds and full re-replication approximately 41.3 seconds after the worker stopped. A scrubber configured with a 2-second interval detected same-size corruption in approximately 3 seconds.
+
+\begin{table}[H]
+\centering
+\caption{Representative evaluation results recorded by the project.}
+\begin{tabular}{lr}
+\toprule
+Measurement & Result\\
+\midrule
+Object used in primary demo & 5.5 MB\\
+Chunks in primary demo & 6\\
+Physical chunk files at RF=2 & 12\\
+Upload throughput, 100 MB & approximately 90 MB/s\\
+Download throughput, 100 MB & approximately 165 MB/s\\
+Failure detection, default timings & approximately 8.5 s\\
+Full re-replication, default timings & approximately 41.3 s\\
+Scrubber detection, 2 s interval & approximately 3 s\\
+\bottomrule
+\end{tabular}
+\end{table}
+
+Correctness is also tested through unit tests, in-process integration tests with fault injection, and Docker Compose end-to-end tests. The scenarios include worker crashes, missing and corrupted files, controller failure during upload, concurrent operations, repair, resynchronization, and invariant auditing.
+
+\section{Limitations and Future Work}
+
+The single controller is the main architectural limitation. Its database survives a process restart and workers can register again, but service availability is lost while the controller is unavailable. A future version could replicate controller metadata using a consensus protocol such as Raft.
+
+The controller is also in the data path, which simplifies verification but caps throughput. Signed URLs or direct client-to-worker transfers could improve scalability, at the cost of more complex authorization and integrity coordination. Replication factor two protects against one worker failure at a time; three replicas, rack-aware placement, or erasure coding would improve durability for larger deployments. Random placement is intentionally simple and does not provide rack or zone awareness. Authentication and authorization are not implemented; the API is bound to localhost for the demonstration environment.
+
+\section{Conclusion}
+
+The project demonstrates a complete distributed object storage workflow in a compact, testable system. Its most important architectural property is that metadata records the intended state while workers provide durable physical storage, and background loops reconcile the two. Replication allows degraded reads, checksums prevent silent corruption from being returned, durable cleanup handles crash windows, and repair restores the desired state after failures. The implementation therefore provides a clear example of how availability, integrity, and recoverability can be built incrementally from explicit state machines and carefully bounded operations.
+
+\begin{thebibliography}{9}
+\bibitem{repo}
+Mini Distributed Object Store repository documentation: \texttt{README.md}, \texttt{docs/ARCHITECTURE.md}, \texttt{docs/DECISIONS.md}, \texttt{docs/EVALUATION.md}, and \texttt{docs/DEMO\_GUIDE.md}.
+
+\bibitem{api}
+Mini Distributed Object Store, \emph{API Reference}, \texttt{docs/API.md}.
+
+\bibitem{demo}
+Mini Distributed Object Store, \emph{Demonstration Script}, \texttt{scripts/demo.sh}.
+\end{thebibliography}
+
+\end{document}

@@ -18,6 +18,12 @@ replication (files on two volumes), metadata PATCH, worker failure with
 re-replication and return, and corruption (read path, scrubber, both copies).
 It does not delete volumes; `docker compose down -v` does.
 
+Open `http://127.0.0.1:${CONTROLLER_PORT:-8080}/dashboard/` in a browser
+before starting the experiments. It refreshes every two seconds and shows
+worker state, physical chunk inventories, controller object/chunk/replica
+mappings, storage health, repair counters, and audit state. Pause refresh when
+you want to inspect a failure snapshot without the tables changing.
+
 ## Feature-to-demonstration map
 
 | Feature | Ready-made test | Viva command / observation |

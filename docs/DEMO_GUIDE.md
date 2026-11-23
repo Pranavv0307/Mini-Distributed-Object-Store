@@ -42,6 +42,10 @@ and how to answer the usual questions. The core demonstration is automated
    `docker compose down -v` again.
 6. Arrange the screen: one large terminal (font ≥ 16 pt), and this guide or
    the README's diagram on a second screen or tab.
+7. Open `http://127.0.0.1:${CONTROLLER_PORT:-8080}/dashboard/` in a browser.
+   Keep it visible beside the terminal: it refreshes every two seconds and
+   makes the worker states, physical chunk files, controller replica map,
+   repair counters, and audit state visible while each failure is injected.
 
 ## 1. The pitch (1–2 minutes, no commands)
 

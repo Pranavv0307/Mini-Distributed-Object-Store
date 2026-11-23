@@ -1,0 +1,112 @@
+{
+    "object_id": "3a819dd0-f9fa-43aa-9d17-0cd90d6ef54c",
+    "name": "big.bin",
+    "size": 5500000,
+    "content_type": "application/octet-stream",
+    "checksum_sha256": "fd25d7bcff57d7ae4f4d2953594d504a75a9be9dc1a10330e89ed443d93ffb1c",
+    "num_chunks": 6,
+    "created_at": "2026-11-23T13:14:53.312969144Z",
+    "modified_at": "2026-11-23T13:33:37.912385593Z",
+    "metadata_version": 3,
+    "custom_metadata": {
+        "owner": "bob"
+    },
+    "chunks": [
+        {
+            "index": 0,
+            "chunk_id": "3a819dd0-f9fa-43aa-9d17-0cd90d6ef54c_000000",
+            "size": 1000000,
+            "checksum_sha256": "d837c8f045271c3a281ac9d7e22e3aa0e32d3a4b7f24bc5fe8de25b96bb29304",
+            "replicas": [
+                {
+                    "worker_id": "worker1",
+                    "state": "OK"
+                },
+                {
+                    "worker_id": "worker2",
+                    "state": "OK"
+                }
+            ]
+        },
+        {
+            "index": 1,
+            "chunk_id": "3a819dd0-f9fa-43aa-9d17-0cd90d6ef54c_000001",
+            "size": 1000000,
+            "checksum_sha256": "058ad91288ba8d01ac01eefec1c214bcbfaf1c2b478a70c7f6328ff6d3f094fe",
+            "replicas": [
+                {
+                    "worker_id": "worker3",
+                    "state": "OK"
+                },
+                {
+                    "worker_id": "worker4",
+                    "state": "OK"
+                }
+            ]
+        },
+        {
+            "index": 2,
+            "chunk_id": "3a819dd0-f9fa-43aa-9d17-0cd90d6ef54c_000002",
+            "size": 1000000,
+            "checksum_sha256": "45533e4f857fe524062491c7c53dc8d24549d2044ea9b8328d00d3657da5fbbc",
+            "replicas": [
+                {
+                    "worker_id": "worker1",
+                    "state": "OK"
+                },
+                {
+                    "worker_id": "worker2",
+                    "state": "OK"
+                }
+            ]
+        },
+        {
+            "index": 3,
+            "chunk_id": "3a819dd0-f9fa-43aa-9d17-0cd90d6ef54c_000003",
+            "size": 1000000,
+            "checksum_sha256": "6edb118f98edc44c54cc4de7ccedbbe452220f3156fd0dcf64a3c675b9d311ee",
+            "replicas": [
+                {
+                    "worker_id": "worker1",
+                    "state": "OK"
+                },
+                {
+                    "worker_id": "worker3",
+                    "state": "OK"
+                }
+            ]
+        },
+        {
+            "index": 4,
+            "chunk_id": "3a819dd0-f9fa-43aa-9d17-0cd90d6ef54c_000004",
+            "size": 1000000,
+            "checksum_sha256": "37ab433bbee02b399f3efca915b6eebb59aa3a3050576054c73c548f27d515a7",
+            "replicas": [
+                {
+                    "worker_id": "worker2",
+                    "state": "OK"
+                },
+                {
+                    "worker_id": "worker3",
+                    "state": "OK"
+                }
+            ]
+        },
+        {
+            "index": 5,
+            "chunk_id": "3a819dd0-f9fa-43aa-9d17-0cd90d6ef54c_000005",
+            "size": 500000,
+            "checksum_sha256": "9f0cdd641e66db8ef7ab346892b66bf4716b909cbf51b6555bfa9d295ca028a6",
+            "replicas": [
+                {
+                    "worker_id": "worker3",
+                    "state": "OK"
+                },
+                {
+                    "worker_id": "worker4",
+                    "state": "OK"
+                }
+            ]
+        }
+    ]
+}

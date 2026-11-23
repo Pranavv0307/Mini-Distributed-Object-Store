@@ -388,6 +388,15 @@ lost and repaired:
 (every `RECONCILER_INTERVAL`), so they lag a state change by up to one
 round. Absent when the controller runs without a repair loop.
 
+### `GET /dashboard/` and `GET /admin/dashboard` — operator dashboard · IMPLEMENTED
+
+`/dashboard/` serves the browser dashboard. `/admin/dashboard` returns its
+read-only aggregated data: the current `/cluster` view, audit report, every
+object row with chunk-to-replica mappings, and a metadata-only inventory for
+each worker. Dead workers are shown with their last known controller state and
+an unavailable inventory rather than being queried. The browser refreshes this
+endpoint every two seconds and can be paused during a failure demonstration.
+
 ### `GET /admin/audit` — invariant audit · IMPLEMENTED (Phase 9, v2)
 
 Checks the correctness invariants against live metadata (architecture

@@ -1,0 +1,81 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Object Store Dashboard</title>
+  <style>
+    :root { --bg:#0b1120; --panel:#121b2d; --panel2:#18243a; --line:#273753; --text:#e8eef9; --muted:#91a0ba; --cyan:#66d9ef; --green:#5ee39b; --yellow:#f5c96b; --red:#ff7185; --blue:#7aa7ff; }
+    * { box-sizing:border-box; }
+    body { margin:0; background:linear-gradient(140deg,#09101d,#101a2d 60%,#0a1222); color:var(--text); font:14px/1.45 Inter,ui-sans-serif,system-ui,-apple-system,"Segoe UI",sans-serif; }
+    .shell { max-width:1500px; margin:auto; padding:28px; }
+    header { display:flex; align-items:flex-end; justify-content:space-between; gap:20px; margin-bottom:24px; }
+    h1,h2,h3 { margin:0; letter-spacing:-.02em; } h1 { font-size:28px; } h2 { font-size:17px; } h3 { font-size:14px; }
+    .eyebrow { color:var(--cyan); text-transform:uppercase; font-size:11px; letter-spacing:.16em; font-weight:700; margin-bottom:7px; }
+    .sub { color:var(--muted); margin-top:6px; }
+    .toolbar { display:flex; align-items:center; gap:10px; flex-wrap:wrap; }
+    button,.link { border:1px solid var(--line); background:var(--panel2); color:var(--text); border-radius:8px; padding:8px 12px; cursor:pointer; text-decoration:none; font:inherit; }
+    button:hover,.link:hover { border-color:var(--cyan); } .live { color:var(--green); } .paused { color:var(--yellow); }
+    .grid { display:grid; gap:14px; } .metrics { grid-template-columns:repeat(6,minmax(120px,1fr)); margin-bottom:20px; }
+    .panel { background:rgba(18,27,45,.88); border:1px solid var(--line); border-radius:12px; padding:17px; box-shadow:0 10px 35px rgba(0,0,0,.15); }
+    .metric .label { color:var(--muted); font-size:12px; } .metric .value { font-size:27px; font-weight:750; margin-top:4px; } .metric .hint { color:var(--muted); font-size:11px; }
+    section { margin-top:20px; } .section-head { display:flex; justify-content:space-between; align-items:center; margin-bottom:11px; }
+    .workers { grid-template-columns:repeat(auto-fit,minmax(270px,1fr)); }
+    .worker-head { display:flex; justify-content:space-between; align-items:flex-start; margin-bottom:14px; } .worker-id { font-size:17px; font-weight:700; }
+    .badge { display:inline-flex; align-items:center; gap:5px; border-radius:999px; padding:3px 8px; font-size:11px; font-weight:700; letter-spacing:.04em; }
+    .badge:before { content:""; width:6px; height:6px; border-radius:50%; background:currentColor; } .alive,.ok { color:var(--green); background:rgba(94,227,155,.1); } .syncing,.pending { color:var(--yellow); background:rgba(245,201,107,.1); } .dead,.corrupt { color:var(--red); background:rgba(255,113,133,.1); }
+    .worker-meta { display:grid; grid-template-columns:1fr 1fr; gap:8px; color:var(--muted); font-size:12px; } .worker-meta strong { display:block; color:var(--text); font-size:14px; }
+    .bar { height:6px; border-radius:6px; background:#26334b; overflow:hidden; margin:12px 0 9px; } .bar span { display:block; height:100%; background:linear-gradient(90deg,var(--cyan),var(--blue)); }
+    .muted { color:var(--muted); } .error { color:var(--red); } .chips { display:flex; flex-wrap:wrap; gap:5px; margin-top:9px; } .chip { max-width:100%; overflow:hidden; text-overflow:ellipsis; white-space:nowrap; border:1px solid var(--line); color:var(--muted); border-radius:5px; padding:3px 5px; font:11px ui-monospace,SFMono-Regular,Menlo,monospace; }
+    .table-wrap { overflow:auto; border:1px solid var(--line); border-radius:8px; } table { width:100%; border-collapse:collapse; min-width:800px; } th,td { text-align:left; padding:10px 11px; border-bottom:1px solid var(--line); vertical-align:top; } th { color:var(--muted); font-size:11px; text-transform:uppercase; letter-spacing:.08em; background:#111b2e; position:sticky; top:0; } tr:last-child td { border-bottom:0; } td code { color:var(--cyan); font-size:12px; }
+    details { border:1px solid var(--line); border-radius:8px; padding:10px 12px; margin-top:8px; background:rgba(24,36,58,.55); } summary { cursor:pointer; font-weight:650; } .inventory-list { max-height:220px; overflow:auto; margin-top:9px; }
+    footer { color:var(--muted); font-size:12px; margin:22px 0 6px; display:flex; justify-content:space-between; gap:10px; flex-wrap:wrap; } a { color:var(--cyan); }
+    @media(max-width:900px) { .metrics { grid-template-columns:repeat(3,1fr); } header { align-items:flex-start; flex-direction:column; } }
+    @media(max-width:560px) { .shell { padding:16px; } .metrics { grid-template-columns:repeat(2,1fr); } }
+  </style>
+</head>
+<body>
+<main class="shell">
+  <header>
+    <div><div class="eyebrow">Mini Distributed Object Store</div><h1>Controller &amp; worker dashboard</h1><div class="sub">Live view for viva experiments, replication, failure detection, and repair.</div></div>
+    <div class="toolbar"><span id="connection" class="live">● connecting</span><span id="updated" class="muted">—</span><button id="refresh">Pause refresh</button><a class="link" href="/cluster" target="_blank">/cluster JSON</a><a class="link" href="/admin/audit" target="_blank">audit JSON</a></div>
+  </header>
+  <div id="metrics" class="grid metrics"></div>
+  <section><div class="section-head"><h2>Workers</h2><span class="muted">Live inventory is fetched through the controller</span></div><div id="workers" class="grid workers"></div></section>
+  <section><div class="section-head"><h2>Controller mapping table</h2><span id="object-count" class="muted"></span></div><div id="objects" class="table-wrap"></div></section>
+  <section><div class="section-head"><h2>Worker chunk inventories</h2><span class="muted">What is physically present right now</span></div><div id="inventories"></div></section>
+  <footer><span id="footer-status">Dashboard endpoint: <code>/admin/dashboard</code></span><span>Refresh interval: 2 seconds</span></footer>
+</main>
+<script>
+  const $ = id => document.getElementById(id);
+  let paused = false, timer;
+  const esc = value => String(value ?? '').replace(/[&<>"']/g, c => ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]));
+  const fmtBytes = n => { n = Number(n || 0); if (n < 1000) return `${n} B`; const units=['KB','MB','GB','TB']; let i=-1; do { n/=1000; i++; } while(n>=1000 && i<units.length-1); return `${n.toFixed(n>=100?0:n>=10?1:2)} ${units[i]}`; };
+  const stateBadge = state => `<span class="badge ${String(state).toLowerCase()}">${esc(state)}</span>`;
+  const metric = (label,value,hint='') => `<div class="panel metric"><div class="label">${esc(label)}</div><div class="value">${esc(value)}</div><div class="hint">${esc(hint)}</div></div>`;
+  function render(data) {
+    const c=data.cluster||{}, sum=c.summary||{}, storage=c.storage||{}, chunks=storage.chunks||{}, repair=c.repair||{}, audit=data.audit||{};
+    $('metrics').innerHTML = [
+      metric('Workers alive', `${sum.alive||0}/${sum.total||0}`, `${sum.dead||0} dead · ${sum.syncing||0} syncing`),
+      metric('Objects', Object.values(storage.objects_by_status||{}).reduce((a,b)=>a+Number(b),0), Object.entries(storage.objects_by_status||{}).map(([k,v])=>`${k}: ${v}`).join(' · ')),
+      metric('Chunks', chunks.total||0, `${chunks.fully_replicated||0} fully replicated`),
+      metric('Under-replicated', chunks.under_replicated||0, `${chunks.zero_effective||0} with zero effective copies`),
+      metric('Repair copies', repair.completed||0, `${repair.in_flight||0} in flight · ${fmtBytes(repair.bytes_copied||0)} copied`),
+      metric('Pending deletes', storage.pending_deletes||0, repair.unrecoverable ? `${repair.unrecoverable} unrecoverable` : 'janitor queue'),
+      metric('Audit', audit.ok ? 'OK' : 'VIOLATION', audit.steady_state ? 'steady state' : 'repair/degraded state')
+    ].join('');
+    const workers=data.workers||[];
+    $('workers').innerHTML = workers.length ? workers.map(w => {
+      const x=w.worker||{}, inv=w.inventory||[], used=Number(x.used_bytes||0), free=Number(x.free_bytes||0), total=used+Math.max(free,0), pct=total?Math.min(100,used/total*100):0;
+      return `<article class="panel"><div class="worker-head"><div><div class="worker-id">${esc(x.worker_id)}</div><div class="muted">${esc(x.address||'—')}</div></div>${stateBadge(x.state)}</div><div class="worker-meta"><div>Epoch<strong>${esc(x.epoch)}</strong></div><div>Heartbeat<strong>${esc(x.last_heartbeat_age_ms)} ms ago</strong></div><div>Chunks<strong>${esc(x.chunk_count)} reported</strong></div><div>Disk used<strong>${fmtBytes(used)}</strong></div></div><div class="bar"><span style="width:${pct}%"></span></div><div class="muted">${inv.length} files in latest inventory${x.repair_eligible?' · repair eligible':''}</div>${w.inventory_error?`<div class="error" style="margin-top:8px">${esc(w.inventory_error)}</div>`:`<div class="chips">${inv.slice(0,8).map(i=>`<span class="chip" title="${esc(i.chunk_id)}">${esc(i.chunk_id)}</span>`).join('')}${inv.length>8?`<span class="chip">+${inv.length-8} more</span>`:''}</div>`}</article>`;
+    }).join('') : '<div class="panel muted">No workers registered yet.</div>';
+    const objects=data.objects||[]; $('object-count').textContent=`${objects.length} object${objects.length===1?'':'s'} · ${objects.reduce((n,o)=>n+(o.chunks||[]).length,0)} chunk rows`;
+    $('objects').innerHTML = objects.length ? `<table><thead><tr><th>Object</th><th>Status</th><th>Chunk</th><th>Size</th><th>Checksum</th><th>Replica mapping</th></tr></thead><tbody>${objects.flatMap(o=>(o.chunks||[]).length?(o.chunks||[]).map((ch,i)=>`<tr>${i===0?`<td rowspan="${o.chunks.length}"><strong>${esc(o.info.name||'(unnamed)')}</strong><br><code>${esc(o.info.object_id)}</code><br><span class="muted">${fmtBytes(o.info.size)} · ${esc(o.info.content_type)}</span></td><td rowspan="${o.chunks.length}">${stateBadge(o.info.status)}</td>`:''}<td><code>${esc(ch.index)} · ${esc(ch.chunk_id)}</code></td><td>${fmtBytes(ch.size)}</td><td><code>${esc(ch.checksum_sha256).slice(0,16)}…</code></td><td>${(ch.replicas||[]).map(r=>`<span class="badge ${String(r.state).toLowerCase()}" style="margin:2px">${esc(r.worker_id)} · ${esc(r.state)}</span>`).join(' ')||'<span class="muted">no replica rows</span>'}</td></tr>`):[`<tr><td><strong>${esc(o.info.name||'(unnamed)')}</strong><br><code>${esc(o.info.object_id)}</code></td><td>${stateBadge(o.info.status)}</td><td colspan="4" class="muted">No chunk rows yet</td></tr>`]).join('')}</tbody></table>` : '<div class="panel muted">No objects in the controller database.</div>';
+    $('inventories').innerHTML = workers.length ? workers.map(w=>{ const x=w.worker||{}, inv=w.inventory||[]; return `<details><summary>${esc(x.worker_id)} · ${stateBadge(x.state)} · ${inv.length} files</summary>${w.inventory_error?`<div class="error">${esc(w.inventory_error)}</div>`:`<div class="inventory-list">${inv.length?inv.map(i=>`<div><code>${esc(i.chunk_id)}</code> <span class="muted">${fmtBytes(i.size)}</span></div>`).join(''):'<span class="muted">No files reported.</span>'}</div>`}</details>`}).join(''):'<div class="panel muted">No inventories available.</div>';
+  }
+  async function refresh() { if(paused) return; try { const res=await fetch('/admin/dashboard',{cache:'no-store'}); if(!res.ok) throw new Error(`${res.status} ${res.statusText}`); render(await res.json()); $('connection').textContent='● live'; $('connection').className='live'; $('updated').textContent=`updated ${new Date().toLocaleTimeString()}`; $('footer-status').innerHTML='Dashboard endpoint: <code>/admin/dashboard</code>'; } catch(e) { $('connection').textContent='● disconnected'; $('connection').className='error'; $('footer-status').textContent=`Dashboard error: ${e.message}`; } }
+  $('refresh').onclick=()=>{ paused=!paused; $('refresh').textContent=paused?'Resume refresh':'Pause refresh'; $('connection').textContent=paused?'● paused':'● live'; $('connection').className=paused?'paused':'live'; if(!paused) refresh(); };
+  refresh(); timer=setInterval(refresh,2000);
+</script>
+</body>
+</html>
